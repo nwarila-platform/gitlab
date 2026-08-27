@@ -1,0 +1,176 @@
+# =========================================================================================== #
+# File: 'ansible/inventory/aws_ec2.yml'
+# --- [ Description ] ----------------------------------------------------------------------- #
+#
+# The dynamic EC2 inventory, and the only one: the deployment is ephemeral, so an instance id
+# written into a static file here would be wrong the moment its run ended. This finds the instance
+# the current run created and derives every connection setting from that instance, which is why the
+# playbook declares no connection variables of its own.
+#
+# =========================================================================================== #
+---
+#region ------ [ This Repository ] ------------------------------------------------------------ #
+# The play addresses a group, not a run. Terraform stamps each system with a Function tag, so the
+# group is the set of functions whose hosts this playbook configures -- add a function to the list
+# to have its hosts join, and give a second group its own list to split a deployment by role.
+groups:
+  gitlab_servers: "(aws_tags.Function | default('', true)) in ['gitlab']"
+
+#endregion --- [ This Repository ] ------------------------------------------------------------ #
+
+
+#region ------ [ Selecting This Run ] --------------------------------------------------------- #
+# Where to look, then which instance. These deployments run in one region.
+regions: [ us-east-1 ]
+
+# One run's instance and no other. Three tags are the identifiers GitHub sets for any workflow, so
+# a run can only ever see what it created; the fourth names the deployment and defaults to the one
+# these pipelines build. Nothing here is particular to this repository.
+filters:
+  instance-state-name: running
+  'tag:RepositoryId': "{{ lookup('ansible.builtin.env', 'GITHUB_REPOSITORY_ID') }}"
+  'tag:RunId': "{{ lookup('ansible.builtin.env', 'GITHUB_RUN_ID') }}"
+  'tag:Repository': "{{ lookup('ansible.builtin.env', 'GITHUB_REPOSITORY') }}"
+  'tag:Environment': "{{ lookup('ansible.builtin.env', 'ENVIRONMENT') | default('test', true) }}"
+
+#endregion --- [ Selecting This Run ] --------------------------------------------------------- #
+
+
+#region ------ [ Plugin Behaviour ] ----------------------------------------------------------- #
+
+# The inventory plugin itself, and the three settings that decide how it presents what it finds.
+plugin: amazon.aws.aws_ec2
+
+# Terraform's hostname becomes the Name tag, so naming hosts after it makes inventory_hostname the
+# system's own name and nothing downstream needs telling it twice.
+hostnames: [ 'tag:Name', instance-id ]
+
+# Fail on a bad expression rather than silently dropping the variable it was meant to set.
+strict: true
+
+# The plugin publishes a host variable named 'state' -- the EC2 instance state -- which would
+# collide with the role input that selects present_windows.yml or absent_windows.yml. Prefixing
+# removes the collision at the source. It applies BEFORE compose, so the expressions below read
+# prefixed names; hostnames and filters read raw ones.
+hostvars_prefix: 'aws_'
+
+#endregion --- [ Plugin Behaviour ] ----------------------------------------------------------- #
+
+
+#region ------ [ Host Variables ] ------------------------------------------------------------- #
+# EVERY EXPRESSION RE-READS THE INSTANCE, never another compose value: Ansible templates them all
+# against one snapshot, so an entry cannot see one set beside it. The repetition is load-bearing.
+#
+# The operating system comes from AWS's own platform_details, which every instance carries and which
+# names the platform it is licensed as -- 'Windows', 'Windows with SQL Server', 'Red Hat Enterprise
+# Linux'. It is matched, not compared, so every Windows variant answers alike.
+compose:
+
+  #region ------ [ Reaching the host ] -------------------------------------------------------- #
+  # The Connection tag in terraform/aws.tfvars decides all four values below. Absent means
+  # ssh-direct, which is what this repository's pipeline uses.
+  #
+  #   ssh-direct     SSH to the routable address on 22.
+  #   ssh-ssm        SSH to the INSTANCE ID, tunnelled by the ProxyCommand below. No inbound rule.
+  #   winrm-direct   WinRM over HTTPS to the routable address on 5986.
+  #   winrm-ssm      WinRM over HTTPS to a local port an SSM session already forwards. WinRM has
+  #                  no proxy hook, so that session is started alongside rather than from here.
+
+  # Public address first for a controller outside the VPC, private for one inside it. The trailing
+  # instance id is deliberately NOT dialable: it surfaces an address-less topology as a connection
+  # error rather than a missing variable. An 'or' chain because Jinja evaluates filter ARGUMENTS
+  # eagerly, so a nested default() still raises on an absent address.
+  ansible_host: >-
+    ((aws_tags.Connection | default('ssh-direct', true)) == 'ssh-ssm')
+    | ternary(
+        aws_instance_id,
+        ((aws_tags.Connection | default('ssh-direct', true)) == 'winrm-ssm')
+        | ternary(
+            '127.0.0.1',
+            (aws_public_ip_address | default('', true))
+            or (aws_private_ip_address | default('', true))
+            or aws_instance_id
+          )
+      )
+
+  ansible_connection: >-
+    ((aws_tags.Connection | default('ssh-direct', true)) in ['winrm-direct', 'winrm-ssm'])
+    | ternary('winrm', 'ssh')
+
+  ansible_port: >-
+    ((aws_tags.Connection | default('ssh-direct', true)) in ['winrm-direct', 'winrm-ssm'])
+    | ternary(5986, 22)
+
+  # Keepalive: a settle poll can wait minutes with no SSH traffic, and an idle connection that times
+  # out is reported as UNREACHABLE. The 30s probes keep the link from counting as idle; twenty
+  # unanswered ones are the dead-peer budget. Only the tunnelled leg adds the proxy.
+  #
+  # Each quoted fragment stays on ONE line. YAML preserves a line break inside an indented block,
+  # and a newline landing inside the quoted ProxyCommand would split it into two shell commands --
+  # the second failing, the first silently losing its port. Breaks between fragments are harmless.
+  ansible_ssh_common_args: >-
+    '-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=20'
+    ~ (
+      ((aws_tags.Connection | default('ssh-direct', true)) == 'ssh-ssm') |
+        ternary(
+          ' -o ProxyCommand="aws ssm start-session --target %h'
+          ~ ' --document-name AWS-StartSSHSession --parameters portNumber=%p"',
+          ''
+        )
+    )
+
+  #endregion --- [ Reaching the host ] -------------------------------------------------------- #
+
+  #region ------ [ Logging in ] --------------------------------------------------------------- #
+  ansible_user: >-
+    (aws_platform_details | lower is search('windows'))
+      | ternary('Administrator', 'ec2-user')
+
+  # Over SSH on Windows the bootstrap flips OpenSSH's DefaultShell to PowerShell before any non-raw
+  # work begins. The value is correct before that flip too, where only raw tasks run and the
+  # registry reads the bootstrap uses parse under either shell. A WinRM leg is different rather than
+  # indifferent: that plugin expects cmd and warns when handed powershell.
+  ansible_shell_type: >-
+    ((aws_tags.Connection | default('ssh-direct', true)) in ['winrm-direct', 'winrm-ssm'])
+    | ternary(
+        'cmd',
+        (aws_platform_details | lower is search('windows'))
+        | ternary('powershell', 'sh')
+      )
+
+  # The workflow stages its key and names it;
+  ansible_ssh_private_key_file: >-
+    lookup('ansible.builtin.env', 'CI_PRIVATE_KEY')
+    | default('~/.ssh/nwarila-ec2-key', true)
+
+  #endregion --- [ Logging in ] --------------------------------------------------------------- #
+
+  #region ------ [ WinRM only ] --------------------------------------------------------------- #
+  # The SSH legs are what this repository deploys over and what its proofs cover. A WinRM leg needs
+  # three things this repository does not supply: pywinrm on the controller, a password (WinRM has
+  # no key authentication), and a listener on the target. These are what it would connect with.
+
+  # NTLM rather than basic: the credential never crosses the wire in a header, and it works against
+  # the workgroup-joined local Administrator a freshly launched instance is.
+  ansible_winrm_transport: "'ntlm'"
+
+  # An EC2 Windows image generates its 5986 certificate on the instance, so there is nothing to
+  # chain to. A real downgrade against the SSH legs, which authenticate the host key.
+  ansible_winrm_server_cert_validation: "'ignore'"
+
+  #endregion --- [ WinRM only ] --------------------------------------------------------------- #
+
+  #region ------ [ Framework inputs ] --------------------------------------------------------- #
+  # The bootstrap dispatcher reads this to pick a bootstrap role WITHOUT running a fact module
+  # first, which on Windows would precede the transport repair the bootstrap exists to perform.
+  platform: >-
+    (aws_platform_details | lower is search('windows'))
+      | ternary('Windows', 'Linux')
+
+  # The framework loader requires a variable NAMED 'ENV' and lower-cases the value itself. Read bare
+  # because the Environment filter above admits only instances that carry the tag.
+  ENV: "aws_tags.Environment"
+
+  #endregion --- [ Framework inputs ] --------------------------------------------------------- #
+
+#endregion --- [ Host Variables ] ------------------------------------------------------------- #
