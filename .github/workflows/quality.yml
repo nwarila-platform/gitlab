@@ -1,0 +1,109 @@
+# =========================================================================================== #
+# Repository-local Ansible and shell quality gate.
+# Fleet-uniform port of the golden pdq-deploy-inventory workflow: role names are DISCOVERED
+# from ansible/applications/ instead of hard-coded, and every Ansible step gates on the tree
+# existing, so the same file is correct in a repo whose application work has not started yet.
+# =========================================================================================== #
+---
+name: Quality
+
+"on":
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Detect the ansible tree
+        id: detect
+        run: |
+          set -euo pipefail
+          if compgen -G 'ansible/applications/*/tasks' > /dev/null; then
+            echo 'has_ansible=true' >> "${GITHUB_OUTPUT}"
+          else
+            echo 'has_ansible=false' >> "${GITHUB_OUTPUT}"
+            echo 'no ansible applications yet; ansible lint steps are skipped'
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install quality tools
+        run: |
+          set -euo pipefail
+          pip install -r requirements-quality.txt
+          # ansible-lint resolves modules offline, so the collections the roles call must be
+          # present before the syntax check runs.
+          ansible-galaxy collection install --force \
+            --requirements-file requirements-quality.yml
+
+      - name: Lint YAML
+        if: steps.detect.outputs.has_ansible == 'true'
+        run: yamllint -c .yamllint.yml ansible
+
+      - name: Read framework pin
+        id: pins
+        run: |
+          set -euo pipefail
+          mapfile -t lines < .framework-pin
+          if [ "${#lines[@]}" -ne 1 ]; then
+            echo '.framework-pin must contain exactly one line' >&2
+            exit 1
+          fi
+          pin="${lines[0]}"
+          if [[ ! "${pin}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '.framework-pin must contain one lowercase 40-character Git SHA' >&2
+            exit 1
+          fi
+          printf 'ansible=%s\n' "${pin}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout ansible-framework (pinned)
+        if: steps.detect.outputs.has_ansible == 'true'
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: nwarila-platform/ansible-framework
+          ref: ${{ steps.pins.outputs.ansible }}
+          path: .frameworks/ansible-framework
+          persist-credentials: false
+
+      - name: Compose application roles
+        if: steps.detect.outputs.has_ansible == 'true'
+        run: |
+          set -euo pipefail
+          scripts/materialize-role-scripts.sh
+          # The framework's roles carry stubs of their own; materialize them in the checkout
+          # before the overlay, for the same reason the deploy workflow does.
+          if [ -x .frameworks/ansible-framework/scripts/materialize-role-scripts.sh ]; then
+            (cd .frameworks/ansible-framework && ./scripts/materialize-role-scripts.sh)
+          fi
+          for role_source in ansible/applications/*/; do
+            role_name="$(basename "${role_source}")"
+            rsync -a --delete "${role_source}" \
+              ".frameworks/ansible-framework/applications/${role_name}/"
+          done
+
+      - name: Lint Ansible
+        if: steps.detect.outputs.has_ansible == 'true'
+        working-directory: .frameworks/ansible-framework
+        run: |
+          set -euo pipefail
+          roles=()
+          for role_source in "${GITHUB_WORKSPACE}"/ansible/applications/*/; do
+            roles+=("applications/$(basename "${role_source}")")
+          done
+          ansible-lint "${roles[@]}"
+
+      - name: Check shell syntax
+        run: bash -n scripts/compose-and-run.sh scripts/materialize-role-scripts.sh

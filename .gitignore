@@ -1,0 +1,54 @@
+# =========================================================================================== #
+# File: '.gitignore'
+# --- [ Description ] ----------------------------------------------------------------------- #
+#
+# DEFAULT-DENY, EXPLICIT INCLUDES ONLY. Nothing in this working tree is tracked unless it is
+# explicitly allowed below, by name — no wildcard allowances. Adding a new file therefore
+# requires allowing it here first — that is deliberate: it makes publishing a file an
+# explicit act rather than an accident.
+#
+# =========================================================================================== #
+
+# Ignore everything ...
+**
+
+# --- [ directory spine ] -------------------------------------------------------------------- #
+# Git does not descend into an excluded directory, so every directory on the path to an
+# allowed file is re-included by name. This publishes no files by itself: files inside these
+# directories stay ignored until named in a section below.
+!/.github/
+!/.github/workflows/
+!/ansible/
+!/ansible/inventory/
+!/scripts/
+
+# --- [ allowed: repository configuration ] -------------------------------------------------- #
+!/.editorconfig
+!/.framework-pin
+!/.gitignore
+!/.yamllint.yml
+
+# --- [ allowed: top-level documents ] ------------------------------------------------------- #
+!/AGENTS.md
+!/CLAUDE.md
+!/LICENSE
+!/README.md
+!/SECURITY.md
+!/quality-tools.env
+!/requirements-quality.txt
+!/requirements-quality.yml
+
+# --- [ allowed: GitHub configuration ] ------------------------------------------------------ #
+!/.github/CODEOWNERS
+!/.github/terraform-framework-pin
+!/.github/workflows/aws-deploy.yml
+!/.github/workflows/powershell.yml
+!/.github/workflows/quality.yml
+
+# --- [ allowed: the ansible tree ] ---------------------------------------------------------- #
+!/ansible/inventory/README.md
+!/ansible/inventory/aws_ec2.yml
+
+# --- [ allowed: scripts ] ------------------------------------------------------------------- #
+!/scripts/compose-and-run.sh
+!/scripts/materialize-role-scripts.sh
