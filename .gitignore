@@ -43,6 +43,7 @@
 !/.github/CODEOWNERS
 !/.github/terraform-framework-pin
 !/.github/workflows/aws-deploy.yml
+!/.github/workflows/aws-reaper.yml
 !/.github/workflows/powershell.yml
 !/.github/workflows/quality.yml
 

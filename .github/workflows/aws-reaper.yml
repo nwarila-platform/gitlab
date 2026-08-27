@@ -1,0 +1,270 @@
+# =========================================================================================== #
+# AWS Reaper — the out-of-process safety net for the ephemeral deploy lifecycle.
+# ------------------------------------------------------------------------------------------- #
+# The deploy workflow always destroys what it applies, but a killed runner, a job-budget
+# timeout, or an abnormal failure can strand paid resources with nobody left to clean them.
+# This workflow is that missing janitor: it runs OUT OF PROCESS (a broken deploy step cannot
+# suppress it), finds instances tagged to this repository that no live deploy accounts for,
+# and destroys the stack they belong to.
+#
+#   * IDENTITY: assumes the repository's REAPER role — describes, tag-scoped terminate/
+#     detach/revoke/delete, and state-file access only. It cannot create, run, tag, read
+#     artifacts, or touch credentials.
+#   * THE RATIFIED REFRESH DECISION: the reaper role deliberately has NO kms or ssm grants,
+#     so `terraform destroy` here MUST run with -refresh=false — a refresh would resolve
+#     data sources (kms alias, ami parameters) the role cannot read. Destroy-from-state
+#     needs neither. Widening the role instead of passing the flag is the wrong fix.
+#   * SERIALIZATION: its own concurrency group. It must NOT share the deploy group — two
+#     pending runs in one group cancel each other, and a scheduled reap must never cancel a
+#     queued deploy. A live deploy is skipped by the run check below, and the terraform
+#     state lock (-lock-timeout, fail closed) is the authoritative gate under any race.
+#   * TRIGGERS: an off-minute schedule for the standing sweep; workflow_run after every
+#     finished deploy so an abnormal failure is cleaned within minutes, not at the next
+#     quarter hour; manual dispatch for an operator.
+# =========================================================================================== #
+name: AWS Reaper
+
+'on':
+  schedule:
+    # Off-minute on purpose: top-of-hour scheduled workflows are documented to be delayed
+    # or dropped under load.
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch: {}
+  workflow_run:
+    workflows: ['AWS Deploy']
+    types: [completed]
+
+permissions: {}
+
+concurrency:
+  group: aws-reaper-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  main-ref:
+    name: Protected main ref
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Refuse privileged execution outside protected main
+        env:
+          EXPECTED_REF: refs/heads/main
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" != "${EXPECTED_REF}" ]; then
+            echo "::error::The reaper runs only from ${EXPECTED_REF}; got ${GITHUB_REF}."
+            exit 1
+          fi
+
+  reap:
+    name: Reap stranded resources
+    needs: main-ref
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      id-token: write
+      contents: read
+      actions: read # the live-deploy check reads this repository's run list
+    env:
+      AWS_REGION: us-east-1
+      REAPER_ROLE: nwarila-platform_gitlab_reaper
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      # A live lifecycle owns its resources: between apply and destroy — including a
+      # multi-hour operator hold — the deploy run is in progress, so its presence is the
+      # signal that running instances are accounted for. Queued counts too: a deploy about
+      # to start will clean predecessor state itself, under the same lock this job takes.
+      - name: Stand down while a deploy lifecycle is live
+        id: live
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          live="$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/aws-deploy.yml/runs?per_page=50" \
+            --jq '[.workflow_runs[] | select(.status != "completed")] | length')"
+          if [ "${live}" -gt 0 ]; then
+            echo "a deploy lifecycle is live (${live} run(s) not completed); nothing here is stranded"
+            echo 'stand_down=true' >> "${GITHUB_OUTPUT}"
+          else
+            echo 'stand_down=false' >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Configure AWS credentials (OIDC)
+        if: steps.live.outputs.stand_down == 'false'
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.REAPER_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
+          role-session-name: aws-reaper-${{ github.run_id }}
+          role-duration-seconds: 3600
+
+      # Instances are the resources that bill by the minute, so they are the trigger. The
+      # secondary debris a stack leaves (groups, interfaces, state) is destroyed with the
+      # stack below, and anything instanceless is cleaned by the next deploy's predecessor
+      # step at zero standing cost.
+      - name: Look for stranded instances
+        id: stranded
+        if: steps.live.outputs.stand_down == 'false'
+        run: |
+          set -euo pipefail
+          ids="$(aws ec2 describe-instances \
+            --filters "Name=tag:Repository,Values=${GITHUB_REPOSITORY}" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text | tr '\t' ' ')"
+          if [ -z "${ids}" ]; then
+            echo 'no stranded instances; nothing to reap'
+            echo 'found=false' >> "${GITHUB_OUTPUT}"
+          else
+            echo "::warning::stranded instance(s) with no live deploy: ${ids}"
+            echo 'found=true' >> "${GITHUB_OUTPUT}"
+          fi
+
+      - name: Read the terraform framework pin
+        id: pins
+        if: steps.stranded.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          mapfile -t lines < .github/terraform-framework-pin
+          [ "${#lines[@]}" -eq 1 ] || { echo 'the pin must contain exactly one line' >&2; exit 1; }
+          pin="${lines[0]}"
+          [[ "${pin}" =~ ^[0-9a-f]{40}$ ]] || { echo 'the pin must be one lowercase 40-char SHA' >&2; exit 1; }
+          printf 'terraform=%s\n' "${pin}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout aws-terraform-framework (pinned)
+        if: steps.stranded.outputs.found == 'true'
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: ${{ github.repository_owner }}/aws-terraform-framework
+          ref: ${{ steps.pins.outputs.terraform }}
+          path: .frameworks/aws-terraform-framework
+          persist-credentials: false
+
+      - name: Setup Terraform
+        if: steps.stranded.outputs.found == 'true'
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: '1.15.1'
+          terraform_wrapper: false
+
+      # The framework validates runner_ip's shape even though a destroy opens nothing.
+      - name: Discover and validate runner public IPv4
+        if: steps.stranded.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          runner_ip="$(curl -fsS https://checkip.amazonaws.com)"
+          ipv4_octet='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+          if [[ ! "${runner_ip}" =~ ^${ipv4_octet}\.${ipv4_octet}\.${ipv4_octet}\.${ipv4_octet}$ ]]; then
+            echo "::error::Runner public address discovery did not return a bare IPv4 address."
+            exit 1
+          fi
+          echo "::add-mask::${runner_ip}"
+          echo "RUNNER_IP=${runner_ip}" >> "${GITHUB_ENV}"
+
+      - name: Terraform init
+        if: steps.stranded.outputs.found == 'true'
+        working-directory: .frameworks/aws-terraform-framework/terraform
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false                                      \
+            -backend-config="bucket=${AWS_ACCOUNT_ID}-terraform"           \
+            -backend-config="key=${{ github.repository }}/aws-poc.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+
+      # -refresh=false is REQUIRED here, not an optimization: see the header. The lock
+      # timeout fails closed against any lifecycle that started after the stand-down check.
+      - name: Terraform destroy the stranded stack
+        if: steps.stranded.outputs.found == 'true'
+        timeout-minutes: 15
+        working-directory: .frameworks/aws-terraform-framework/terraform
+        env:
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          terraform destroy -input=false -auto-approve -refresh=false -lock-timeout=300s \
+            -var-file="${GITHUB_WORKSPACE}/terraform/aws.tfvars"             \
+            -var "commit_sha=$(git -C "${GITHUB_WORKSPACE}" rev-parse HEAD)" \
+            -var "environment=test"                                          \
+            -var "repository=${GITHUB_REPOSITORY}"                           \
+            -var "repository_id=${GITHUB_REPOSITORY_ID}"                     \
+            -var "run_id=${GITHUB_RUN_ID}"                                   \
+            -var "runner_ip=${RUNNER_IP}"
+
+      # The destroy is judged by the account, not by terraform's report of itself: state
+      # that lost track of an instance leaves it running and this is the step that says so.
+      - name: Prove nothing tagged to this repository is still running
+        if: steps.stranded.outputs.found == 'true'
+        run: |
+          set -euo pipefail
+          left="$(aws ec2 describe-instances \
+            --filters "Name=tag:Repository,Values=${GITHUB_REPOSITORY}" \
+                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text | tr '\t' ' ')"
+          if [ -n "${left}" ]; then
+            echo "::error::instances survived the reap and need a human: ${left}"
+            exit 1
+          fi
+          echo 'the stack is gone; nothing tagged to this repository is running'
+
+  report:
+    name: Reaper incident
+    needs: [main-ref, reap]
+    if: always() && needs.main-ref.result == 'success' && github.event_name != 'workflow_run'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      INCIDENT_LABEL: automation-incident
+      INCIDENT_MARKER: '<!-- automation:aws-reaper -->'
+      INCIDENT_TITLE: '[automation] AWS reaper failed'
+      REAP_RESULT: ${{ needs.reap.result }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Update or resolve the reaper incident
+        run: |
+          set -euo pipefail
+          gh label create "${INCIDENT_LABEL}" --repo "${GITHUB_REPOSITORY}" --force \
+            --color B60205 --description 'Owned exclusively by recurring automation incidents' > /dev/null
+          issue_json="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state all --limit 100 \
+            --label "${INCIDENT_LABEL}" --json number,title,body,author,state)"
+          issue_number="$(jq -r --arg title "${INCIDENT_TITLE}" --arg marker "${INCIDENT_MARKER}" '
+              [.[] | select(
+                .title == $title
+                and .author.login == "app/github-actions"
+                and ((.body // "") | contains($marker))
+              )] | sort_by(.number) | (.[0].number // empty)
+            ' <<< "${issue_json}")"
+
+          if [ "${REAP_RESULT}" != failure ]; then
+            if [ -n "${issue_number}" ] && \
+              [ "$(gh issue view "${issue_number}" --repo "${GITHUB_REPOSITORY}" --json state --jq .state)" = OPEN ]; then
+              gh issue close "${issue_number}" --repo "${GITHUB_REPOSITORY}" \
+                --reason completed --comment "Recovered in ${RUN_URL}."
+            else
+              echo "Reaper is healthy; no open incident to resolve."
+            fi
+            exit 0
+          fi
+
+          message="Reaper result: ${REAP_RESULT}. Stranded resources may still be billing. Inspect ${RUN_URL}."
+          if [ -z "${issue_number}" ]; then
+            gh issue create --repo "${GITHUB_REPOSITORY}" \
+              --label "${INCIDENT_LABEL}" --title "${INCIDENT_TITLE}" \
+              --body "$(printf '%s\n\n%s' "${INCIDENT_MARKER}" "${message}")"
+          else
+            if [ "$(gh issue view "${issue_number}" --repo "${GITHUB_REPOSITORY}" --json state --jq .state)" = CLOSED ]; then
+              gh issue reopen "${issue_number}" --repo "${GITHUB_REPOSITORY}"
+            fi
+            gh issue comment "${issue_number}" --repo "${GITHUB_REPOSITORY}" --body "${message}"
+          fi
