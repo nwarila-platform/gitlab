@@ -29,6 +29,8 @@
 !/.yamllint.yml
 
 # --- [ allowed: top-level documents ] ------------------------------------------------------- #
+!/AGENTS.md
+!/CLAUDE.md
 !/README.md
 !/quality-tools.env
 !/requirements-quality.txt
