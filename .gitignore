@@ -41,6 +41,7 @@
 
 # --- [ allowed: GitHub configuration ] ------------------------------------------------------ #
 !/.github/CODEOWNERS
+!/.github/renovate.json5
 !/.github/terraform-framework-pin
 !/.github/workflows/aws-deploy.yml
 !/.github/workflows/aws-reaper.yml

@@ -1,0 +1,6 @@
+{
+  // Thin consumer per org ADR-0004: the Golden Repo owns the complete fleet baseline and
+  // this file adds only overrides genuinely specific to this repository (currently none).
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["github>nwarila-platform/pdq-deploy-inventory//.github/renovate.json5"]
+}
