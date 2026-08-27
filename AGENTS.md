@@ -55,3 +55,12 @@ Audit domains:
    files are never hand-bumped; nothing installs "latest".
 10. **Failure honesty** — errors fail loudly and name their cause; no swallowed exit
     codes; success is verified against reality, not a tool's report of itself.
+11. **Guard discipline (lifecycle trust)** — code is responsible for itself, not for every
+    imaginable state: it exists within the lifecycle of the pipeline that deploys it, and
+    states that lifecycle cannot produce are not defended against. Every guard must name
+    the realistic path that produces the state it guards; a guard that can't is a finding.
+    Invariants already validated upstream (the workflow's gates, the inventory contract,
+    the framework loader's checks) are trusted, not re-verified — validation lives once,
+    at the boundary that owns it. This bounds domain 10, it does not contradict it: when
+    reality does break an assumption, fail loudly at the point of breakage — never absorb
+    it with pre-emptive padding.
