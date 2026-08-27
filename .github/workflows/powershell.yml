@@ -1,0 +1,48 @@
+# =========================================================================================== #
+# File: '.github/workflows/powershell.yml'
+# --- [ Description ] ----------------------------------------------------------------------- #
+#
+# Thin caller for the organization's standardized PowerShell test suite. Everything of
+# substance lives in NWarila/powershell-template (the single org definition of PowerShell):
+# its reusable pester-matrix workflow discovers every <Name>.ps1 + <Name>.pester.ps1 pair
+# under scripts/ (the generic script home, shared with Python/bash tooling; only .ps1 files
+# participate) and runs one matrix leg per script — house PSScriptAnalyzer settings
+# (custom rules included, zero findings), then the self-contained Pester spec.
+#
+# Runs when a PowerShell file changes in a pull request, and again on the merge to main —
+# the main run is what publishes default-branch artifacts and code-scanning analyses.
+# Adopting new organizational tests is a pin bump on the `uses:` line — nothing else in
+# this repository changes.
+#
+# =========================================================================================== #
+---
+name: 'PowerShell'
+
+"on":
+  pull_request:
+    paths:
+      - 'scripts/**.ps1'                  # script pairs (<Name>.ps1 + <Name>.pester.ps1)
+      - '.github/workflows/powershell.yml'  # pin bumps must re-prove the matrix
+  push:
+    branches:
+      - 'main'
+    paths:
+      - 'scripts/**.ps1'
+      - '.github/workflows/powershell.yml'
+
+permissions:
+  contents: 'read'
+
+jobs:
+  pester-matrix:
+    permissions:
+      contents: 'read'
+      checks: 'write'          # report job: check run with per-test results
+      pull-requests: 'write'   # report job: sticky results comment on the PR
+      security-events: 'write' # test legs: SARIF upload to code scanning
+    uses: 'NWarila/powershell-template/.github/workflows/pester-matrix.yaml@758b3313d34269f10dcf1a1b07837c0b887bdc87' # main (#31)
+    with:
+      scan-path: 'scripts'
+      # Must match the `uses:` ref: the ref selects the workflow file, while template-ref
+      # is what the workflow checks out for the harness and analyzer settings.
+      template-ref: '758b3313d34269f10dcf1a1b07837c0b887bdc87' # main (#31)

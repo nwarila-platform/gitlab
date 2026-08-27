@@ -1,0 +1,12 @@
+---
+# Collections used while linting the composed application + pinned framework tree.
+collections:
+  - name: amazon.aws
+    version: '11.4.0'
+  - name: ansible.windows
+    version: '3.7.0'
+  - name: community.windows
+    version: '3.3.0'
+  # The framework's domain_member role performs its Windows join through microsoft.ad.
+  - name: microsoft.ad
+    version: '1.12.0'

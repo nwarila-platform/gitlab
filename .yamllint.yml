@@ -1,0 +1,86 @@
+---
+# =============================================================================
+# yamllint Configuration
+# =============================================================================
+# Extends the default ruleset with Ansible-appropriate overrides.
+# Ansible YAML files tend to have long module parameter blocks and inline
+# Jinja2 expressions — configure accordingly without sacrificing correctness.
+# =============================================================================
+
+extends: default
+
+rules:
+
+  # ---------------------------------------------------------------------------
+  # Line Length
+  # ---------------------------------------------------------------------------
+  # 160 chars accommodates verbose module parameter blocks. Warning-only so
+  # pipelines don't fail on rare exceptions; keep lines short by convention.
+  # ---------------------------------------------------------------------------
+  line-length:
+    max: 160
+    level: warning
+
+  # ---------------------------------------------------------------------------
+  # Truthy Values
+  # ---------------------------------------------------------------------------
+  # Enforce canonical YAML 1.2 booleans (true/false). Ansible historically
+  # accepted yes/no/on/off, but these are ambiguous and deprecated in
+  # Ansible 2.17+ (YAML 1.1 legacy). Quoted 'yes'/'no' strings are allowed.
+  # ---------------------------------------------------------------------------
+  truthy:
+    allowed-values: ['true', 'false']
+    check-keys: true
+
+  # ---------------------------------------------------------------------------
+  # Document Start
+  # ---------------------------------------------------------------------------
+  # Disabled — Ansible task files and role files commonly start with comments
+  # or directly with list items. Enforce via convention, not linting.
+  # ---------------------------------------------------------------------------
+  document-start: disable
+
+  # ---------------------------------------------------------------------------
+  # Comments
+  # ---------------------------------------------------------------------------
+  # Require 1 space between code and inline comment (#).
+  # Disable indentation enforcement — region comments and block headers
+  # intentionally sit at column 0 or use custom indentation.
+  # ---------------------------------------------------------------------------
+  comments:
+    min-spaces-from-content: 1
+  comments-indentation: disable
+
+  # ---------------------------------------------------------------------------
+  # Braces & Brackets
+  # ---------------------------------------------------------------------------
+  # Allow up to 1 space inside braces and brackets to match common Jinja2
+  # and Ansible inline dict/list style: { key: value } and [ item ].
+  # ---------------------------------------------------------------------------
+  braces:
+    min-spaces-inside: 0
+    max-spaces-inside: 1
+  brackets:
+    min-spaces-inside: 0
+    max-spaces-inside: 1
+
+  # ---------------------------------------------------------------------------
+  # Indentation
+  # ---------------------------------------------------------------------------
+  # Standard 2-space indentation. indent-sequences: consistent allows both
+  # block and flow sequence styles as long as they're internally consistent.
+  # ---------------------------------------------------------------------------
+  indentation:
+    spaces: 2
+    indent-sequences: consistent
+    check-multi-line-strings: false
+
+  # ---------------------------------------------------------------------------
+  # New Line at End of File
+  # ---------------------------------------------------------------------------
+  new-line-at-end-of-file: enable
+
+  # ---------------------------------------------------------------------------
+  # Trailing Spaces
+  # ---------------------------------------------------------------------------
+  trailing-spaces: enable

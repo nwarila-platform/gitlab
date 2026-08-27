@@ -1,0 +1,510 @@
+# =========================================================================================== #
+# AWS Deploy — gitlab
+# ------------------------------------------------------------------------------------------- #
+# Ephemeral lifecycle: terraform init/apply -> ansible -> terraform destroy on the normal path.
+# Terraform is DATA-ONLY here (a plain tfvars, no .tf files); resources live in the pinned
+# aws-terraform-framework, configuration in the pinned ansible-framework + this repo's role.
+#
+#   * AWS credentials are issued only to this workflow at refs/heads/main. Pull requests use
+#     the credential-free quality workflow; feature-branch workflow code never reaches AWS.
+#   * Reachability: direct SSH to a subnet-assigned public IPv4. At runtime the framework adds
+#     one run-scoped security group to every interface, sourced from the runner's validated
+#     public IPv4 and, when an operator hostname is configured, from the address it resolves to
+#     as well — that one adding RDP, so a person can work on a held host. This configuration
+#     creates no EIP and has no NAT. The playbook performs the bounded direct-SSH readiness
+#     check because readiness_gate remains disabled.
+#   * AWS credentials are exchanged before provisioning and refreshed before eligible teardown.
+#     The initial 7,800-second session covers normal deployment work; the teardown refresh uses a
+#     modest 3,600-second session so long holds do not reach destroy with expired credentials.
+#     The 330-minute job budget includes a four-hour hold plus measured-path margin and stays below
+#     the runner's 360-minute execution limit. It is not a teardown guarantee: abnormal delay can
+#     exhaust the job budget before destroy and strand paid resources. That risk is accepted for
+#     this temporary proof bed.
+#   * One fixed state key; this workflow's concurrency group prevents overlapping applies and
+#     never cancels a live lifecycle. A later lifecycle can clean predecessor state before apply;
+#     no age-gated reaper exists for a run killed before destroy.
+#   * Protected-main pushes prove immediately; an off-minute weekly schedule proves recurrence.
+#     One durable incident is updated on failure and closed after the next successful lifecycle.
+# =========================================================================================== #
+name: AWS Deploy
+
+'on':
+  workflow_dispatch:
+    inputs:
+      hold_minutes:
+        description: Hold the converged guest before teardown
+        type: choice
+        options: [ '0', '15', '60', '120', '240' ]
+        default: '0'
+  push:
+    branches: [ main ]
+  schedule:
+    # Avoid the top-of-hour load spike documented for scheduled Actions workflows.
+    - cron: '17 9 * * 1'
+permissions: {}
+
+# One boundary, one state key — never two runs at once, never cancel a live apply.
+concurrency:
+  group: aws-deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  main-ref:
+    name: Protected main ref
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Refuse privileged execution outside protected main
+        env:
+          EXPECTED_REF: refs/heads/main
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF}" != "${EXPECTED_REF}" ]; then
+            echo "::error::AWS lifecycle runs only from ${EXPECTED_REF}; got ${GITHUB_REF}."
+            exit 1
+          fi
+
+  aws-deploy:
+    name: AWS (ephemeral deploy-test-destroy)
+    needs: main-ref
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    # The 330-minute budget leaves measured-path margin around a 240-minute hold and remains below
+    # the runner's 360-minute execution limit; a timeout can still strand resources before teardown.
+    timeout-minutes: 330
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: us-east-1
+      DEPLOY_ROLE: nwarila-platform_gitlab_runner
+      # Must match key_name in terraform/aws.tfvars.
+      CI_KEY_NAME: nwarila-ec2-key
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Validate hold duration
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          HOLD_MINUTES: ${{ inputs.hold_minutes }}
+        run: |
+          set -euo pipefail
+          case "${HOLD_MINUTES}" in
+            0|15|60|120|240) ;;
+            *)
+              echo "::error::hold_minutes must be one of 0, 15, 60, 120, or 240; re-dispatch with a listed choice."
+              exit 1
+              ;;
+          esac
+
+      - name: Set up pinned Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c # v6.0.0
+        with:
+          python-version: '3.12.11'
+          cache: pip
+          cache-dependency-path: requirements-quality.txt
+
+      - name: Install Ansible
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: '1'
+        run: |
+          set -euo pipefail
+          . ./quality-tools.env
+          runtime_venv="${RUNNER_TEMP}/aws-proof-venv"
+          python3 -m venv "${runtime_venv}"
+          "${runtime_venv}/bin/python" -m pip install --quiet --no-cache-dir \
+            --requirement requirements-quality.txt
+          "${runtime_venv}/bin/ansible-galaxy" collection install --force \
+            --requirements-file requirements-quality.yml
+          echo "${runtime_venv}/bin" >> "${GITHUB_PATH}"
+
+      # The framework consumes a pre-existing key pair and never creates one, so the standing
+      # account key pair named in terraform/aws.tfvars is the launch key. Windows user_data
+      # installs its public half by reading IMDS; only the private half is secret, and it
+      # exists solely in this runner's temporary directory, mode 0600, for this one job.
+      - name: Stage the launch private key
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.AWS_EC2_SSH_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          private_key="${RUNNER_TEMP}/${CI_KEY_NAME}.pem"
+          umask 077
+          printf '%s\n' "${SSH_PRIVATE_KEY}" > "${private_key}"
+          staged_public="$(ssh-keygen -y -f "${private_key}")" \
+            || { echo "::error::AWS_EC2_SSH_PRIVATE_KEY is not a usable private key."; exit 1; }
+          echo "CI_PRIVATE_KEY=${private_key}" >> "${GITHUB_ENV}"
+          echo "CI_STAGED_PUBLIC_KEY=${staged_public}" >> "${GITHUB_ENV}"
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
+          role-session-name: aws-deploy-${{ github.run_id }}
+          role-duration-seconds: 7800
+
+      # actions/checkout cannot read a file into ref:, so validated immutable SHAs pass through
+      # step outputs. Reject malformed/multiline pins before any external framework checkout.
+      # A rotated secret that no longer matches the launch key pair is invisible until Ansible
+      # cannot log in — which surfaces fifteen minutes and one instance later as a readiness
+      # timeout. Compare the two public halves here instead, before anything is created.
+      - name: Assert the staged key matches the launch key pair
+        run: |
+          set -euo pipefail
+          launch_public="$(aws ec2 describe-key-pairs --key-names "${CI_KEY_NAME}" \
+            --include-public-key --query 'KeyPairs[0].PublicKey' --output text)"
+          staged_material="$(awk '{print $1" "$2}' <<< "${CI_STAGED_PUBLIC_KEY}")"
+          launch_material="$(awk '{print $1" "$2}' <<< "${launch_public}")"
+          if [ "${staged_material}" != "${launch_material}" ]; then
+            echo "::error::AWS_EC2_SSH_PRIVATE_KEY does not match EC2 key pair ${CI_KEY_NAME}." \
+                 "The guest installs the key pair's public half, so SSH would fail after launch." \
+                 "Rotate the secret to the matching private key, or repoint key_name."
+            exit 1
+          fi
+          echo "staged key matches ${CI_KEY_NAME}"
+
+      - name: Read framework pins
+        id: pins
+        run: |
+          set -euo pipefail
+          emit_pin() {
+            local name="$1" path="$2" pin
+            local -a lines
+            mapfile -t lines < "${path}"
+            [ "${#lines[@]}" -eq 1 ] || {
+              echo "${path} must contain exactly one line" >&2
+              return 1
+            }
+            pin="${lines[0]}"
+            [[ "${pin}" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "${path} must contain exactly one lowercase 40-character Git SHA" >&2
+              return 1
+            }
+            printf '%s=%s\n' "${name}" "${pin}" >> "${GITHUB_OUTPUT}"
+          }
+          # The ansible-framework pin is the single root .framework-pin, read by BOTH this workflow
+          # and scripts/compose-and-run.sh, so local and CI can never diverge. The terraform pin
+          # stays under .github/ because only CI consumes terraform.
+          emit_pin terraform .github/terraform-framework-pin
+          emit_pin ansible .framework-pin
+
+      - name: Checkout aws-terraform-framework (pinned)
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: ${{ github.repository_owner }}/aws-terraform-framework
+          ref: ${{ steps.pins.outputs.terraform }}
+          path: .frameworks/aws-terraform-framework
+          persist-credentials: false
+
+      - name: Checkout ansible-framework (pinned)
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: ${{ github.repository_owner }}/ansible-framework
+          ref: ${{ steps.pins.outputs.ansible }}
+          path: .frameworks/ansible-framework
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: '1.15.1'
+          terraform_wrapper: false
+
+      - name: Discover and validate runner public IPv4
+        run: |
+          set -euo pipefail
+          runner_ip="$(curl -fsS https://checkip.amazonaws.com)"
+          ipv4_octet='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+          if [[ ! "${runner_ip}" =~ ^${ipv4_octet}\.${ipv4_octet}\.${ipv4_octet}\.${ipv4_octet}$ ]]; then
+            echo "::error::Runner public address discovery did not return a bare IPv4 address."
+            exit 1
+          fi
+          echo "::add-mask::${runner_ip}"
+          echo "RUNNER_IP=${runner_ip}" >> "${GITHUB_ENV}"
+          echo 'runner public IPv4 validated'
+
+      # The operator's own address, so a held host can be reached directly rather than through a
+      # tunnel. The secret carries a NAME, not an address: the name is stable and private, the
+      # address behind it changes with the operator's connection, and resolving here means only
+      # the address reaches Terraform -- masked in the log, exactly as the runner's is. The
+      # address does reach Terraform state and the security group it builds; what no commit
+      # records is the operator it belongs to.
+      #
+      # Absent secret means no operator access, not a failed run: the framework's debug_ip is
+      # optional and a pipeline with nobody watching should grant nobody anything. A name that
+      # is set and will not resolve DOES fail, because the alternative is a host that silently
+      # cannot be reached by the person who asked for it.
+      - name: Resolve the operator address for direct access
+        env:
+          DEBUG_HOSTNAME: ${{ secrets.AWS_DEBUG_HOSTNAME }}
+        run: |
+          set -euo pipefail
+          if [ -z "${DEBUG_HOSTNAME}" ]; then
+            echo 'no operator hostname configured; this run grants no direct access'
+            exit 0
+          fi
+          # `|| true` so the check below is the ONE gate: a name that does not resolve and a name
+          # that resolves to something that is not an address fail the same way to a reader, and
+          # without it the first kills the step on pipefail before this message can explain
+          # itself. The check proves the SHAPE of an address, not that it is routable -- a name
+          # pointing somewhere private yields a rule that simply reaches nobody.
+          debug_ip="$(getent ahostsv4 "${DEBUG_HOSTNAME}" | awk '{ print $1; exit }' || true)"
+          ipv4_octet='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+          if [[ ! "${debug_ip}" =~ ^${ipv4_octet}\.${ipv4_octet}\.${ipv4_octet}\.${ipv4_octet}$ ]]; then
+            echo "::error::The operator hostname did not resolve to a bare IPv4 address."
+            exit 1
+          fi
+          echo "::add-mask::${debug_ip}"
+          echo "DEBUG_IP=${debug_ip}" >> "${GITHUB_ENV}"
+          echo 'operator IPv4 resolved and validated'
+
+      - name: Terraform init
+        id: tf-init
+        working-directory: .frameworks/aws-terraform-framework/terraform
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false                                      \
+            -backend-config="bucket=${AWS_ACCOUNT_ID}-terraform"           \
+            -backend-config="key=${{ github.repository }}/aws-poc.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+
+      # A killed predecessor can leave state and an instance whose one-time SSH private key no
+      # longer exists. Never adopt it: destroy under the same lock, then apply with a fresh key.
+      # A live/out-of-band lock makes this fail closed.
+      - name: Remove interrupted predecessor state before apply
+        timeout-minutes: 15
+        working-directory: .frameworks/aws-terraform-framework/terraform
+        env:
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          terraform destroy -input=false -auto-approve -lock-timeout=300s    \
+            -var-file="${GITHUB_WORKSPACE}/terraform/aws.tfvars"             \
+            -var "commit_sha=$(git -C "${GITHUB_WORKSPACE}" rev-parse HEAD)" \
+            -var "environment=test"                                          \
+            -var "repository=${GITHUB_REPOSITORY}"                           \
+            -var "repository_id=${GITHUB_REPOSITORY_ID}"                     \
+            -var "run_id=${GITHUB_RUN_ID}"                                   \
+            -var "runner_ip=${RUNNER_IP}"                                    \
+            ${DEBUG_IP:+-var "debug_ip=${DEBUG_IP}"}
+
+      # The value file comes FIRST and the identity flags after it. Terraform resolves repeated
+      # command-line assignments in the order they are given, so this ordering -- not the kind of
+      # flag -- is what stops the file from renaming who this fresh deployment says it is.
+      - name: Terraform apply
+        id: tf-apply
+        timeout-minutes: 15
+        working-directory: .frameworks/aws-terraform-framework/terraform
+        run: |
+          set -euo pipefail
+          terraform apply -input=false -auto-approve -lock-timeout=120s      \
+            -var-file="${GITHUB_WORKSPACE}/terraform/aws.tfvars"             \
+            -var "commit_sha=$(git -C "${GITHUB_WORKSPACE}" rev-parse HEAD)" \
+            -var "environment=test"                                          \
+            -var "repository=${GITHUB_REPOSITORY}"                           \
+            -var "repository_id=${GITHUB_REPOSITORY_ID}"                     \
+            -var "run_id=${GITHUB_RUN_ID}"                                   \
+            -var "runner_ip=${RUNNER_IP}"                                    \
+            ${DEBUG_IP:+-var "debug_ip=${DEBUG_IP}"}
+
+      # This repo's roles overlay onto the pinned framework tree. A framework-TRACKED role
+      # path is refused so an overlay can never replace framework-owned code.
+      - name: Compose the Ansible tree
+        run: |
+          set -euo pipefail
+          # A role that runs a first-class PowerShell script tracks only files/<Name>.ps1.stub;
+          # the script itself is developed and pair-tested under scripts/ and copied into place
+          # here. This must precede the rsync below, which is what carries the materialized copy
+          # into the composed tree.
+          bash "${GITHUB_WORKSPACE}/scripts/materialize-role-scripts.sh"
+
+          framework_dir="${GITHUB_WORKSPACE}/.frameworks/ansible-framework"
+
+          # The framework's own roles track only files/<Name>.ps1.stub. Materialize them in the
+          # checkout before the overlay: that materializer validates every stub it finds, and this
+          # repository's roles resolve their sources from this repository, not from the framework.
+          if [ -x "${framework_dir}/scripts/materialize-role-scripts.sh" ]; then
+            (cd "${framework_dir}" && ./scripts/materialize-role-scripts.sh)
+          fi
+
+          for role_source in "${GITHUB_WORKSPACE}"/ansible/applications/*; do
+            role_name="$(basename "${role_source}")"
+            [ -f "${role_source}/tasks/main.yml" ] || { echo "!! missing tasks/main.yml in ${role_source}" >&2; exit 1; }
+            [ -z "$(git -C "${framework_dir}" ls-files -- "applications/${role_name}/")" ] \
+              || { echo "!! refusing framework-tracked role path applications/${role_name}" >&2; exit 1; }
+            rsync -a --delete "${role_source}/" "${framework_dir}/applications/${role_name}/"
+          done
+
+      # Readiness, configuration and the application proof all live in the playbook. The EC2
+      # inventory plugin filters live AWS instances to this repository and run before exposing
+      # one target. The budget guards against a hung converge without cutting a working one short.
+      - name: Run the application playbook
+        timeout-minutes: 60
+        working-directory: .frameworks/ansible-framework
+        env:
+          ANSIBLE_CONFIG: ${{ github.workspace }}/.frameworks/ansible-framework/ansible.cfg
+          # A secret reaches the shell through the environment, never by substitution into the
+          # script text, so its value cannot be read as shell syntax. Forwarded on as an
+          # extra-var below because the play requires it; same value the OIDC role ARN uses.
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          # NOT extra-vars: the dynamic inventory reads these from the environment to pick this
+          # run's instance, and a lookup('env') has no command-line equivalent.
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          # Dynamic inventory publishes an instance attribute named state; extra-vars take precedence.
+          ansible-playbook "${GITHUB_WORKSPACE}/ansible/playbooks/gitlab-aws.yml" \
+            --extra-vars aws_account_id="${AWS_ACCOUNT_ID}"                    \
+            --extra-vars aws_region="${AWS_REGION}"                            \
+            --extra-vars env=test                                              \
+            --extra-vars state=present                                         \
+            --inventory "${GITHUB_WORKSPACE}/ansible/inventory/aws_ec2.yml"
+
+      - name: Hold the converged guest for interactive work
+        if: >-
+          !cancelled() &&
+          github.event_name == 'workflow_dispatch' &&
+          inputs.hold_minutes != '0' &&
+          steps.tf-apply.outcome == 'success'
+        timeout-minutes: 245
+        env:
+          HOLD_MINUTES: ${{ inputs.hold_minutes }}
+        run: |
+          set -euo pipefail
+          instance_id="$(
+            aws ec2 describe-instances \
+              --filters "Name=tag:RepositoryId,Values=${GITHUB_REPOSITORY_ID}" \
+                        "Name=tag:RunId,Values=${GITHUB_RUN_ID}" \
+                        "Name=tag:Repository,Values=${GITHUB_REPOSITORY}" \
+                        "Name=tag:Environment,Values=test" \
+                        "Name=instance-state-name,Values=running" \
+              --query 'Reservations[].Instances[].InstanceId' \
+              --output text 2>/dev/null || true
+          )"
+          if [[ ! "${instance_id}" =~ ^i-[0-9a-f]+$ ]]; then
+            instance_id='unavailable'
+          fi
+
+          remaining_minutes="${HOLD_MINUTES}"
+          echo "Holding EC2 instance ${instance_id} for ${remaining_minutes} minutes."
+          while (( remaining_minutes > 0 )); do
+            sleep 300
+            remaining_minutes=$((remaining_minutes - 5))
+            echo "Hold heartbeat for EC2 instance ${instance_id}: ${remaining_minutes} minutes remaining."
+          done
+          exit 0
+
+      - name: Refresh AWS credentials for teardown (OIDC)
+        if: always() && steps.tf-init.outcome == 'success'
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
+          role-session-name: aws-deploy-${{ github.run_id }}-teardown
+          role-duration-seconds: 3600
+
+      # Gated on INIT, not apply: a failed apply still leaves state to tear down.
+      - name: Terraform destroy (always)
+        id: tf-destroy
+        if: >-
+          always() &&
+          steps.tf-init.outcome == 'success'
+        timeout-minutes: 15
+        working-directory: .frameworks/aws-terraform-framework/terraform
+        env:
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          terraform destroy -input=false -auto-approve -lock-timeout=300s    \
+            -var-file="${GITHUB_WORKSPACE}/terraform/aws.tfvars"             \
+            -var "commit_sha=$(git -C "${GITHUB_WORKSPACE}" rev-parse HEAD)" \
+            -var "environment=test"                                          \
+            -var "repository=${GITHUB_REPOSITORY}"                           \
+            -var "repository_id=${GITHUB_REPOSITORY_ID}"                     \
+            -var "run_id=${GITHUB_RUN_ID}"                                   \
+            -var "runner_ip=${RUNNER_IP}"                                    \
+            ${DEBUG_IP:+-var "debug_ip=${DEBUG_IP}"}
+
+      - name: Remove the ephemeral private key
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${CI_PRIVATE_KEY:-}" ]; then
+            rm -f -- "${CI_PRIVATE_KEY}"
+          fi
+
+  report:
+    name: AWS lifecycle incident
+    needs: [main-ref, aws-deploy]
+    if: always() && needs.main-ref.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      INCIDENT_LABEL: automation-incident
+      INCIDENT_MARKER: '<!-- gitlab-automation:aws-lifecycle -->'
+      INCIDENT_TITLE: '[automation] AWS lifecycle proof failed'
+      LIFECYCLE_RESULT: ${{ needs.aws-deploy.result }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Update or resolve the lifecycle incident
+        run: |
+          set -euo pipefail
+
+          gh label create "${INCIDENT_LABEL}" --repo "${GITHUB_REPOSITORY}" --force \
+            --color B60205 --description 'Owned exclusively by recurring automation incidents' > /dev/null
+          issue_json="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state all --limit 100 \
+            --label "${INCIDENT_LABEL}" --json number,title,body,author,state)"
+          mapfile -t issue_numbers < <(jq -r --arg title "${INCIDENT_TITLE}" \
+            --arg marker "${INCIDENT_MARKER}" '
+              [.[] | select(
+                .title == $title
+                and .author.login == "app/github-actions"
+                and ((.body // "") | contains($marker))
+              )] | sort_by(.number) | .[].number
+            ' <<< "${issue_json}")
+          issue_number="${issue_numbers[0]:-}"
+          for duplicate in "${issue_numbers[@]:1}"; do
+            if [ "$(gh issue view "${duplicate}" --repo "${GITHUB_REPOSITORY}" \
+              --json state --jq .state)" = OPEN ]; then
+              gh issue close "${duplicate}" --repo "${GITHUB_REPOSITORY}" --reason duplicate \
+                --comment "Deduplicated into automation-owned incident #${issue_number}."
+            fi
+          done
+
+          if [ "${LIFECYCLE_RESULT}" = success ]; then
+            if [ -n "${issue_number}" ] && \
+              [ "$(gh issue view "${issue_number}" --repo "${GITHUB_REPOSITORY}" --json state --jq .state)" = OPEN ]; then
+              gh issue close "${issue_number}" --repo "${GITHUB_REPOSITORY}" \
+                --reason completed --comment "Recovered in ${RUN_URL}."
+            else
+              echo "Lifecycle is healthy; no open incident to resolve."
+            fi
+            exit 0
+          fi
+
+          message="Lifecycle result: ${LIFECYCLE_RESULT}. Inspect ${RUN_URL}."
+          message="${message} Cleanup was attempted when initialization succeeded;"
+          message="${message} inspect the destroy and post-cleanup steps."
+          if [ -z "${issue_number}" ]; then
+            gh issue create --repo "${GITHUB_REPOSITORY}" \
+              --label "${INCIDENT_LABEL}" --title "${INCIDENT_TITLE}" \
+              --body "$(printf '%s\n\n%s' "${INCIDENT_MARKER}" "${message}")"
+          else
+            if [ "$(gh issue view "${issue_number}" --repo "${GITHUB_REPOSITORY}" --json state --jq .state)" = CLOSED ]; then
+              gh issue reopen "${issue_number}" --repo "${GITHUB_REPOSITORY}"
+            fi
+            gh issue comment "${issue_number}" --repo "${GITHUB_REPOSITORY}" --body "${message}"
+          fi
