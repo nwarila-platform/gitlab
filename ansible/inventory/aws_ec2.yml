@@ -143,6 +143,14 @@ compose:
     lookup('ansible.builtin.env', 'CI_PRIVATE_KEY')
     | default('~/.ssh/nwarila-ec2-key', true)
 
+  # Linux interpreter: RHEL converges on platform-python, the interpreter its system packages
+  # target; every other distribution uses the standard python3. Windows connections ignore
+  # this variable. A task needing a newer boto3 than the pinned interpreter carries overrides
+  # itself, per-task, onto its bootstrap venv.
+  ansible_python_interpreter: >-
+    (aws_platform_details | lower is search('red hat'))
+      | ternary('/usr/libexec/platform-python', '/usr/bin/python3')
+
   #endregion --- [ Logging in ] --------------------------------------------------------------- #
 
   #region ------ [ WinRM only ] --------------------------------------------------------------- #
@@ -157,6 +165,12 @@ compose:
   # An EC2 Windows image generates its 5986 certificate on the instance, so there is nothing to
   # chain to. A real downgrade against the SSH legs, which authenticate the host key.
   ansible_winrm_server_cert_validation: "'ignore'"
+
+  # Where the launch password comes from on a WinRM leg. The play that fetches it gates on
+  # 'ec2'; every other leg composes empty, so SSH-only repositories never trip that play.
+  windows_password_source: >-
+    ((aws_tags.Connection | default('ssh-direct', true)) == 'winrm-direct')
+    | ternary('ec2', '')
 
   #endregion --- [ WinRM only ] --------------------------------------------------------------- #
 
