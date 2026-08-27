@@ -31,7 +31,9 @@
 # --- [ allowed: top-level documents ] ------------------------------------------------------- #
 !/AGENTS.md
 !/CLAUDE.md
+!/LICENSE
 !/README.md
+!/SECURITY.md
 !/quality-tools.env
 !/requirements-quality.txt
 !/requirements-quality.yml
