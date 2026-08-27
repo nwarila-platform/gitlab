@@ -21,6 +21,7 @@
 !/ansible/
 !/ansible/inventory/
 !/scripts/
+!/terraform/
 
 # --- [ allowed: repository configuration ] -------------------------------------------------- #
 !/.editorconfig
@@ -52,3 +53,7 @@
 # --- [ allowed: scripts ] ------------------------------------------------------------------- #
 !/scripts/compose-and-run.sh
 !/scripts/materialize-role-scripts.sh
+
+# --- [ allowed: terraform (data-only; resources live in the pinned framework) ] -------------- #
+!/terraform/README.md
+!/terraform/aws.tfvars
