@@ -23,7 +23,8 @@
 #   * One fixed state key; this workflow's concurrency group prevents overlapping applies and
 #     never cancels a live lifecycle. A later lifecycle can clean predecessor state before apply;
 #     no age-gated reaper exists for a run killed before destroy.
-#   * Protected-main pushes prove immediately; an off-minute weekly schedule proves recurrence.
+#   * Protected-main pushes that touch the deploy inputs — terraform, ansible, the framework
+#     pins, this workflow — prove immediately; an off-minute weekly schedule proves recurrence.
 #     One durable incident is updated on failure and closed after the next successful lifecycle.
 # =========================================================================================== #
 name: AWS Deploy
@@ -38,6 +39,12 @@ name: AWS Deploy
         default: '0'
   push:
     branches: [ main ]
+    paths:
+      - 'terraform/**'
+      - 'ansible/**'
+      - '.framework-pin'                      # a pin bump changes what is deployed
+      - '.github/terraform-framework-pin'
+      - '.github/workflows/aws-deploy.yml'
   schedule:
     # Avoid the top-of-hour load spike documented for scheduled Actions workflows.
     - cron: '17 9 * * 1'
