@@ -30,8 +30,6 @@
 !/.yamllint.yml
 
 # --- [ allowed: top-level documents ] ------------------------------------------------------- #
-!/AGENTS.md
-!/CLAUDE.md
 !/LICENSE
 !/README.md
 !/SECURITY.md
