@@ -14,7 +14,7 @@
 # group is the set of functions whose hosts this playbook configures -- add a function to the list
 # to have its hosts join, and give a second group its own list to split a deployment by role.
 groups:
-  gitlab_servers: "(aws_tags.Function | default('', true)) in ['gitlab']"
+  gitlab_servers: "((aws_ec2_tags | default(aws_tags)).Function | default('', true)) in ['gitlab']"
 
 #endregion --- [ This Repository ] ------------------------------------------------------------ #
 
@@ -81,10 +81,10 @@ compose:
   # error rather than a missing variable. An 'or' chain because Jinja evaluates filter ARGUMENTS
   # eagerly, so a nested default() still raises on an absent address.
   ansible_host: >-
-    ((aws_tags.Connection | default('ssh-direct', true)) == 'ssh-ssm')
+    (((aws_ec2_tags | default(aws_tags)).Connection | default('ssh-direct', true)) == 'ssh-ssm')
     | ternary(
         aws_instance_id,
-        ((aws_tags.Connection | default('ssh-direct', true)) == 'winrm-ssm')
+        (((aws_ec2_tags | default(aws_tags)).Connection | default('ssh-direct', true)) == 'winrm-ssm')
         | ternary(
             '127.0.0.1',
             (aws_public_ip_address | default('', true))
@@ -94,11 +94,11 @@ compose:
       )
 
   ansible_connection: >-
-    ((aws_tags.Connection | default('ssh-direct', true)) in ['winrm-direct', 'winrm-ssm'])
+    (((aws_ec2_tags | default(aws_tags)).Connection | default('ssh-direct', true)) in ['winrm-direct', 'winrm-ssm'])
     | ternary('winrm', 'ssh')
 
   ansible_port: >-
-    ((aws_tags.Connection | default('ssh-direct', true)) in ['winrm-direct', 'winrm-ssm'])
+    (((aws_ec2_tags | default(aws_tags)).Connection | default('ssh-direct', true)) in ['winrm-direct', 'winrm-ssm'])
     | ternary(5986, 22)
 
   # Keepalive: a settle poll can wait minutes with no SSH traffic, and an idle connection that times
@@ -111,7 +111,7 @@ compose:
   ansible_ssh_common_args: >-
     '-o StrictHostKeyChecking=accept-new -o ServerAliveInterval=30 -o ServerAliveCountMax=20'
     ~ (
-      ((aws_tags.Connection | default('ssh-direct', true)) == 'ssh-ssm') |
+      (((aws_ec2_tags | default(aws_tags)).Connection | default('ssh-direct', true)) == 'ssh-ssm') |
         ternary(
           ' -o ProxyCommand="aws ssm start-session --target %h'
           ~ ' --document-name AWS-StartSSHSession --parameters portNumber=%p"',
@@ -131,7 +131,7 @@ compose:
   # registry reads the bootstrap uses parse under either shell. A WinRM leg is different rather than
   # indifferent: that plugin expects cmd and warns when handed powershell.
   ansible_shell_type: >-
-    ((aws_tags.Connection | default('ssh-direct', true)) in ['winrm-direct', 'winrm-ssm'])
+    (((aws_ec2_tags | default(aws_tags)).Connection | default('ssh-direct', true)) in ['winrm-direct', 'winrm-ssm'])
     | ternary(
         'cmd',
         (aws_platform_details | lower is search('windows'))
@@ -169,7 +169,7 @@ compose:
   # Where the launch password comes from on a WinRM leg. The play that fetches it gates on
   # 'ec2'; every other leg composes empty, so SSH-only repositories never trip that play.
   windows_password_source: >-
-    ((aws_tags.Connection | default('ssh-direct', true)) == 'winrm-direct')
+    (((aws_ec2_tags | default(aws_tags)).Connection | default('ssh-direct', true)) == 'winrm-direct')
     | ternary('ec2', '')
 
   #endregion --- [ WinRM only ] --------------------------------------------------------------- #
@@ -183,7 +183,7 @@ compose:
 
   # The framework loader requires a variable NAMED 'ENV' and lower-cases the value itself. Read bare
   # because the Environment filter above admits only instances that carry the tag.
-  ENV: "aws_tags.Environment"
+  ENV: "(aws_ec2_tags | default(aws_tags)).Environment"
 
   #endregion --- [ Framework inputs ] --------------------------------------------------------- #
 
