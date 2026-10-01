@@ -10,3 +10,10 @@ collections:
   # The framework's domain_member role performs its Windows join through microsoft.ad.
   - name: microsoft.ad
     version: '1.12.0'
+  # The rest of the Galaxy set the pinned framework's requirements.yml declares, at the versions it
+  # declares at the pinned commit, so every role the composed tree ships resolves offline -- not
+  # only the ones this playbook composes today.
+  - name: community.general
+    version: '7.5.9'
+  - name: ansible.posix
+    version: '1.6.2'

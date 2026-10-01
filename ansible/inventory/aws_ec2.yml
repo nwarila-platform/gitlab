@@ -3,9 +3,8 @@
 # --- [ Description ] ----------------------------------------------------------------------- #
 #
 # The dynamic EC2 inventory, and the only one: the deployment is ephemeral, so an instance id
-# written into a static file here would be wrong the moment its run ended. This finds the instance
-# the current run created and derives every connection setting from that instance, which is why the
-# playbook declares no connection variables of its own.
+# written into a static file here would be wrong the moment its run ended. This finds this run's
+# instances. The inventory says how to reach a host; credential_resolver selects who logs on.
 #
 # =========================================================================================== #
 ---
@@ -49,7 +48,7 @@ hostnames: [ 'tag:Name', instance-id ]
 strict: true
 
 # The plugin publishes a host variable named 'state' -- the EC2 instance state -- which would
-# collide with the role input that selects present_windows.yml or absent_windows.yml. Prefixing
+# collide with the role input that selects present_redhat.yml or absent_redhat.yml. Prefixing
 # removes the collision at the source. It applies BEFORE compose, so the expressions below read
 # prefixed names; hostnames and filters read raw ones.
 hostvars_prefix: 'aws_'
@@ -138,18 +137,21 @@ compose:
         | ternary('powershell', 'sh')
       )
 
-  # The workflow stages its key and names it;
-  ansible_ssh_private_key_file: >-
-    lookup('ansible.builtin.env', 'CI_PRIVATE_KEY')
-    | default('~/.ssh/nwarila-ec2-key', true)
-
-  # Linux interpreter: RHEL converges on platform-python, the interpreter its system packages
-  # target; every other distribution uses the standard python3. Windows connections ignore
-  # this variable. A task needing a newer boto3 than the pinned interpreter carries overrides
-  # itself, per-task, onto its bootstrap venv.
+  # Linux interpreter. RHEL 8's platform-python is 3.6, below ansible-core 2.21's 3.9 floor, so
+  # RHEL names the Python 3.12 the framework's redhat_rocky_8 bootstrap installs; every other
+  # distribution uses the standard python3. Nothing before that bootstrap runs a module -- the
+  # resolver, the readiness probe and the bootstrap's own first step are raw -- and modules that
+  # need the distribution's 3.6-only bindings (dnf, rpm) respawn under platform-python themselves
+  # (measured 2026-09-30, ansible-core 2.21.2 on RHEL 8.10). Windows connections ignore this.
   ansible_python_interpreter: >-
     (aws_platform_details | lower is search('red hat'))
-      | ternary('/usr/libexec/platform-python', '/usr/bin/python3')
+      | ternary('/usr/bin/python3.12', '/usr/bin/python3')
+
+  # Pipelining, so a module is streamed to the interpreter on stdin instead of staged as a file.
+  # A STIG host runs fapolicyd, which denies an interpreter opening an untrusted script -- and a
+  # module staged under the remote temporary directory is exactly that. Streamed, there is no
+  # file to deny. Windows connections ignore this.
+  ansible_pipelining: 'true'
 
   #endregion --- [ Logging in ] --------------------------------------------------------------- #
 

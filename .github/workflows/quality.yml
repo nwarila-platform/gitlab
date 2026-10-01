@@ -57,14 +57,14 @@ jobs:
         id: pins
         run: |
           set -euo pipefail
-          mapfile -t lines < .framework-pin
+          mapfile -t lines < .github/ansible-framework-pin
           if [ "${#lines[@]}" -ne 1 ]; then
-            echo '.framework-pin must contain exactly one line' >&2
+            echo '.github/ansible-framework-pin must contain exactly one line' >&2
             exit 1
           fi
           pin="${lines[0]}"
           if [[ ! "${pin}" =~ ^[0-9a-f]{40}$ ]]; then
-            echo '.framework-pin must contain one lowercase 40-character Git SHA' >&2
+            echo '.github/ansible-framework-pin must be one lowercase 40-character Git SHA' >&2
             exit 1
           fi
           printf 'ansible=%s\n' "${pin}" >> "${GITHUB_OUTPUT}"
@@ -104,6 +104,19 @@ jobs:
             roles+=("applications/$(basename "${role_source}")")
           done
           ansible-lint "${roles[@]}"
+
+      # The playbook composes framework roles by bare name, so its syntax is only checkable from
+      # inside the composed tree, where roles_path resolves them.
+      - name: Check playbook syntax
+        if: steps.detect.outputs.has_ansible == 'true'
+        working-directory: .frameworks/ansible-framework
+        env:
+          ANSIBLE_CONFIG: ${{ github.workspace }}/.frameworks/ansible-framework/ansible.cfg
+        run: |
+          set -euo pipefail
+          for playbook in "${GITHUB_WORKSPACE}"/ansible/playbooks/*.yml; do
+            ansible-playbook --syntax-check --inventory localhost, "${playbook}"
+          done
 
       - name: Check shell syntax
         run: bash -n scripts/compose-and-run.sh scripts/materialize-role-scripts.sh
