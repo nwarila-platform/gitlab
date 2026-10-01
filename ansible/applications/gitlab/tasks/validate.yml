@@ -1,0 +1,34 @@
+# ============================================================================================= #
+# File: '{{ role_path }}/tasks/validate.yml'
+# --- [ Description ] ------------------------------------------------------------------------- #
+#
+# Validates the merged gitlab configuration on the CONTROLLER, before anything touches the guest,
+# so a missing or malformed input fails in a second rather than mid-converge at the cost of an
+# instance. meta/main.yml describes these inputs; this file enforces them.
+#
+# ============================================================================================= #
+---
+
+#region ------ [ Validate: The Pinned Installer ] --------------------------------------------- #
+
+# check: safety-critical -- the version is compared with what GitLab reports and recorded as what
+# was reconfigured, and the digest is the only thing vouching for the bytes.
+- name: 'VALIDATE | Require The Pinned Installer'
+  when: (state | default('present') | string | lower | trim) == 'present'
+
+  ansible.builtin.assert:
+    fail_msg: >-
+      Refusing to deploy: the playbook must supply installer.bucket (an S3 bucket name),
+      installer.version (three numeric parts, e.g. 19.4.1) and installer.sha256 (64 lower-case
+      hex characters). The bucket is not echoed because it carries the account id. Got version
+      '{{ gitlab_running.installer.version | default('') }}', sha256
+      '{{ gitlab_running.installer.sha256 | default('') }}'.
+    quiet: true
+    that:
+      - >-
+        gitlab_running.installer.bucket | default('')
+        is match('^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')
+      - gitlab_running.installer.version | default('') is match('^[0-9]+[.][0-9]+[.][0-9]+$')
+      - gitlab_running.installer.sha256 | default('') is match('^[0-9a-f]{64}$')
+
+#endregion --- [ Validate: The Pinned Installer ] --------------------------------------------- #

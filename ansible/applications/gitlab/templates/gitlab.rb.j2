@@ -1,0 +1,12 @@
+# Managed by the gitlab role (ansible/applications/gitlab); a local edit is overwritten, and a
+# change here is applied by the next converge's 'gitlab-ctl reconfigure'. Every setting not named
+# below keeps the package default.
+
+# The node's private address, from the EC2 inventory: GitLab is reached only from inside the
+# network.
+external_url 'http://{{ aws_private_ip_address }}'
+
+# Every bundled service shares this one node. Two of the settings GitLab documents for running in
+# a memory-constrained environment.
+prometheus_monitoring['enable'] = false
+sidekiq['concurrency'] = 10

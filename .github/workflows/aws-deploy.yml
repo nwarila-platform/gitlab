@@ -375,6 +375,28 @@ jobs:
             --extra-vars state=present                                         \
             --inventory "${GITHUB_WORKSPACE}/ansible/inventory/aws_ec2.yml"
 
+      # The opt-in proof play (nessus precedent): a git push creates a project over HTTP and a
+      # clone must read the same commit back. It adds a project, so it runs once, here, and the
+      # second converge after it still judges only what the role manages. The budget is
+      # unmeasured until the first live run.
+      - name: Prove GitLab serves a git push and clone
+        timeout-minutes: 15
+        working-directory: .frameworks/ansible-framework
+        env:
+          ANSIBLE_CONFIG: ${{ github.workspace }}/.frameworks/ansible-framework/ansible.cfg
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          ansible-playbook "${GITHUB_WORKSPACE}/ansible/playbooks/gitlab-aws.yml" \
+            --tags gitlab_proof                                                \
+            --extra-vars aws_account_id="${AWS_ACCOUNT_ID}"                    \
+            --extra-vars aws_region="${AWS_REGION}"                            \
+            --extra-vars env=test                                              \
+            --extra-vars state=present                                         \
+            --inventory "${GITHUB_WORKSPACE}/ansible/inventory/aws_ec2.yml"
+
       # Idempotency gate (nessus precedent): a settled node reports NO change on a second converge.
       # The role reads before it writes, so any change here is drift it failed to settle.
       - name: Prove a second converge changes nothing

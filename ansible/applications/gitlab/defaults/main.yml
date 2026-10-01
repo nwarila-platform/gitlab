@@ -1,0 +1,42 @@
+# ============================================================================================= #
+# File: '{{ role_path }}/defaults/main.yml'
+# --- [ Description ] ------------------------------------------------------------------------- #
+#
+# Lowest-precedence configuration for the gitlab role. The v3 loader merges the OS overlay in
+# vars/ over this map and publishes the result as 'gitlab_running'; tasks read only that.
+#
+# Universally safe values live here: the package, its object key and the vendor signing key. The
+# artifact's bucket, version and digest change with every site, so they are declared empty and
+# the PLAYBOOK supplies them where a reader can see them (meta/main.yml, tasks/validate.yml).
+#
+# ============================================================================================= #
+---
+gitlab_defaults:
+
+  #region ------ [ Installer ] ---------------------------------------------------------------- #
+
+  # The EL 8 package, at the application repository's <Publisher>/<Application>/<version> layout.
+  # The token <version> is replaced with installer.version, so a bump is one version and one
+  # digest; the controller fetches it and the guest verifies the digest and the vendor signature
+  # before dnf installs it.
+  installer:
+    bucket: ''
+    key: 'GitLab Inc/GitLab FIPS/<version>/GitLab-Inc_GitLab-FIPS_<version>-el8_x64.rpm'
+    version: ''
+    sha256: ''
+
+  # The package that object delivers: GitLab's FIPS build, which uses the system OpenSSL a host
+  # in FIPS mode requires. It is an EE build, and without a licence it runs as the Free tier.
+  package: 'gitlab-fips'
+
+  #endregion --- [ Installer ] ---------------------------------------------------------------- #
+
+  #region ------ [ Package Signing Key ] ------------------------------------------------------ #
+
+  # GitLab's package signing key, shipped in files/ and imported only when its fingerprint is
+  # this one. It expires 2028-02-16.
+  signing_key:
+    file: 'gitlab-package-signing-key.asc'
+    fingerprint: '98BFDB87FCF10076416C1E0BAD997ACC82DD593D'
+
+  #endregion --- [ Package Signing Key ] ------------------------------------------------------ #
