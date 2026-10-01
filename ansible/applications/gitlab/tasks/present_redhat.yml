@@ -91,6 +91,8 @@
     # Seconds gitlab-ctl reconfigure may run. UNMEASURED: a bound inside the converge step's
     # 60-minute budget until a live run measures reconfigure.
     __reconfigure_bound__: 1800
+    # Seconds timeout(1) waits after its SIGTERM at the bound before it sends SIGKILL.
+    __reconfigure_grace__: 60
   block:
 
     #region ------ [ Process: Trust The Package Signing Key ] --------------------------------- #
@@ -303,8 +305,7 @@
     #region ------ [ Process: Write The GitLab Configuration ] -------------------------------- #
 
     # 0600 as the package's own post-install step leaves it: reconfigure, as root, is its only
-    # reader. The Jinja delimiter arguments keep their defaults unstated, because a literal '{{'
-    # given as a value would itself be templated.
+    # reader.
     - name: 'PROCESS | Write gitlab.rb'
       register: '__gitlab_rb__'
 
@@ -378,7 +379,7 @@
         remote_src: false
         unsafe_writes: false
 
-    - name: 'BEGIN | Read The Rules fapolicyd Has Compiled'
+    - name: 'PROCESS | Read The Rules fapolicyd Has Compiled'
       changed_when: false
       check_mode: false
       register: '__gitlab_rules__'
@@ -420,7 +421,7 @@
       ansible.builtin.command:
         argv:
           - 'timeout'
-          - '--kill-after=60'
+          - "--kill-after={{ __reconfigure_grace__ }}"
           - "{{ __reconfigure_bound__ }}"
           - 'gitlab-ctl'
           - 'reconfigure'
@@ -429,7 +430,7 @@
         strip_empty_ends: true
 
     # rc-contract: timeout(1) exits 124 when it stopped the command at the bound. When the
-    # command outlives the 60-second grace as well, timeout kills itself with SIGKILL, which
+    # command outlives __reconfigure_grace__ as well, timeout kills itself with SIGKILL, which
     # Ansible reports as rc -9 -- as it does for a SIGKILL from the kernel.
     - name: 'PROCESS | Require The Reconfigure To Succeed'
       when: __gitlab_reconfigure__ is not skipped
@@ -440,7 +441,8 @@
           ('timed out after ' ~ __reconfigure_bound__ ~ ' s')
           if __gitlab_reconfigure__.rc == 124 else
           ('was killed by SIGKILL after ' ~ __gitlab_reconfigure__.delta ~ ' (the '
-           ~ __reconfigure_bound__ ~ ' s bound plus 60 s grace, or the kernel)')
+           ~ __reconfigure_bound__ ~ ' s bound plus ' ~ __reconfigure_grace__
+           ~ ' s grace, or the kernel)')
           if __gitlab_reconfigure__.rc == -9 else
           ('failed with rc ' ~ __gitlab_reconfigure__.rc) }}. Its output ended:
           {{ __gitlab_reconfigure__.stdout_lines[-40:] }}

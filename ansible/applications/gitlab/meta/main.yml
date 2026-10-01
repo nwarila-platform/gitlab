@@ -14,7 +14,8 @@
 #   gitlab.installer.sha256    Lowercase 64-character digest of that object, verified on the
 #                              controller and again on the GUEST before dnf installs it.
 #   gitlab.external_url        The http:// or https:// URL GitLab serves itself at, without
-#                              quotes or whitespace: gitlab.rb holds it in a Ruby string.
+#                              quotes, backslashes or whitespace: gitlab.rb holds it in a
+#                              Ruby string.
 #
 # The controller fetches the object with its own credentials; the guest is never given any.
 # ============================================================================================= #

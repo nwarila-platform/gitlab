@@ -34,8 +34,8 @@ supplies `installer.bucket`, `installer.version`, `installer.sha256` and `extern
 composes the object key from the version:
 `GitLab Inc/GitLab FIPS/<version>/GitLab-Inc_GitLab-FIPS_<version>-el8_x64.rpm`. The AWS playbook
 sets `external_url` to the node's private address, `aws_private_ip_address` from the EC2
-inventory. `tasks/validate.yml` requires an `http://` or `https://` URL without quotes or
-whitespace, because `gitlab.rb` holds it in a Ruby single-quoted string.
+inventory. `tasks/validate.yml` requires an `http://` or `https://` URL without quotes,
+backslashes or whitespace, because `gitlab.rb` holds it in a Ruby single-quoted string.
 
 ## Why `gitlab-fips`
 
