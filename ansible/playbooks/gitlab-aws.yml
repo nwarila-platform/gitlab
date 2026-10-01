@@ -22,6 +22,9 @@
 
 - name: 'PLAY | Validate The Ephemeral AWS Inventory Contract'
   hosts: 'localhost'
+  # A run that selects one play by tag, as the push proof does, is refused on an empty inventory
+  # too, rather than reporting a green run that touched nothing.
+  tags: ['always']
   tasks:
     - name: 'INVENTORY | Require At Least One Filtered Host'
       ansible.builtin.assert:
@@ -112,6 +115,10 @@
             version: '19.4.1'
             sha256: '339d4a04b89e67d6108642642a68ed31c3eaae46b8c50a09a4667c4610e3520b'
 
+          # The node's private address, from the EC2 inventory: GitLab is reached only from
+          # inside the network.
+          external_url: "http://{{ aws_private_ip_address }}"
+
   #endregion --- [ Roles ] -------------------------------------------------------------------- #
 
 #endregion --- [ Play: GitLab ] --------------------------------------------------------------- #
@@ -135,7 +142,7 @@
   vars:
     __proof_git__: '/opt/gitlab/embedded/bin/git'
     __proof_url__: >-
-      http://127.0.0.1/root/r0-proof-{{ lookup('ansible.builtin.env', 'GITHUB_RUN_ID') }}.git
+      http://127.0.0.1/root/push-proof-{{ lookup('ansible.builtin.env', 'GITHUB_RUN_ID') }}.git
     # Runs the git command line it is given with the header read from stdin set as git
     # environment config, and fails rather than prompting for a credential.
     __proof_with_header__: >-
@@ -153,6 +160,28 @@
         __source__: "{{ __proof_workspace__.path }}/source"
         __clone__: "{{ __proof_workspace__.path }}/clone"
       block:
+
+        # Asked first, outside no_log, so a missing file fails by name, not as hidden output.
+        - name: 'BEGIN | Read Whether The Initial Root Password Exists'
+          register: '__proof_password_file__'
+
+          ansible.builtin.stat:
+            checksum_algorithm: 'sha1'
+            follow: false
+            get_attributes: false
+            get_checksum: false
+            get_mime: false
+            get_selinux_context: false
+            path: '/etc/gitlab/initial_root_password'
+
+        - name: 'VERIFY | Require The Initial Root Password'
+          ansible.builtin.assert:
+            fail_msg: >-
+              /etc/gitlab/initial_root_password does not exist: the first reconfigure writes
+              it, and the first reconfigure after 24 hours removes it. The push proof signs in
+              with it.
+            quiet: true
+            that: __proof_password_file__.stat.exists
 
         - name: 'BEGIN | Read The Initial Root Password'
           no_log: true
@@ -205,7 +234,7 @@
 
         - name: 'BEGIN | Read The Commit To Push'
           changed_when: false
-          register: '__proof_pushed__'
+          register: '__proof_source_head__'
 
           ansible.builtin.command:
             argv: [ "{{ __proof_git__ }}", '-C', "{{ __source__ }}", 'rev-parse', 'HEAD' ]
@@ -215,7 +244,7 @@
 
         # Pushing to a project that does not exist creates it, private, under root.
         - name: 'PROCESS | Push The Commit To A New Project'
-          changed_when: true
+          changed_when: __proof_push__.rc == 0
           failed_when: false
           no_log: true
           register: '__proof_push__'
@@ -273,7 +302,7 @@
 
         - name: 'BEGIN | Read The Cloned Commit'
           changed_when: false
-          register: '__proof_cloned__'
+          register: '__proof_clone_head__'
 
           ansible.builtin.command:
             argv: [ "{{ __proof_git__ }}", '-C', "{{ __clone__ }}", 'rev-parse', 'HEAD' ]
@@ -284,16 +313,16 @@
         - name: 'VERIFY | Require The Clone To Hold The Pushed Commit'
           ansible.builtin.assert:
             fail_msg: >-
-              The clone of {{ __proof_url__ }} holds {{ __proof_cloned__.stdout }}, but
-              {{ __proof_pushed__.stdout }} was pushed.
+              The clone of {{ __proof_url__ }} holds {{ __proof_clone_head__.stdout }}, but
+              {{ __proof_source_head__.stdout }} was pushed.
             quiet: true
-            that: __proof_cloned__.stdout == __proof_pushed__.stdout
+            that: __proof_clone_head__.stdout == __proof_source_head__.stdout
 
         - name: 'INFO | Report The Round Trip'
           ansible.builtin.debug:
             msg: >-
-              Pushed {{ __proof_pushed__.stdout }} in {{ __proof_push__.delta }} and cloned
-              {{ __proof_cloned__.stdout }} back in {{ __proof_clone__.delta }}.
+              Pushed {{ __proof_source_head__.stdout }} in {{ __proof_push__.delta }} and cloned
+              {{ __proof_clone_head__.stdout }} back in {{ __proof_clone__.delta }}.
             verbosity: 0
 
       always:

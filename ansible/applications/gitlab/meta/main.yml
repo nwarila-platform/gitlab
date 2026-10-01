@@ -5,16 +5,16 @@
 # Role metadata for gitlab. Description-only: NOT an enforcing argument spec. The role's
 # tasks/validate.yml enforces its merged-config guards.
 #
-# REQUIRED INPUTS -- declared empty in defaults and supplied by the playbook, because every
-# artifact location carries an account id and a concrete default would ship one site's values:
+# REQUIRED INPUTS -- declared empty in defaults and supplied by the playbook, because each is
+# particular to a site or a node, and a concrete default would ship one site's values:
 #
 #   gitlab.installer.bucket    S3 bucket holding the package (the application repository).
 #   gitlab.installer.version   Three-part GitLab version the package delivers; read back from
 #                              the version manifest GitLab installs.
 #   gitlab.installer.sha256    Lowercase 64-character digest of that object, verified on the
 #                              controller and again on the GUEST before dnf installs it.
-#
-# FROM THE INVENTORY: aws_private_ip_address, the node's address in external_url.
+#   gitlab.external_url        The http:// or https:// URL GitLab serves itself at, without
+#                              quotes or whitespace: gitlab.rb holds it in a Ruby string.
 #
 # The controller fetches the object with its own credentials; the guest is never given any.
 # ============================================================================================= #

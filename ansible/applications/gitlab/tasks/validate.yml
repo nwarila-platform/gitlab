@@ -12,7 +12,7 @@
 #region ------ [ Validate: The Pinned Installer ] --------------------------------------------- #
 
 # check: safety-critical -- the version is compared with what GitLab reports and recorded as what
-# was reconfigured, and the digest is the only thing vouching for the bytes.
+# was reconfigured, and the digest is the only pin on which bytes are installed.
 - name: 'VALIDATE | Require The Pinned Installer'
   when: (state | default('present') | string | lower | trim) == 'present'
 
@@ -32,3 +32,19 @@
       - gitlab_running.installer.sha256 | default('') is match('^[0-9a-f]{64}$')
 
 #endregion --- [ Validate: The Pinned Installer ] --------------------------------------------- #
+
+#region ------ [ Validate: The External URL ] ------------------------------------------------- #
+
+# check: the URL lands inside a Ruby single-quoted string in gitlab.rb, so a quote or whitespace
+# in it would change what reconfigure evaluates.
+- name: 'VALIDATE | Require An External URL'
+  when: (state | default('present') | string | lower | trim) == 'present'
+
+  ansible.builtin.assert:
+    fail_msg: >-
+      Refusing to deploy: the playbook must supply external_url, an http:// or https:// URL
+      without quotes or whitespace. Got '{{ gitlab_running.external_url | default('') }}'.
+    quiet: true
+    that: gitlab_running.external_url | default('') is match('^https?://[^\'\s]+$')
+
+#endregion --- [ Validate: The External URL ] ------------------------------------------------- #
