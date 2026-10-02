@@ -1,0 +1,6 @@
+{
+  "InstanceProfileName": "nwarila-ec2-gitlab-profile",
+  "Roles": [
+    "nwarila-ec2-gitlab-role"
+  ]
+}

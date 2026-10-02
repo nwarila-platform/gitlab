@@ -8,6 +8,12 @@
         "arn:aws:iam::<account-id>:instance-profile/nwarila-ec2-apprepo-profile"
       ],
       "Sid": "ReadTheOrgInstanceProfile"
+    },
+    {
+      "Action": "iam:GetInstanceProfile",
+      "Effect": "Allow",
+      "Resource": "arn:aws:iam::<account-id>:instance-profile/nwarila-ec2-gitlab-profile",
+      "Sid": "ReadTheGitLabInstanceProfile"
     }
   ],
   "Version": "2012-10-17"

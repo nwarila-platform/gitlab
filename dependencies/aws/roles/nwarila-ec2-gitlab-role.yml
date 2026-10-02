@@ -1,0 +1,11 @@
+schema: aws-role/v1
+name: "nwarila-ec2-gitlab-role"
+session_seconds: 3600
+trust: "nwarila-ec2-gitlab-role.trust.json"
+attach:
+  - "nwarila-platform_gitlab_instance_s3"
+managed_attach:
+  - "AmazonSSMManagedInstanceCore"
+path: /
+description: null
+managed_by: consumer

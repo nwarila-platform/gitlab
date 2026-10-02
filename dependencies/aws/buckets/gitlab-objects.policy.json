@@ -1,0 +1,47 @@
+{
+  "Statement": [
+    {
+      "Action": "s3:*",
+      "Condition": {
+        "Bool": {
+          "aws:SecureTransport": "false"
+        }
+      },
+      "Effect": "Deny",
+      "Principal": "*",
+      "Resource": [
+        "arn:aws:s3:::<account-id>-gitlab-objects",
+        "arn:aws:s3:::<account-id>-gitlab-objects/*"
+      ],
+      "Sid": "DenyRequestsWithoutTls"
+    },
+    {
+      "Action": [
+        "s3:GetObject*",
+        "s3:PutObject*",
+        "s3:DeleteObject*",
+        "s3:AbortMultipartUpload",
+        "s3:ListMultipartUploadParts",
+        "s3:ListBucket",
+        "s3:ListBucketVersions",
+        "s3:ListBucketMultipartUploads"
+      ],
+      "Condition": {
+        "ArnNotEquals": {
+          "aws:PrincipalArn": [
+            "arn:aws:iam::<account-id>:role/nwarila-ec2-gitlab-role",
+            "arn:aws:iam::<account-id>:role/nwarila-platform_gitlab_admin"
+          ]
+        }
+      },
+      "Effect": "Deny",
+      "Principal": "*",
+      "Resource": [
+        "arn:aws:s3:::<account-id>-gitlab-objects",
+        "arn:aws:s3:::<account-id>-gitlab-objects/*"
+      ],
+      "Sid": "DenyObjectDataAndKeyNamesToAllButTheGitLabInstanceAndAdminRoles"
+    }
+  ],
+  "Version": "2012-10-17"
+}

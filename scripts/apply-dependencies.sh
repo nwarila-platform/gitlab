@@ -3,10 +3,11 @@
 # File: 'scripts/apply-dependencies.sh'
 # --- [ Description ] ----------------------------------------------------------------------- #
 #
-# Plans, and with --apply writes, what dependencies/aws/ declares: this repository's IAM roles and
-# policies, and the standing estate in estate.yml.
+# Plans, and with --apply writes, what dependencies/aws/ declares: this repository's IAM roles,
+# policies and instance profile, and the standing estate in estate.yml. With --export it records
+# live IAM's versions into dependencies/aws/manifest.json once nothing is pending.
 #
-#   scripts/apply-dependencies.sh [--apply] [aws-profile]      (profile defaults to 'admin')
+#   scripts/apply-dependencies.sh [--apply] [--export] [aws-profile]   (profile defaults to 'admin')
 #
 # Exit status: 0 in sync (or applied and verified), 2 a plan with pending changes, 1 any failure
 # or a blocked estate object. Every failed command stops the run and names itself.
@@ -34,11 +35,13 @@ set -E
 trap 'rc=$?; ((BASH_SUBSHELL)) && exit "${rc}"; die "line ${LINENO}: ${BASH_COMMAND} exited ${rc}"' ERR
 
 APPLY=false
+EXPORT=false
 PROFILE='admin'
 for arg in "$@"; do
     case "${arg}" in
         --apply) APPLY=true ;;
-        -*) die "unknown option ${arg}; usage: scripts/apply-dependencies.sh [--apply] [aws-profile]" ;;
+        --export) EXPORT=true ;;
+        -*) die "unknown option ${arg}; usage: scripts/apply-dependencies.sh [--apply] [--export] [aws-profile]" ;;
         *) PROFILE="${arg}" ;;
     esac
 done
@@ -66,7 +69,18 @@ read_or_absent() {
     local out="$1"
     shift
     if aws_ "$@" > "${out}" 2> "${WORK}/stderr"; then return 0; fi
-    if grep -q -E 'NoSuchEntity|DBSubnetGroupNotFoundFault|DBParameterGroupNotFound' "${WORK}/stderr"; then return 1; fi
+    if grep -q -E -e 'NoSuchEntity|DBSubnetGroupNotFoundFault|DBParameterGroupNotFound' \
+            -e 'NoSuchBucket\) when calling the GetBucketLocation operation' \
+            -e 'NoSuchTagSet|NoSuchPublicAccessBlockConfiguration|OwnershipControlsNotFoundError' \
+            -e 'NoSuchLifecycleConfiguration|NoSuchBucketPolicy|ServerSideEncryptionConfigurationNotFoundError' \
+            "${WORK}/stderr"; then
+        return 1
+    fi
+    # Bucket names are global: given the expected owner, GetBucketLocation answers 403 for a name
+    # another account holds.
+    if grep -q -E '\((403|AccessDenied)\) when calling the GetBucketLocation operation' "${WORK}/stderr"; then
+        die "aws $*: the bucket exists and is not ours"
+    fi
     die "aws $*: $(cat "${WORK}/stderr")"
 }
 
@@ -85,19 +99,20 @@ REPO_ID="$(gh api "repos/${OWNER}/${REPO}" --jq .id)"
 say 'account / region' "${ACCOUNT} / ${REGION}"
 say 'GitHub owner id / repository id' "${OWNER_ID} / ${REPO_ID}"
 
-mkdir -p "${WORK}/policies" "${WORK}/roles"
+mkdir -p "${WORK}/policies" "${WORK}/roles" "${WORK}/buckets"
 cp "${DEP}/policies/"*.json "${WORK}/policies/"
 cp "${DEP}/roles/"*.trust.json "${WORK}/roles/"
+cp "${DEP}/buckets/"*.json "${WORK}/buckets/"
+python3 -c 'import json, sys, yaml; json.dump(yaml.safe_load(open(sys.argv[1])), sys.stdout)' \
+    "${DEP}/estate.yml" > "${WORK}/estate.json"
+RENDERED=("${WORK}"/policies/*.json "${WORK}"/roles/*.json "${WORK}"/buckets/*.json "${WORK}/estate.json")
 sed -i "s|<account-id>|${ACCOUNT}|g; s|<owner-id>|${OWNER_ID}|g; s|<repository-id>|${REPO_ID}|g;
-        s|<region>|${REGION}|g" "${WORK}"/policies/*.json "${WORK}"/roles/*.json
+        s|<region>|${REGION}|g" "${RENDERED[@]}"
 # The gate the 2026-08-03 incident lacked: a rendered document may hold no token at all.
-if leftover="$(grep -l -E '<[a-z0-9-]+>' "${WORK}"/policies/*.json "${WORK}"/roles/*.json)"; then
+if leftover="$(grep -l -E '<[a-z0-9-]+>' "${RENDERED[@]}")"; then
     die "unrendered token in: ${leftover//$'\n'/ }"
 fi
 say 'substitution gate' 'clean'
-
-python3 -c 'import json, sys, yaml; json.dump(yaml.safe_load(open(sys.argv[1])), sys.stdout)' \
-    "${DEP}/estate.yml" > "${WORK}/estate.json"
 ESTATE_TAGS_JSON="$(jq -c '[.tags | to_entries[] | {Key: .key, Value: .value}]' "${WORK}/estate.json")"
 #endregion --- [ Resolve and render ] -------------------------------------------------------- #
 
@@ -119,6 +134,17 @@ for f in "${WORK}"/roles/*.trust.json; do
          --query 'length(findings[?findingType==`ERROR`])' --output text)"
     [ "${n}" = 0 ] || die "$(basename "${f}") has ${n} error finding(s)"
     say "$(basename "${f}")" 'clean'
+done
+for f in "${WORK}"/buckets/*.json; do
+    # shellcheck disable=SC2016 # backticks are JMESPath literals, not shell
+    n="$(aws_ accessanalyzer validate-policy --policy-type RESOURCE_POLICY \
+         --validate-policy-resource-type 'AWS::S3::Bucket' --policy-document "file://${f}" \
+         --query 'length(findings[?findingType==`ERROR`||findingType==`SECURITY_WARNING`])' --output text)"
+    [ "${n}" = 0 ] || die "$(basename "${f}") has ${n} error or security finding(s)"
+    public="$(aws_ accessanalyzer check-no-public-access --resource-type 'AWS::S3::Bucket' \
+              --policy-document "file://${f}" --query result --output text)"
+    [ "${public}" = PASS ] || die "$(basename "${f}") would grant public access: check-no-public-access answered ${public}"
+    say "$(basename "${f}")" 'clean, grants no public access'
 done
 #endregion --- [ Validate with Access Analyzer ] --------------------------------------------- #
 
@@ -144,10 +170,10 @@ ACTIONS="${WORK}/actions"
 act() { printf '%s\n' "$*" >> "${ACTIONS}"; }
 
 # Adopting a same-named object someone else made would hand this repository's rules to it.
-require_estate_tags() { # label tags-json-file
+require_estate_tags() { # label tags-json-file [how such an object arises]
     jq -e --argjson want "${ESTATE_TAGS_JSON}" \
         '[.[] | {Key, Value}] as $have | all($want[]; . as $w | any($have[]; . == $w))' "$2" > /dev/null \
-        || die "$1 exists but does not carry this repository's estate tags; it is not ours to adopt"
+        || die "$1 exists but does not carry this repository's estate tags${3:+ (${3})}; it is not ours to adopt"
 }
 
 plan_iam() {
@@ -160,6 +186,8 @@ plan_iam() {
                 --query Policy.DefaultVersionId --output text; then
             say "${name}" 'CREATE'; act policy-create "${name}"; continue
         fi
+        # The live default version, which --export records.
+        printf '%s\t%s\n' "${name}" "$(< "${WORK}/version")" >> "${WORK}/versions"
         aws_ iam get-policy-version --policy-arn "${arn}" --version-id "$(< "${WORK}/version")" \
             --query PolicyVersion.Document --output json > "${WORK}/live.json"
         if same "${WORK}/live.json" "${WORK}/policies/${name}.json"; then
@@ -198,7 +226,8 @@ plan_iam() {
                     --query 'AttachedPolicies[].PolicyArn' --output text | tr '\t' '\n' | sort)"
         fi
         want="$(jq -r --arg r "${role}" --arg a "arn:aws:iam::${ACCOUNT}:policy/" \
-                '.roles[$r].attached[] | $a + .name' "${DEP}/manifest.json" | sort)"
+                '.roles[$r].attached[] | (if .managed_by == "aws" then "arn:aws:iam::aws:policy/" else $a end) + .name' \
+                "${DEP}/manifest.json" | sort)"
         while read -r arn; do
             [ -n "${arn}" ] || continue
             say "${role} attach" "ATTACH ${arn##*/}"; act role-attach "${role}" "${arn}"
@@ -208,6 +237,29 @@ plan_iam() {
             say "${role} attach" "DETACH ${arn##*/} (not declared)"; act role-detach "${role}" "${arn}"
         done < <(comm -23 <(printf '%s\n' "${have}") <(printf '%s\n' "${want}"))
     done < <(jq -r '.roles | keys[]' "${DEP}/manifest.json")
+}
+
+plan_profiles() {
+    local profile role have want
+    echo '== plan: instance profiles =='
+    while read -r profile; do
+        have=''
+        if read_or_absent "${WORK}/profile.json" iam get-instance-profile --instance-profile-name "${profile}" --output json; then
+            say "instance profile ${profile}" 'present'
+            have="$(jq -r '.InstanceProfile.Roles[].RoleName' "${WORK}/profile.json" | sort)"
+        else
+            say "instance profile ${profile}" 'CREATE'; act profile-create "${profile}"
+        fi
+        want="$(jq -r --arg p "${profile}" '.instance_profiles[$p][]' "${DEP}/manifest.json" | sort)"
+        while read -r role; do
+            [ -n "${role}" ] || continue
+            say "${profile} role" "REMOVE ${role} (not declared)"; act profile-remove-role "${profile}" "${role}"
+        done < <(comm -23 <(printf '%s\n' "${have}") <(printf '%s\n' "${want}"))
+        while read -r role; do
+            [ -n "${role}" ] || continue
+            say "${profile} role" "ADD ${role}"; act profile-add-role "${profile}" "${role}"
+        done < <(comm -13 <(printf '%s\n' "${have}") <(printf '%s\n' "${want}"))
+    done < <(jq -r '.instance_profiles | keys[]' "${DEP}/manifest.json")
 }
 
 plan_estate() {
@@ -333,21 +385,107 @@ plan_estate() {
     done < <(jq -r '.security_groups[].name' "${WORK}/estate.json")
 }
 
+# One declared sub-configuration of a bucket, in the shape its put call takes.
+bucket_want() { # bucket sub-configuration
+    jq -c --arg n "$1" --arg s "$2" --argjson tags "${ESTATE_TAGS_JSON}" '.buckets[] | select(.name == $n) | {
+        "tags": {TagSet: $tags},
+        "public-access-block": (.public_access_block | {BlockPublicAcls: .block_public_acls,
+            IgnorePublicAcls: .ignore_public_acls, BlockPublicPolicy: .block_public_policy,
+            RestrictPublicBuckets: .restrict_public_buckets}),
+        "ownership": {Rules: [{ObjectOwnership: .object_ownership}]},
+        "encryption": {Rules: [{ApplyServerSideEncryptionByDefault: {SSEAlgorithm: .encryption}}]},
+        "lifecycle": {Rules: [{ID: "expire-every-object", Status: "Enabled", Filter: {Prefix: ""},
+            Expiration: {Days: .lifecycle.expire_days},
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: .lifecycle.abort_incomplete_multipart_days}}]}
+    }[$s]' "${WORK}/estate.json"
+}
+
+plan_buckets() {
+    local bucket sub norm status policy
+    local -a get
+    echo '== plan: buckets =='
+    while read -r bucket; do
+        # GetBucketLocation, not HeadBucket: HeadBucket is authorized as s3:ListBucket, which the
+        # bucket policy denies this apply's own administrator profile.
+        if ! read_or_absent "${WORK}/location.json" s3api get-bucket-location --bucket "${bucket}" \
+                --expected-bucket-owner "${ACCOUNT}"; then
+            # The create also writes the tags and the object ownership.
+            say "bucket ${bucket}" 'CREATE'; act bucket-create "${bucket}"
+            for sub in public-access-block encryption lifecycle policy; do
+                say "  ${bucket}" "PUT ${sub}"; act "bucket-${sub}" "${bucket}"
+            done
+            continue
+        fi
+        read_or_absent "${WORK}/tagging.json" s3api get-bucket-tagging --bucket "${bucket}" \
+            --expected-bucket-owner "${ACCOUNT}" --output json || echo '{"TagSet": []}' > "${WORK}/tagging.json"
+        jq '.TagSet' "${WORK}/tagging.json" > "${WORK}/tags.json"
+        require_estate_tags "bucket ${bucket}" "${WORK}/tags.json" 'made by hand'
+        say "bucket ${bucket}" 'present'
+        # A bucket never returns to unversioned, and with versioning expiry keeps noncurrent versions.
+        status="$(aws_ s3api get-bucket-versioning --bucket "${bucket}" --expected-bucket-owner "${ACCOUNT}" \
+                  --query Status --output text)"
+        [ "${status}" = None ] || die "bucket ${bucket} has versioning ${status}, which only a hand edit sets; empty, delete and re-create it"
+
+        if jq -e --argjson want "$(bucket_want "${bucket}" tags)" \
+                '(.TagSet | sort_by(.Key)) == ($want.TagSet | sort_by(.Key))' "${WORK}/tagging.json" > /dev/null; then
+            say "  ${bucket} tags" 'in sync'
+        else
+            say "  ${bucket} tags" 'UPDATE'; act bucket-tags "${bucket}"
+        fi
+        # Each live sub-configuration is read into the shape its put call takes, and compared on
+        # what the declaration sets: S3 adds fields of its own, such as BucketKeyEnabled.
+        for sub in public-access-block ownership encryption lifecycle; do
+            case "${sub}" in
+                public-access-block) get=(s3api get-public-access-block --query PublicAccessBlockConfiguration); norm='.' ;;
+                ownership) get=(s3api get-bucket-ownership-controls --query OwnershipControls); norm='.' ;;
+                encryption) get=(s3api get-bucket-encryption --query ServerSideEncryptionConfiguration)
+                    norm='[.Rules[].ApplyServerSideEncryptionByDefault | {SSEAlgorithm, KMSMasterKeyID}]' ;;
+                # A whole-bucket filter may read back as {} rather than {"Prefix": ""}. Transitions and
+                # noncurrent-version rules are declared absent, so one added by hand is a difference.
+                lifecycle) get=(s3api get-bucket-lifecycle-configuration --query '{Rules: Rules}')
+                    norm='[.Rules[] | {Status, Filter: (.Filter // {} | with_entries(select(.value != ""))),
+                           Days: .Expiration.Days, Abort: .AbortIncompleteMultipartUpload.DaysAfterInitiation,
+                           Transitions: (.Transitions // []), NoncurrentVersionTransitions: (.NoncurrentVersionTransitions // []),
+                           NoncurrentVersionExpiration}]' ;;
+            esac
+            if read_or_absent "${WORK}/live.json" "${get[@]}" --bucket "${bucket}" \
+                    --expected-bucket-owner "${ACCOUNT}" --output json \
+                && jq -e -n --slurpfile live "${WORK}/live.json" --argjson want "$(bucket_want "${bucket}" "${sub}")" \
+                    "def norm: ${norm}; (\$live[0] | norm) == (\$want | norm)" > /dev/null; then
+                say "  ${bucket} ${sub}" 'in sync'
+            else
+                say "  ${bucket} ${sub}" 'UPDATE'; act "bucket-${sub}" "${bucket}"
+            fi
+        done
+        policy="$(jq -r --arg n "${bucket}" '.buckets[] | select(.name == $n) | .policy' "${WORK}/estate.json")"
+        if read_or_absent "${WORK}/live.json" s3api get-bucket-policy --bucket "${bucket}" \
+                --expected-bucket-owner "${ACCOUNT}" --query Policy --output text \
+            && same "${WORK}/live.json" "${WORK}/buckets/${policy}"; then
+            say "  ${bucket} policy" 'in sync'
+        else
+            say "  ${bucket} policy" 'UPDATE'; act bucket-policy "${bucket}"
+        fi
+    done < <(jq -r '.buckets[].name' "${WORK}/estate.json")
+}
+
 declare -A SG_IDS=()
 plan() {
     : > "${ACTIONS}"
+    : > "${WORK}/versions"
     BLOCKED=''
     DB_SUBNET_GROUP=''
     DB_PARAMETER_GROUP=''
     plan_iam
+    plan_profiles
     plan_estate
+    plan_buckets
 }
 
 plan
 #endregion --- [ Plan ] ---------------------------------------------------------------------- #
 
 PENDING="$(wc -l < "${ACTIONS}")"
-if ! ${APPLY}; then
+if ! ${APPLY} && ! ${EXPORT}; then
     [ -z "${BLOCKED}" ] || die "blocked: ${BLOCKED}; ${PENDING} other change(s) pending"
     if [ "${PENDING}" -eq 0 ]; then
         printf '\napply-dependencies: IN SYNC - live AWS matches dependencies/aws.\n'
@@ -355,6 +493,11 @@ if ! ${APPLY}; then
     fi
     printf '\napply-dependencies: PLAN ONLY - %s change(s); nothing was written. Re-run with --apply.\n' "${PENDING}"
     exit 2
+fi
+# An export records live IAM as this tree's, so nothing may be pending. A blocked estate object is
+# not IAM, and does not stop it.
+if ! ${APPLY} && [ "${PENDING}" -gt 0 ]; then
+    die "--export records live IAM, which differs from this tree: ${PENDING} change(s) pending; re-run with --apply"
 fi
 
 #region ------ [ Apply ] --------------------------------------------------------------------- #
@@ -441,6 +584,35 @@ apply_action() {
         sg-revoke)
             # By rule id, which revokes a rule of any peer kind: address, group, prefix list or IPv6.
             aws_ ec2 "revoke-security-group-$2" --group-id "${SG_IDS[$1]}" --security-group-rule-ids "$3" > /dev/null ;;
+        profile-create)
+            aws_ iam create-instance-profile --instance-profile-name "$1" > /dev/null ;;
+        profile-remove-role)
+            aws_ iam remove-role-from-instance-profile --instance-profile-name "$1" --role-name "$2" ;;
+        profile-add-role)
+            aws_ iam add-role-to-instance-profile --instance-profile-name "$1" --role-name "$2" ;;
+        bucket-create)
+            # Tagged in the create itself, so no bucket of this tree's ever exists untagged.
+            # us-east-1 takes no LocationConstraint; any other REGION must pass one.
+            aws_ s3api create-bucket --bucket "$1" --object-ownership \
+                "$(jq -r --arg n "$1" '.buckets[] | select(.name == $n) | .object_ownership' "${WORK}/estate.json")" \
+                --create-bucket-configuration "$(jq -cn --argjson t "${ESTATE_TAGS_JSON}" '{Tags: $t}')" > /dev/null ;;
+        bucket-tags)
+            aws_ s3api put-bucket-tagging --bucket "$1" --expected-bucket-owner "${ACCOUNT}" --tagging "$(bucket_want "$1" tags)" ;;
+        bucket-public-access-block)
+            aws_ s3api put-public-access-block --bucket "$1" --expected-bucket-owner "${ACCOUNT}" \
+                --public-access-block-configuration "$(bucket_want "$1" public-access-block)" ;;
+        bucket-ownership)
+            aws_ s3api put-bucket-ownership-controls --bucket "$1" --expected-bucket-owner "${ACCOUNT}" \
+                --ownership-controls "$(bucket_want "$1" ownership)" ;;
+        bucket-encryption)
+            aws_ s3api put-bucket-encryption --bucket "$1" --expected-bucket-owner "${ACCOUNT}" \
+                --server-side-encryption-configuration "$(bucket_want "$1" encryption)" ;;
+        bucket-lifecycle)
+            aws_ s3api put-bucket-lifecycle-configuration --bucket "$1" --expected-bucket-owner "${ACCOUNT}" \
+                --lifecycle-configuration "$(bucket_want "$1" lifecycle)" > /dev/null ;;
+        bucket-policy)
+            aws_ s3api put-bucket-policy --bucket "$1" --expected-bucket-owner "${ACCOUNT}" --policy \
+                "file://${WORK}/buckets/$(jq -r --arg n "$1" '.buckets[] | select(.name == $n) | .policy' "${WORK}/estate.json")" ;;
     esac
     say "${verb}" "$* done"
 }
@@ -449,10 +621,14 @@ if [ "${PENDING}" -gt 0 ]; then
     echo '== apply =='
     cp "${ACTIONS}" "${WORK}/applying"
     # Each step's dependencies are written first. Detach precedes attach: a role at its policy
-    # quota can take a declared policy only after an undeclared one is gone.
-    for verb in slr-create policy-create policy-version role-create role-trust role-session role-boundary-delete \
-                role-inline-delete role-detach role-attach subnetgroup-create subnetgroup-modify \
-                pg-create pg-modify pg-reset sg-create sg-authorize sg-revoke; do
+    # quota can take a declared policy only after an undeclared one is gone, and a profile holds
+    # one role. New versions of existing policies go last, so a widened grant, such as passing the
+    # instance role, lands only once everything it reaches exists and is configured.
+    for verb in slr-create policy-create role-create role-trust role-session role-boundary-delete \
+                role-inline-delete role-detach role-attach profile-create profile-remove-role profile-add-role \
+                subnetgroup-create subnetgroup-modify pg-create pg-modify pg-reset sg-create sg-authorize sg-revoke \
+                bucket-create bucket-tags bucket-public-access-block bucket-ownership bucket-encryption \
+                bucket-lifecycle bucket-policy policy-version; do
         while read -r action_verb target rest; do
             [ "${action_verb}" = "${verb}" ] || continue
             # A rule key is one argument with spaces; every other action's fields are words.
@@ -474,6 +650,14 @@ fi
 # allow and deny. A decision other than the expected one fails the run.
 echo '== verify: simulate the roles =='
 role_arn() { printf 'arn:aws:iam::%s:role/%s_%s_%s' "${ACCOUNT}" "${OWNER}" "${REPO}" "$1"; }
+HOST_ROLE="arn:aws:iam::${ACCOUNT}:role/nwarila-ec2-${REPO}-role"
+principal() { # runner | reaper | admin | instance | a role ARN
+    case "$1" in
+        arn:*) printf '%s' "$1" ;;
+        instance) printf '%s' "${HOST_ROLE}" ;;
+        *) role_arn "$1" ;;
+    esac
+}
 ctx() { printf 'ContextKeyName=%s,ContextKeyValues=%s,ContextKeyType=%s\n' "$1" "$2" "${3:-string}"; }
 identity() { # aws:RequestTag | aws:ResourceTag
     ctx "$1/ManagedBy" Terraform
@@ -501,10 +685,10 @@ rds:MultiAz false boolean
 EOF
 }
 expect() { # role expected-decision description action resource, then context entries on stdin
-    local role="$1" want="$2" what="$3" action="$4" resource="$5" got
+    local role="${1##*/}" want="$2" what="$3" action="$4" resource="$5" got
     local -a entries
     mapfile -t entries
-    got="$(aws_ iam simulate-principal-policy --policy-source-arn "$(role_arn "${role}")" --action-names "${action}" \
+    got="$(aws_ iam simulate-principal-policy --policy-source-arn "$(principal "$1")" --action-names "${action}" \
            --resource-arns "${resource}" --context-entries "${entries[@]}" \
            --query 'EvaluationResults[0].EvalDecision' --output text)"
     [ "${got}" = "${want}" ] || die "${role}: ${what}: expected ${want}, simulated ${got}"
@@ -579,9 +763,135 @@ expect reaper allowed      'delete the owned balancer'      elasticloadbalancing
 expect reaper implicitDeny 'delete an unowned balancer'     elasticloadbalancing:DeleteLoadBalancer "${LB}" <<< "${NONE}"
 expect admin  allowed      "read this database's secret"    secretsmanager:GetSecretValue "${SECRET}" <<< "${OWN_SECRET}"
 expect admin  implicitDeny 'create a database'              rds:CreateDBInstance "${DB}" < <(identity "${REQ}"; db_shape)
+
+HOST_PROFILE="arn:aws:iam::${ACCOUNT}:instance-profile/nwarila-ec2-${REPO}-profile"
+OBJECTS="arn:aws:s3:::$(jq -r '.buckets[0].name' "${WORK}/estate.json")"
+RUN_OBJECT="${OBJECTS}/runs/0/x"
+TO_EC2="$(ctx iam:PassedToService ec2.amazonaws.com)"
+OWN="$(ctx aws:ResourceAccount "${ACCOUNT}")"
+expect runner allowed      'pass the instance role to EC2'     iam:PassRole "${HOST_ROLE}" <<< "${TO_EC2}"
+expect runner implicitDeny 'pass the instance role to Lambda'  iam:PassRole "${HOST_ROLE}" < <(ctx iam:PassedToService lambda.amazonaws.com)
+expect runner implicitDeny 'pass another EC2 role'             iam:PassRole "arn:aws:iam::${ACCOUNT}:role/nwarila-ec2-other-role" \
+    <<< "${TO_EC2}"
+expect runner allowed      'read the instance profile'         iam:GetInstanceProfile "${HOST_PROFILE}" <<< "${NONE}"
+expect runner implicitDeny 'write a run object'                s3:PutObject "${RUN_OBJECT}" <<< "${OWN}"
+expect runner implicitDeny 'read a run object'                 s3:GetObject "${RUN_OBJECT}" <<< "${OWN}"
+expect runner implicitDeny "replace the bucket's policy"       s3:PutBucketPolicy "${OBJECTS}" <<< "${OWN}"
+expect reaper allowed      'read the instance profile'         iam:GetInstanceProfile "${HOST_PROFILE}" <<< "${NONE}"
+expect reaper implicitDeny 'pass the instance role to EC2'     iam:PassRole "${HOST_ROLE}" <<< "${TO_EC2}"
+expect reaper implicitDeny 'read a run object'                 s3:GetObject "${RUN_OBJECT}" <<< "${OWN}"
+# The admin role carries runner_iam, so it may launch a host with the instance role too.
+expect admin  allowed      'pass the instance role to EC2'     iam:PassRole "${HOST_ROLE}" <<< "${TO_EC2}"
+for action in s3:GetObject s3:PutObject s3:DeleteObject; do
+    expect admin allowed "${action#s3:} a run object" "${action}" "${RUN_OBJECT}" <<< "${OWN}"
+done
+expect admin  allowed      'list under runs/'                  s3:ListBucket "${OBJECTS}" < <(echo "${OWN}"; ctx s3:prefix runs/0/)
+expect admin  implicitDeny 'list the whole bucket'             s3:ListBucket "${OBJECTS}" <<< "${OWN}"
+expect admin  implicitDeny 'write outside runs/'               s3:PutObject "${OBJECTS}/other/x" <<< "${OWN}"
+for action in s3:PutBucketPolicy s3:PutLifecycleConfiguration s3:DeleteBucket; do
+    expect admin implicitDeny "${action#s3:} on the bucket" "${action}" "${OBJECTS}" <<< "${OWN}"
+done
+# The instance role reaches object data under runs/ in this account's bucket, and SSM; nothing else.
+for action in s3:GetObject s3:PutObject s3:DeleteObject s3:AbortMultipartUpload s3:ListMultipartUploadParts; do
+    expect instance allowed "${action#s3:} a run object" "${action}" "${RUN_OBJECT}" <<< "${OWN}"
+done
+expect instance allowed      'list under runs/'                s3:ListBucket "${OBJECTS}" < <(echo "${OWN}"; ctx s3:prefix runs/0/)
+expect instance allowed      'register with SSM'               ssm:UpdateInstanceInformation '*' <<< "${NONE}"
+expect instance implicitDeny 'list the whole bucket'           s3:ListBucket "${OBJECTS}" <<< "${OWN}"
+expect instance implicitDeny 'list outside runs/'              s3:ListBucket "${OBJECTS}" < <(echo "${OWN}"; ctx s3:prefix other/)
+expect instance implicitDeny 'write outside runs/'             s3:PutObject "${OBJECTS}/other/x" <<< "${OWN}"
+expect instance implicitDeny "write another account's bucket"  s3:PutObject "${RUN_OBJECT}" < <(ctx aws:ResourceAccount 999999999999)
+for bucket in apprepo ansible terraform; do
+    expect instance implicitDeny "read the ${bucket} bucket" s3:GetObject "arn:aws:s3:::${ACCOUNT}-${bucket}/x" <<< "${OWN}"
+done
+expect instance implicitDeny 'write the apprepo bucket'        s3:PutObject "arn:aws:s3:::${ACCOUNT}-apprepo/x" <<< "${OWN}"
+for action in s3:PutBucketPolicy s3:PutLifecycleConfiguration s3:PutBucketPublicAccessBlock s3:DeleteBucket; do
+    expect instance implicitDeny "${action#s3:} on the bucket" "${action}" "${OBJECTS}" <<< "${OWN}"
+done
+expect instance implicitDeny 'pass a role'                     iam:PassRole "${HOST_ROLE}" <<< "${TO_EC2}"
+
+# Every other repository's deploy and operator role is outside the instance role and the bucket.
+aws_ iam list-roles --query 'Roles[].RoleName' --output json > "${WORK}/role-names.json"
+mapfile -t OTHERS < <(jq -r --arg org "${OWNER}_" --arg own "${OWNER}_${REPO}_" \
+    '.[] | select(startswith($org) and (startswith($own) | not) and test("_(runner|admin)$"))' "${WORK}/role-names.json")
+[ "${#OTHERS[@]}" -gt 0 ] || die "found no other repository's runner or admin role to simulate"
+for name in "${OTHERS[@]}"; do
+    expect "arn:aws:iam::${ACCOUNT}:role/${name}" implicitDeny 'pass the GitLab instance role' iam:PassRole "${HOST_ROLE}" \
+        <<< "${TO_EC2}"
+    expect "arn:aws:iam::${ACCOUNT}:role/${name}" implicitDeny 'write a GitLab run object' s3:PutObject "${RUN_OBJECT}" \
+        <<< "${OWN}"
+done
+
+# The bucket policy, for a caller whose own policy allows the request: it denies all but the two
+# roles, and those too without TLS. The caller is the role under test, also given as the
+# aws:PrincipalArn the policy's condition reads.
+BUCKET_POLICY="${WORK}/buckets/$(jq -r '.buckets[0].policy' "${WORK}/estate.json")"
+bucket_expect() { # expected-decision description principal-arn secure-transport action resource, then context on stdin
+    local got
+    local -a entries
+    mapfile -t entries
+    jq -n --arg a "$5" --arg r "$6" '{Version: "2012-10-17", Statement: [{Effect: "Allow", Action: $a, Resource: $r}]}' \
+        > "${WORK}/may.json"
+    got="$(aws_ iam simulate-custom-policy --policy-input-list "file://${WORK}/may.json" \
+           --resource-policy "file://${BUCKET_POLICY}" --caller-arn "$3" --action-names "$5" --resource-arns "$6" \
+           --context-entries "$(ctx aws:PrincipalArn "$3")" "$(ctx aws:SecureTransport "$4" boolean)" "${entries[@]}" \
+           --query 'EvaluationResults[0].EvalDecision' --output text)"
+    [ "${got}" = "$1" ] || die "bucket policy: $2: expected $1, simulated ${got}"
+    say "bucket policy: $2" "${got}"
+}
+RUNS="$(ctx s3:prefix runs/0/)"
+bucket_expect allowed      'the instance role writes over TLS'  "${HOST_ROLE}" true s3:PutObject "${RUN_OBJECT}" < /dev/null
+bucket_expect allowed      'the admin role writes over TLS'     "$(role_arn admin)" true s3:PutObject "${RUN_OBJECT}" < /dev/null
+bucket_expect allowed      'the instance role lists runs/'      "${HOST_ROLE}" true s3:ListBucket "${OBJECTS}" <<< "${RUNS}"
+bucket_expect allowed      'the admin role lists runs/'         "$(role_arn admin)" true s3:ListBucket "${OBJECTS}" <<< "${RUNS}"
+bucket_expect explicitDeny 'the instance role without TLS'      "${HOST_ROLE}" false s3:PutObject "${RUN_OBJECT}" < /dev/null
+for name in "${OTHERS[@]}"; do
+    other="arn:aws:iam::${ACCOUNT}:role/${name}"
+    bucket_expect explicitDeny "${name} writes"                  "${other}" true s3:PutObject "${RUN_OBJECT}" < /dev/null
+    bucket_expect explicitDeny "${name} reads the null version"  "${other}" true s3:GetObjectVersion "${RUN_OBJECT}" < /dev/null
+    bucket_expect explicitDeny "${name} lists runs/"             "${other}" true s3:ListBucket "${OBJECTS}" <<< "${RUNS}"
+done
+# This script runs as an account administrator, whom the deny does not except; another repository's
+# role stands in for it. Configuring and inspecting the bucket stay open to it.
+for action in s3:GetBucketLocation s3:GetBucketPolicy s3:GetBucketTagging s3:GetLifecycleConfiguration \
+              s3:GetEncryptionConfiguration s3:GetBucketPublicAccessBlock s3:GetBucketOwnershipControls \
+              s3:GetBucketVersioning s3:PutBucketPolicy; do
+    bucket_expect allowed "${OTHERS[0]} ${action#s3:}" "arn:aws:iam::${ACCOUNT}:role/${OTHERS[0]}" true \
+        "${action}" "${OBJECTS}" < /dev/null
+done
 #endregion --- [ Verify ] -------------------------------------------------------------------- #
 
-echo '== estate ids for terraform/aws.tfvars =='
+#region ------ [ Export ] -------------------------------------------------------------------- #
+EXPORT_NOTE='Exported from live IAM by scripts/apply-dependencies.sh --export on the date in exported, once nothing'
+EXPORT_NOTE+=' was pending: every attached version is the live default version of a document this tree matched. A'
+EXPORT_NOTE+=' document changed since is listed in not_yet_applied, with a null version while it does not exist yet,'
+EXPORT_NOTE+=' until the next export.'
+EXPORTED=''
+if ${EXPORT}; then
+    echo '== export: live IAM into dependencies/aws/manifest.json =='
+    jq -R -n '[inputs | split("\t") | {(.[0]): .[1]}] | add' "${WORK}/versions" > "${WORK}/versions.json"
+    jq --arg date "$(date -u +%F)" --slurpfile versions "${WORK}/versions.json" --arg note "${EXPORT_NOTE}" '
+        .exported = $date
+        | .roles[].attached[] |= (if .managed_by == "aws" then . else .version = $versions[0][.name] end)
+        | .divergence = {note: $note, not_yet_applied: []}' "${DEP}/manifest.json" > "${WORK}/manifest.json"
+    mv "${WORK}/manifest.json" "${DEP}/manifest.json"
+    # The command dependencies/README.md gives, so the bundle digest is reproducible.
+    # shellcheck disable=SC2094 # find excludes MANIFEST.sha256; the pipeline only writes it
+    (cd "${ROOT}/dependencies" && LC_ALL=C find . -type f ! -name MANIFEST.sha256 -print0 | LC_ALL=C sort -z \
+        | xargs -0 sha256sum > MANIFEST.sha256)
+    python3 "${ROOT}/scripts/check-dependencies.py" > /dev/null || die 'the exported manifest fails scripts/check-dependencies.py'
+    say 'dependencies/aws/manifest.json' "exported $(jq -r .exported "${DEP}/manifest.json"); commit it with MANIFEST.sha256"
+    EXPORTED='; manifest exported'
+fi
+#endregion --- [ Export ] -------------------------------------------------------------------- #
+
+echo '== names and ids the deployment consumes =='
+while read -r profile; do
+    say 'iam_instance_profile for the Rails nodes' "${profile}"
+done < <(jq -r '.instance_profiles | keys[]' "${DEP}/manifest.json")
+while read -r bucket; do
+    say 'objects bucket' "${bucket}"
+done < <(jq -r '.buckets[].name' "${WORK}/estate.json")
 [ -z "${DB_SUBNET_GROUP}" ] || say 'db_subnet_group_name' "${DB_SUBNET_GROUP}"
 [ -z "${DB_PARAMETER_GROUP}" ] || say 'parameter_group_name' "${DB_PARAMETER_GROUP}"
 mapfile -t SG_NAMES < <(printf '%s\n' "${!SG_IDS[@]}" | sort)
@@ -589,11 +899,14 @@ for sg_name in "${SG_NAMES[@]}"; do
     say "security group ${sg_name}" "${SG_IDS[${sg_name}]}"
 done
 if [ -n "${BLOCKED}" ]; then
-    [ "${PENDING}" -eq 0 ] || die "applied everything else; still blocked: ${BLOCKED}; ${PENDING} change(s) applied and verified"
-    die "still blocked: ${BLOCKED}; 0 change(s) applied and verified"
+    [ "${PENDING}" -eq 0 ] \
+        || die "applied everything else; still blocked: ${BLOCKED}; ${PENDING} change(s) applied and verified${EXPORTED}"
+    die "still blocked: ${BLOCKED}; 0 change(s) applied and verified${EXPORTED}"
 fi
 if [ "${PENDING}" -eq 0 ]; then
     printf '\napply-dependencies: IN SYNC and verified - nothing needed writing.\n'
+elif ${EXPORT}; then
+    printf '\napply-dependencies: APPLIED, verified and exported.\n'
 else
-    printf '\napply-dependencies: APPLIED and verified. Re-export live IAM into dependencies/aws/manifest.json.\n'
+    printf '\napply-dependencies: APPLIED and verified. Record live IAM with --export.\n'
 fi

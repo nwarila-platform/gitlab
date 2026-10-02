@@ -22,6 +22,23 @@
         "arn:aws:iam::<account-id>:role/nwarila-ec2-apprepo-role"
       ],
       "Sid": "PassOnlyTheOrgEc2RoleAndOnlyToEc2"
+    },
+    {
+      "Action": "iam:GetInstanceProfile",
+      "Effect": "Allow",
+      "Resource": "arn:aws:iam::<account-id>:instance-profile/nwarila-ec2-gitlab-profile",
+      "Sid": "ReadTheGitLabInstanceProfile"
+    },
+    {
+      "Action": "iam:PassRole",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ec2.amazonaws.com"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:iam::<account-id>:role/nwarila-ec2-gitlab-role",
+      "Sid": "PassOnlyTheGitLabInstanceRoleAndOnlyToEc2"
     }
   ],
   "Version": "2012-10-17"
