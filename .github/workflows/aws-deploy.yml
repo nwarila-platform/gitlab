@@ -176,6 +176,72 @@ jobs:
           fi
           echo "staged key matches ${CI_KEY_NAME}"
 
+      # One-off, and removed by the next change: settles whether runner_rds's Multi-AZ pin holds,
+      # the one guard there that may fail open (dependencies/README.md, "Not yet proven live").
+      # Both requests carry the declared shape and every identity tag, and name the 'gitlab'
+      # subnet group, which must not exist yet. The control has to fail on that group: it then
+      # passed IAM, so AccessDenied on the probe, which adds only --multi-az, is the pin. Any
+      # other answer may mean a database is being created, so it is waited for and deleted.
+      - name: Probe whether the rds:MultiAz pin holds (one-off; the next change removes it)
+        timeout-minutes: 30
+        env:
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+        run: |
+          set -euo pipefail
+          # Prints the error code of one CreateDBInstance, or 'created' if it was accepted.
+          attempt() {
+            local output rc=0
+            output="$(aws rds create-db-instance \
+              --db-instance-identifier gitlab --db-instance-class db.t4g.large \
+              --engine postgres --engine-version 17 --allocated-storage 20 \
+              --master-username gitlab_admin --manage-master-user-password \
+              --no-publicly-accessible --storage-encrypted \
+              --db-subnet-group-name gitlab --db-parameter-group-name gitlab \
+              --tags "Key=ManagedBy,Value=Terraform" "Key=Repository,Value=${GITHUB_REPOSITORY}" \
+                     "Key=RepositoryId,Value=${GITHUB_REPOSITORY_ID}" "Key=CommitSha,Value=${GITHUB_SHA}" \
+                     "Key=Environment,Value=test" "Key=RunId,Value=${GITHUB_RUN_ID}" \
+              "$@" 2>&1 > /dev/null)" || rc=$?
+            if [ "${rc}" -eq 0 ]; then
+              echo 'created'
+            elif [[ "${output}" =~ An\ error\ occurred\ \(([A-Za-z]+)\) ]]; then
+              echo "${BASH_REMATCH[1]}"
+            else
+              echo "unrecognized (rc ${rc}): ${output}"
+            fi
+          }
+          # Nothing else would delete a database this step started: it is in no Terraform state,
+          # so this run's destroy and a later run's predecessor cleanup never see it, and the
+          # reaper looks for instances only. The wait is bounded inside the step's budget and may
+          # fail, so the delete is attempted whatever it answered. If RDS refuses the delete, as
+          # it may for a database still creating, the step fails on that error and the database
+          # is deleted by hand.
+          remove_any_database() {
+            echo "::error::$1"
+            timeout 1200 aws rds wait db-instance-available --db-instance-identifier gitlab || true
+            aws rds delete-db-instance --db-instance-identifier gitlab \
+              --skip-final-snapshot --delete-automated-backups > /dev/null
+            exit 1
+          }
+
+          control="$(attempt)"
+          case "${control}" in
+            DBSubnetGroupNotFoundFault) ;;
+            AccessDenied)
+              echo '::error::The control was denied: the request shape is wrong, so the probe proves nothing.'
+              exit 1 ;;
+            *) remove_any_database "The control answered '${control}', not DBSubnetGroupNotFoundFault." ;;
+          esac
+
+          probe="$(attempt --multi-az)"
+          echo "control: ${control}; probe: ${probe}"
+          case "${probe}" in
+            AccessDenied) echo 'the rds:MultiAz pin holds: a Multi-AZ create is denied' ;;
+            DBSubnetGroupNotFoundFault)
+              echo '::error::The rds:MultiAz pin FAILS OPEN: a Multi-AZ create passed IAM. Stop; runner_rds must be revised.'
+              exit 1 ;;
+            *) remove_any_database "The probe answered '${probe}', not AccessDenied." ;;
+          esac
+
       - name: Read framework pins
         id: pins
         run: |
