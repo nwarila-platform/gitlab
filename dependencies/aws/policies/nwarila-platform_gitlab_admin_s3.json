@@ -1,0 +1,38 @@
+{
+  "Statement": [
+    {
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject",
+        "s3:AbortMultipartUpload"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceAccount": "<account-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:s3:::<account-id>-ansible/applications/gitlab/*",
+      "Sid": "ManageOwnAnsibleApplicationObjects"
+    },
+    {
+      "Action": "s3:ListBucket",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceAccount": "<account-id>"
+        },
+        "StringLike": {
+          "s3:prefix": [
+            "applications/gitlab/",
+            "applications/gitlab/*"
+          ]
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:s3:::<account-id>-ansible",
+      "Sid": "ListOwnAnsibleApplicationPrefix"
+    }
+  ],
+  "Version": "2012-10-17"
+}

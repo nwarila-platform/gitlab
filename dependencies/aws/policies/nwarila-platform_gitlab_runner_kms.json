@@ -1,0 +1,33 @@
+{
+  "Statement": [
+    {
+      "Action": [
+        "kms:ListAliases",
+        "kms:DescribeKey"
+      ],
+      "Effect": "Allow",
+      "Resource": "*",
+      "Sid": "ResolveTheEbsAliasAndKey"
+    },
+    {
+      "Action": [
+        "kms:CreateGrant",
+        "kms:Encrypt",
+        "kms:Decrypt",
+        "kms:ReEncryptFrom",
+        "kms:ReEncryptTo",
+        "kms:GenerateDataKey",
+        "kms:GenerateDataKeyWithoutPlaintext"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "kms:ViaService": "ec2.<region>.amazonaws.com"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "*",
+      "Sid": "UseTheEbsKeyThroughEc2Only"
+    }
+  ],
+  "Version": "2012-10-17"
+}

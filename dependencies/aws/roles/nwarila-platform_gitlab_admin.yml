@@ -1,0 +1,19 @@
+schema: aws-role/v1
+name: "nwarila-platform_gitlab_admin"
+session_seconds: 3600
+trust: "nwarila-platform_gitlab_admin.trust.json"
+attach:
+  - "nwarila-platform_gitlab_admin_s3"
+  - "nwarila-platform_gitlab_admin_secretsmanager"
+  - "nwarila-platform_gitlab_runner_ebs"
+  - "nwarila-platform_gitlab_runner_ec2"
+  - "nwarila-platform_gitlab_runner_eni"
+  - "nwarila-platform_gitlab_runner_iam"
+  - "nwarila-platform_gitlab_runner_kms"
+  - "nwarila-platform_gitlab_runner_s3"
+  - "nwarila-platform_gitlab_runner_sg"
+  - "nwarila-platform_gitlab_runner_ssm"
+managed_attach: []
+path: /
+description: null
+managed_by: consumer

@@ -1,0 +1,32 @@
+{
+  "Statement": [
+    {
+      "Action": [
+        "rds:DescribeDBInstances",
+        "rds:ListTagsForResource"
+      ],
+      "Effect": "Allow",
+      "Resource": "arn:aws:rds:<region>:<account-id>:db:*",
+      "Sid": "DescribeDatabases"
+    },
+    {
+      "Action": "rds:DeleteDBInstance",
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/CommitSha": "false",
+          "aws:ResourceTag/Environment": "false",
+          "aws:ResourceTag/RunId": "false"
+        },
+        "StringEquals": {
+          "aws:ResourceTag/ManagedBy": "Terraform",
+          "aws:ResourceTag/Repository": "nwarila-platform/gitlab",
+          "aws:ResourceTag/RepositoryId": "<repository-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:rds:<region>:<account-id>:db:gitlab",
+      "Sid": "DeleteOwnedDatabaseOnly"
+    }
+  ],
+  "Version": "2012-10-17"
+}

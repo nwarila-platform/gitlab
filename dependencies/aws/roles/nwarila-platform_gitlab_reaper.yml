@@ -1,0 +1,17 @@
+schema: aws-role/v1
+name: "nwarila-platform_gitlab_reaper"
+session_seconds: 3600
+trust: "nwarila-platform_gitlab_reaper.trust.json"
+attach:
+  - "nwarila-platform_gitlab_reaper_ebs"
+  - "nwarila-platform_gitlab_reaper_ec2"
+  - "nwarila-platform_gitlab_reaper_elb"
+  - "nwarila-platform_gitlab_reaper_eni"
+  - "nwarila-platform_gitlab_reaper_iam"
+  - "nwarila-platform_gitlab_reaper_rds"
+  - "nwarila-platform_gitlab_reaper_s3"
+  - "nwarila-platform_gitlab_reaper_sg"
+managed_attach: []
+path: /
+description: null
+managed_by: consumer

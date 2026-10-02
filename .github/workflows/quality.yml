@@ -1,5 +1,5 @@
 # =========================================================================================== #
-# Repository-local Ansible and shell quality gate.
+# Repository-local Ansible, shell and dependency-declaration quality gate.
 # Fleet-uniform port of the golden pdq-deploy-inventory workflow: role names are DISCOVERED
 # from ansible/applications/ instead of hard-coded, and every Ansible step gates on the tree
 # existing, so the same file is correct in a repo whose application work has not started yet.
@@ -48,6 +48,11 @@ jobs:
           # present before the syntax check runs.
           ansible-galaxy collection install --force \
             --requirements-file requirements-quality.yml
+
+      # Credential-free: the IAM, artifact and estate declarations under dependencies/ must be
+      # internally closed, tokenized, canonical, and within IAM's default policy quota.
+      - name: Check dependency declarations
+        run: python3 scripts/check-dependencies.py
 
       - name: Lint YAML
         if: steps.detect.outputs.has_ansible == 'true'
@@ -119,4 +124,4 @@ jobs:
           done
 
       - name: Check shell syntax
-        run: bash -n scripts/compose-and-run.sh scripts/materialize-role-scripts.sh
+        run: bash -n scripts/apply-dependencies.sh scripts/compose-and-run.sh scripts/materialize-role-scripts.sh

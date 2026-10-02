@@ -1,0 +1,32 @@
+{
+  "Statement": [
+    {
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:s3:::<account-id>-terraform/nwarila-platform/gitlab/aws-poc.tfstate",
+        "arn:aws:s3:::<account-id>-terraform/nwarila-platform/gitlab/aws-poc.tfstate.tflock"
+      ],
+      "Sid": "ReadWriteOnlyTheStateFileAndItsLock"
+    },
+    {
+      "Action": "s3:ListBucket",
+      "Condition": {
+        "StringEquals": {
+          "s3:prefix": [
+            "nwarila-platform/gitlab/aws-poc.tfstate",
+            "nwarila-platform/gitlab/aws-poc.tfstate.tflock"
+          ]
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:s3:::<account-id>-terraform",
+      "Sid": "ListOnlyThoseTwoKeys"
+    }
+  ],
+  "Version": "2012-10-17"
+}

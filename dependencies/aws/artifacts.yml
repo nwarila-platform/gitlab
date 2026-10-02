@@ -1,0 +1,14 @@
+# This file declares consumption; IAM policy documents declare authorization.
+# Every object here is read on the CONTROLLER with the runner's credentials; the guest receives
+# a verified copy and never holds cloud credentials of its own.
+schema: aws-artifacts/v1
+artifacts:
+  # Byte-identical to gitlab-fips-19.4.1-fips.0.el8.x86_64.rpm from GitLab's package repository;
+  # the digest is the one GitLab's signed yum metadata records for that package.
+  - bucket: "registry://aws/s3/apprepo"
+    key: "GitLab Inc/GitLab FIPS/19.4.1/GitLab-Inc_GitLab-FIPS_19.4.1-el8_x64.rpm"
+    sha256: 339d4a04b89e67d6108642642a68ed31c3eaae46b8c50a09a4667c4610e3520b
+    access: controller-fetch
+# No secret object is read: GitLab generates its initial root password on the host, and the
+# playbook reads it there.
+secrets: []

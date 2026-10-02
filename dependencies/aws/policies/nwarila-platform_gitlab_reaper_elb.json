@@ -1,0 +1,49 @@
+{
+  "Statement": [
+    {
+      "Action": [
+        "elasticloadbalancing:DescribeCapacityReservation",
+        "elasticloadbalancing:DescribeListenerAttributes",
+        "elasticloadbalancing:DescribeListeners",
+        "elasticloadbalancing:DescribeLoadBalancerAttributes",
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "elasticloadbalancing:DescribeRules",
+        "elasticloadbalancing:DescribeTags",
+        "elasticloadbalancing:DescribeTargetGroupAttributes",
+        "elasticloadbalancing:DescribeTargetGroups",
+        "elasticloadbalancing:DescribeTargetHealth"
+      ],
+      "Effect": "Allow",
+      "Resource": "*",
+      "Sid": "DescribeLoadBalancing"
+    },
+    {
+      "Action": [
+        "elasticloadbalancing:DeleteListener",
+        "elasticloadbalancing:DeleteLoadBalancer",
+        "elasticloadbalancing:DeleteTargetGroup",
+        "elasticloadbalancing:DeregisterTargets"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/CommitSha": "false",
+          "aws:ResourceTag/Environment": "false",
+          "aws:ResourceTag/RunId": "false"
+        },
+        "StringEquals": {
+          "aws:ResourceTag/ManagedBy": "Terraform",
+          "aws:ResourceTag/Repository": "nwarila-platform/gitlab",
+          "aws:ResourceTag/RepositoryId": "<repository-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:elasticloadbalancing:<region>:<account-id>:loadbalancer/net/gitlab/*",
+        "arn:aws:elasticloadbalancing:<region>:<account-id>:listener/net/gitlab/*/*",
+        "arn:aws:elasticloadbalancing:<region>:<account-id>:targetgroup/tf-*/*"
+      ],
+      "Sid": "DeleteOwnedLoadBalancingOnly"
+    }
+  ],
+  "Version": "2012-10-17"
+}
