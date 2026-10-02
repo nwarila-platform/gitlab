@@ -51,9 +51,9 @@ all_systems = [
     # No standalone data volumes yet, so the OS instance is not swap-eligible; a future
     # persistent deployment declares its data volumes below and flips this to true.
     refresh = false
-    # Starting size for the application proof; resize when the application's real footprint
-    # is measured.
-    instance_type = "t3.medium"
+    # Every bundled GitLab service runs on this one node, and GitLab's documented floor for a
+    # memory-constrained install is 8 GB. The distributed layout re-sizes each node per role.
+    instance_type = "t3.large"
     # Direct SSH reaches the launch-time public IPv4 through the runner-scoped framework SG.
     connection_type = "ssh"
     readiness_user  = "ec2-user"

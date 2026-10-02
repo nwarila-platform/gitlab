@@ -19,13 +19,21 @@
 !/.github/
 !/.github/workflows/
 !/ansible/
+!/ansible/applications/
+!/ansible/applications/gitlab/
+!/ansible/applications/gitlab/defaults/
+!/ansible/applications/gitlab/files/
+!/ansible/applications/gitlab/meta/
+!/ansible/applications/gitlab/tasks/
+!/ansible/applications/gitlab/templates/
+!/ansible/applications/gitlab/vars/
 !/ansible/inventory/
+!/ansible/playbooks/
 !/scripts/
 !/terraform/
 
 # --- [ allowed: repository configuration ] -------------------------------------------------- #
 !/.editorconfig
-!/.framework-pin
 !/.gitignore
 !/.yamllint.yml
 
@@ -39,6 +47,7 @@
 
 # --- [ allowed: GitHub configuration ] ------------------------------------------------------ #
 !/.github/CODEOWNERS
+!/.github/ansible-framework-pin
 !/.github/renovate.json5
 !/.github/terraform-framework-pin
 !/.github/workflows/aws-deploy.yml
@@ -47,8 +56,18 @@
 !/.github/workflows/quality.yml
 
 # --- [ allowed: the ansible tree ] ---------------------------------------------------------- #
+!/ansible/applications/gitlab/README.md
+!/ansible/applications/gitlab/defaults/main.yml
+!/ansible/applications/gitlab/files/gitlab-package-signing-key.asc
+!/ansible/applications/gitlab/meta/main.yml
+!/ansible/applications/gitlab/tasks/main.yml
+!/ansible/applications/gitlab/tasks/present_redhat.yml
+!/ansible/applications/gitlab/tasks/validate.yml
+!/ansible/applications/gitlab/templates/gitlab.rb.j2
+!/ansible/applications/gitlab/vars/redhat.yml
 !/ansible/inventory/README.md
 !/ansible/inventory/aws_ec2.yml
+!/ansible/playbooks/gitlab-aws.yml
 
 # --- [ allowed: scripts ] ------------------------------------------------------------------- #
 !/scripts/compose-and-run.sh

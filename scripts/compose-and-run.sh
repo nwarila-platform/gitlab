@@ -6,7 +6,7 @@
 # Composition runner: builds the combined execution tree and runs the playbook.
 #
 #   1. Clones/updates nwarila-platform/ansible-framework into .compose/ansible-framework
-#      and checks out the commit pinned in .framework-pin (tags once upstream releases).
+#      and checks out the commit pinned in .github/ansible-framework-pin (tags once upstream releases).
 #   2. Overlays this repo's roles into the framework's applications/ namespace (rsync
 #      --delete so stale files never linger).
 #   3. Runs the selected playbook with the framework's ansible.cfg as the chassis
@@ -23,13 +23,13 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_DIR="${REPO_ROOT}/.compose"
 FRAMEWORK_DIR="${COMPOSE_DIR}/ansible-framework"
 FRAMEWORK_REMOTE='git@github.com:nwarila-platform/ansible-framework.git'
-PIN_FILE="${REPO_ROOT}/.framework-pin"
+PIN_FILE="${REPO_ROOT}/.github/ansible-framework-pin"
 ANSIBLE_PLAYBOOK="${ANSIBLE_PLAYBOOK:-/root/.local/bin/ansible-playbook}"
 
 [ -f "${PIN_FILE}" ] || { echo "!! missing ${PIN_FILE}" >&2; exit 1; }
 PIN="$(tr -d '[:space:]' < "${PIN_FILE}")"
 if ! [[ "${PIN}" =~ ^[0-9a-f]{40}$ ]]; then
-    echo "!! .framework-pin must be a full 40-character lowercase git commit SHA, not a tag/branch: '${PIN}'" >&2
+    echo "!! ${PIN_FILE} must be a full 40-character lowercase git commit SHA, not a tag/branch: '${PIN}'" >&2
     exit 1
 fi
 COMPOSE_PLAYBOOK_VALUE="${COMPOSE_PLAYBOOK-gitlab-aws.yml}"

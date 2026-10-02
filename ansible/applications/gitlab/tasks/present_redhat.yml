@@ -1,0 +1,619 @@
+# ============================================================================================= #
+# File: '{{ role_path }}/tasks/present_redhat.yml'
+# --- [ Description ] ------------------------------------------------------------------------- #
+#
+# Installs GitLab at the pinned version on a CIS-hardened RHEL 8 host, with every bundled service
+# (PostgreSQL, Redis, Gitaly, Puma, Sidekiq, Workhorse, NGINX) on this one node, and reconfigures
+# it.
+#
+# BEGIN reads the host. PROCESS trusts the vendor key, installs the verified package, writes
+# gitlab.rb, lets Gitaly execute under fapolicyd and reconfigures, each writing only on
+# difference. END reads the version, readiness, the services and FIPS mode back from GitLab
+# itself, and the gitlab rule back from fapolicyd. It is ungated, so a converged host proves what
+# a fresh one does.
+#
+# ============================================================================================= #
+---
+
+#region ------ [ Begin: Read The Host ] ------------------------------------------------------- #
+
+- name: 'BEGIN | Read The Host'
+  vars:
+    __key_id__: "{{ gitlab_running.signing_key.fingerprint[-8:] | lower }}"
+  block:
+
+    # rc-contract: systemctl(1) is-active exits 0 only for an active unit, printing its state.
+    - name: 'BEGIN | Read Whether fapolicyd Is Running'
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      register: '__gitlab_fapolicyd__'
+
+      ansible.builtin.command:
+        argv: [ 'systemctl', 'is-active', 'fapolicyd' ]
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    # RPM records an imported key as gpg-pubkey-<last 8 hex of the fingerprint>; asking for that
+    # name is how a converged host skips the import.
+    # rc-contract: rpm(8) -q exits 0 when the named package is installed and 1 when it is not.
+    - name: 'BEGIN | Read Whether The Package Signing Key Is Trusted'
+      changed_when: false
+      check_mode: false
+      failed_when: __gitlab_key__.rc not in [0, 1]
+      register: '__gitlab_key__'
+
+      ansible.builtin.command:
+        argv: [ 'rpm', '-q', "gpg-pubkey-{{ __key_id__ }}" ]
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    - name: 'BEGIN | Read Whether A Reconfigure Was Recorded'
+      register: '__gitlab_record_file__'
+
+      ansible.builtin.stat:
+        checksum_algorithm: 'sha1'
+        follow: false
+        get_attributes: false
+        get_checksum: false
+        get_mime: false
+        get_selinux_context: false
+        path: '/var/opt/gitlab/.nwarila-reconfigured'
+
+    - name: 'BEGIN | Read What The Last Reconfigure Recorded'
+      register: '__gitlab_recorded__'
+      when: __gitlab_record_file__.stat.exists
+
+      ansible.builtin.slurp:
+        armor: true
+        src: '/var/opt/gitlab/.nwarila-reconfigured'
+
+#endregion --- [ Begin: Read The Host ] ------------------------------------------------------- #
+
+#region ------ [ Process: Install And Configure GitLab ] -------------------------------------- #
+
+- name: 'PROCESS | Install And Configure GitLab At The Pinned Version'
+  vars:
+    __object__: >-
+      {{ gitlab_running.installer.key | replace('<version>', gitlab_running.installer.version) }}
+    __package_file__: "{{ __object__ | basename }}"
+    __fapolicyd_active__: >-
+      {{ (__gitlab_fapolicyd__.stdout | trim) == 'active' }}
+    __install_required__: >-
+      {{ (ansible_facts.packages[gitlab_running.package] | default([])
+          | map(attribute='version') | list) != [gitlab_running.installer.version] }}
+    # What GitLab was reconfigured from: the version and the gitlab.rb written below. A
+    # difference from the record on disk reconfigures.
+    __record__: "{{ gitlab_running.installer.version }} {{ __gitlab_config__.stat.checksum }}"
+    __recorded__: "{{ __gitlab_recorded__.content | default('') | b64decode }}"
+    # Seconds gitlab-ctl reconfigure may run. UNMEASURED: a bound inside the converge step's
+    # 60-minute budget until a live run measures reconfigure.
+    __reconfigure_bound__: 1800
+    # Seconds timeout(1) waits after its SIGTERM at the bound before it sends SIGKILL.
+    __reconfigure_grace__: 60
+  block:
+
+    #region ------ [ Process: Trust The Package Signing Key ] --------------------------------- #
+
+    - name: 'PROCESS | Stage The Package Signing Key'
+      changed_when: false
+      when: __gitlab_key__.rc != 0
+
+      ansible.builtin.copy:
+        backup: false
+        decrypt: true
+        dest: "{{ __temp_dir__.path }}/{{ gitlab_running.signing_key.file }}"
+        follow: false
+        force: true
+        group: 'root'
+        mode: '0600'
+        owner: 'root'
+        remote_src: false
+        src: "{{ gitlab_running.signing_key.file }}"
+        unsafe_writes: false
+
+    # rpm_key refuses the shipped key unless its fingerprint is the pinned one.
+    - name: 'PROCESS | Trust The Package Signing Key'
+      when: __gitlab_key__.rc != 0
+
+      ansible.builtin.rpm_key:
+        fingerprint: [ "{{ gitlab_running.signing_key.fingerprint }}" ]
+        key: "{{ __temp_dir__.path }}/{{ gitlab_running.signing_key.file }}"
+        state: 'present'
+        validate_certs: true
+
+    #endregion --- [ Process: Trust The Package Signing Key ] --------------------------------- #
+
+    #region ------ [ Process: Install The Pinned Package ] ------------------------------------ #
+
+    # The controller fetches the object with its own credentials; the guest is never given any.
+    # The digest is checked on the controller before a byte is shipped, and again on the guest
+    # copy, because that is the one dnf installs; the signature proves GitLab built it.
+    #
+    # On a first install, the package's post-install step writes the vendor gitlab.rb with a
+    # placeholder URL, which its post-transaction step treats as unset: it skips its upgrade
+    # script and runs no reconfigure inside dnf, so the reconfigure below is the only one.
+    - name: 'PROCESS | Install The Pinned Package'
+      when: __install_required__ | bool
+      block:
+
+        - name: 'PROCESS | Create The Controller Staging Directory'
+          become: false
+          changed_when: false
+          check_mode: false
+          delegate_to: 'localhost'
+          register: '__gitlab_stage__'
+          vars:
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+          ansible.builtin.tempfile:
+            path: '/tmp'
+            prefix: 'gitlab-'
+            state: 'directory'
+            suffix: ''
+
+        # The module probes the BUCKET before the object, on a bucket-level grant this deployment
+        # does not hold; skipping that probe is the documented answer. A missing object still
+        # fails loudly: the key check uses head_object, which the object grant authorizes.
+        - name: 'PROCESS | Fetch The Package To The Controller'
+          become: false
+          changed_when: false
+          delegate_to: 'localhost'
+          vars:
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+          amazon.aws.s3_object:
+            bucket: "{{ gitlab_running.installer.bucket }}"
+            ceph: false
+            debug_botocore_endpoint_logs: false
+            dest: "{{ __gitlab_stage__.path }}/{{ __package_file__ }}"
+            dualstack: false
+            encrypt: true
+            encryption_mode: 'AES256'
+            expiry: 600
+            ignore_nonexistent_bucket: true
+            mode: 'get'
+            object: "{{ __object__ }}"
+            overwrite: 'always'
+            permission: [ 'private' ]
+            prefix: ''
+            purge_tags: true
+            retries: 0
+            sig_v4: true
+            validate_bucket_name: true
+            validate_certs: true
+
+        - name: 'PROCESS | Read The Controller Copy Digest'
+          become: false
+          delegate_to: 'localhost'
+          register: '__gitlab_controller_copy__'
+          vars:
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+          ansible.builtin.stat:
+            checksum_algorithm: 'sha256'
+            follow: false
+            get_attributes: false
+            get_checksum: true
+            get_mime: false
+            get_selinux_context: false
+            path: "{{ __gitlab_stage__.path }}/{{ __package_file__ }}"
+
+        - name: 'PROCESS | Require The Controller Copy To Match Its Pin'
+          ansible.builtin.assert:
+            fail_msg: >-
+              The stored package has sha256 {{ __gitlab_controller_copy__.stat.checksum }},
+              but the playbook pins {{ gitlab_running.installer.sha256 }}. The object changed
+              under an unchanged pin; refusing to ship it.
+            quiet: true
+            that: __gitlab_controller_copy__.stat.checksum == gitlab_running.installer.sha256
+
+        # Into the loader's temporary directory: root-owned, 0700, removed when the role ends.
+        - name: 'PROCESS | Copy The Package To The Guest'
+          changed_when: false
+
+          ansible.builtin.copy:
+            backup: false
+            decrypt: true
+            dest: "{{ __temp_dir__.path }}/{{ __package_file__ }}"
+            follow: false
+            force: true
+            group: 'root'
+            mode: '0600'
+            owner: 'root'
+            remote_src: false
+            src: "{{ __gitlab_stage__.path }}/{{ __package_file__ }}"
+            unsafe_writes: false
+
+        - name: 'PROCESS | Read The Guest Copy Digest'
+          register: '__gitlab_guest_copy__'
+
+          ansible.builtin.stat:
+            checksum_algorithm: 'sha256'
+            follow: false
+            get_attributes: false
+            get_checksum: true
+            get_mime: false
+            get_selinux_context: false
+            path: "{{ __temp_dir__.path }}/{{ __package_file__ }}"
+
+        - name: 'PROCESS | Require The Guest Copy To Match Its Pin'
+          ansible.builtin.assert:
+            fail_msg: >-
+              The copy staged on the guest has sha256
+              {{ __gitlab_guest_copy__.stat.checksum }}, but the playbook pins
+              {{ gitlab_running.installer.sha256 }}. Refusing to install it.
+            quiet: true
+            that: __gitlab_guest_copy__.stat.checksum == gitlab_running.installer.sha256
+
+        - name: 'PROCESS | Read The Package Signature'
+          changed_when: false
+          check_mode: false
+          failed_when: false
+          register: '__gitlab_signature__'
+
+          ansible.builtin.command:
+            argv: [ 'rpm', '--checksig', "{{ __temp_dir__.path }}/{{ __package_file__ }}" ]
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'PROCESS | Require The Vendor Signature'
+          ansible.builtin.assert:
+            fail_msg: >-
+              rpm --checksig did not report a good vendor signature on {{ __package_file__ }}:
+              {{ __gitlab_signature__.stdout }} {{ __gitlab_signature__.stderr }}
+            quiet: true
+            that:
+              - __gitlab_signature__.rc == 0
+              - __gitlab_signature__.stdout is search('signatures OK')
+
+        # No downgrade: GitLab migrates its database forward, and an older package cannot run it.
+        - name: 'PROCESS | Install The Pinned Package From The Verified Copy'
+          register: '__gitlab_package__'
+
+          ansible.builtin.dnf:
+            allow_downgrade: false
+            allowerasing: false
+            autoremove: false
+            bugfix: false
+            cacheonly: false
+            disable_gpg_check: false
+            disable_plugin: []
+            disablerepo: []
+            download_only: false
+            enable_plugin: []
+            enablerepo: []
+            exclude: []
+            install_weak_deps: true
+            installroot: '/'
+            lock_timeout: 30
+            name: [ "{{ __temp_dir__.path }}/{{ __package_file__ }}" ]
+            security: false
+            skip_broken: false
+            sslverify: true
+            state: 'present'
+            update_cache: false
+            update_only: false
+            use_backend: 'auto'
+            validate_certs: true
+
+    #endregion --- [ Process: Install The Pinned Package ] ------------------------------------ #
+
+    #region ------ [ Process: Write The GitLab Configuration ] -------------------------------- #
+
+    # 0600 as the package's own post-install step leaves it: reconfigure, as root, is its only
+    # reader.
+    - name: 'PROCESS | Write gitlab.rb'
+      register: '__gitlab_rb__'
+
+      ansible.builtin.template:
+        backup: false
+        dest: '/etc/gitlab/gitlab.rb'
+        follow: false
+        force: true
+        group: 'root'
+        lstrip_blocks: false
+        mode: '0600'
+        newline_sequence: '\n'
+        output_encoding: 'utf-8'
+        owner: 'root'
+        src: 'gitlab.rb.j2'
+        trim_blocks: true
+        unsafe_writes: false
+
+    - name: 'PROCESS | Read The gitlab.rb Digest'
+      register: '__gitlab_config__'
+
+      ansible.builtin.stat:
+        checksum_algorithm: 'sha256'
+        follow: false
+        get_attributes: false
+        get_checksum: true
+        get_mime: false
+        get_selinux_context: false
+        path: '/etc/gitlab/gitlab.rb'
+
+    #endregion --- [ Process: Write The GitLab Configuration ] -------------------------------- #
+
+    #region ------ [ Process: Let Gitaly Execute Under fapolicyd ] ---------------------------- #
+
+    # fapolicyd trusts a file by its RPM digest only once it has learned of it, and reconfigure
+    # runs the binaries the package installed. Repeated until a reconfigure is recorded, so a run
+    # that stopped between dnf and this refresh repeats it.
+    - name: 'PROCESS | Refresh The fapolicyd Trust Database After The Install'
+      changed_when: true
+      when:
+        - __fapolicyd_active__ | bool
+        - (__gitlab_package__ is changed) or (__recorded__ != __record__)
+
+      ansible.builtin.command:
+        argv: [ 'fapolicyd-cli', '--update' ]
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    # GitLab's documented rule: Gitaly unpacks its runtime binaries under its own directory and
+    # executes them, and no RPM digest can vouch for a file written at run time. dir= matches the
+    # whole subtree, which belongs to the git account that Puma and Workhorse, the services
+    # behind GitLab's network listener, also run as: code running as git can write an ELF there
+    # and execute it, so fapolicyd no longer limits native execution for that account under that
+    # subtree. Numbered before the default rules' deny of untrusted execution, so it applies.
+    - name: 'PROCESS | Allow Gitaly To Execute Its Runtime Binaries'
+      when: __fapolicyd_active__ | bool
+
+      ansible.builtin.copy:
+        backup: false
+        content: |
+          # Managed by the gitlab role; a local edit is overwritten on the next converge.
+          {{ gitlab_running.fapolicyd_rule }}
+        decrypt: true
+        dest: '/etc/fapolicyd/rules.d/89-gitlab.rules'
+        follow: false
+        force: true
+        group: 'fapolicyd'
+        mode: '0644'
+        owner: 'root'
+        remote_src: false
+        unsafe_writes: false
+
+    - name: 'PROCESS | Read The Rules fapolicyd Has Compiled'
+      changed_when: false
+      check_mode: false
+      register: '__gitlab_rules__'
+      when: __fapolicyd_active__ | bool
+
+      ansible.builtin.command:
+        argv: [ 'fapolicyd-cli', '--list' ]
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    # Matched by its text, not its position: the number fapolicyd lists a rule under shifts with
+    # every rule before it.
+    - name: 'PROCESS | Load The fapolicyd Rules'
+      changed_when: true
+      when:
+        - __fapolicyd_active__ | bool
+        - gitlab_running.fapolicyd_rule not in __gitlab_rules__.stdout
+
+      ansible.builtin.command:
+        argv: [ 'fagenrules', '--load' ]
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    #endregion --- [ Process: Let Gitaly Execute Under fapolicyd ] ---------------------------- #
+
+    #region ------ [ Process: Reconfigure GitLab ] -------------------------------------------- #
+
+    # Bounded by timeout(1) in argv, not with async: async stages its wrapper as a file and turns
+    # pipelining off, and fapolicyd denies the staged file. The bound is __reconfigure_bound__.
+    # Also run when this converge rewrote gitlab.rb: the conventional apply-on-change trigger.
+    - name: 'PROCESS | Reconfigure GitLab'
+      changed_when: true
+      failed_when: false
+      register: '__gitlab_reconfigure__'
+      when: (__recorded__ != __record__) or (__gitlab_rb__ is changed)
+
+      ansible.builtin.command:
+        argv:
+          - 'timeout'
+          - "--kill-after={{ __reconfigure_grace__ }}"
+          - "{{ __reconfigure_bound__ }}"
+          - 'gitlab-ctl'
+          - 'reconfigure'
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    # rc-contract: timeout(1) exits 124 when it stopped the command at the bound. When the
+    # command outlives __reconfigure_grace__ as well, timeout kills itself with SIGKILL, which
+    # Ansible reports as rc -9 -- as it does for a SIGKILL from the kernel.
+    - name: 'PROCESS | Require The Reconfigure To Succeed'
+      when: __gitlab_reconfigure__ is not skipped
+
+      ansible.builtin.assert:
+        fail_msg: >-
+          gitlab-ctl reconfigure {{
+          ('timed out after ' ~ __reconfigure_bound__ ~ ' s')
+          if __gitlab_reconfigure__.rc == 124 else
+          ('was killed by SIGKILL after ' ~ __gitlab_reconfigure__.delta ~ ' (the '
+           ~ __reconfigure_bound__ ~ ' s bound plus ' ~ __reconfigure_grace__
+           ~ ' s grace, or the kernel)')
+          if __gitlab_reconfigure__.rc == -9 else
+          ('failed with rc ' ~ __gitlab_reconfigure__.rc) }}. Its output ended:
+          {{ __gitlab_reconfigure__.stdout_lines[-40:] }}
+          {{ __gitlab_reconfigure__.stderr_lines[-20:] }}
+        quiet: true
+        that: __gitlab_reconfigure__.rc == 0
+
+    # Written only once a reconfigure has succeeded, so a failed one is retried by the next
+    # converge rather than recorded as done.
+    - name: 'PROCESS | Record What GitLab Was Reconfigured With'
+      ansible.builtin.copy:
+        backup: false
+        content: "{{ __record__ }}"
+        decrypt: true
+        dest: '/var/opt/gitlab/.nwarila-reconfigured'
+        follow: false
+        force: true
+        group: 'root'
+        mode: '0600'
+        owner: 'root'
+        remote_src: false
+        unsafe_writes: false
+
+    #endregion --- [ Process: Reconfigure GitLab ] -------------------------------------------- #
+
+  always:
+
+    - name: 'PROCESS | Remove The Controller Staging Directory'
+      become: false
+      changed_when: false
+      delegate_to: 'localhost'
+      when: __gitlab_stage__.path is defined
+      vars:
+        ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+      ansible.builtin.file:
+        access_time_format: '%Y%m%d%H%M.%S'
+        follow: true
+        force: false
+        modification_time_format: '%Y%m%d%H%M.%S'
+        path: "{{ __gitlab_stage__.path }}"
+        recurse: false
+        state: 'absent'
+        unsafe_writes: false
+
+#endregion --- [ Process: Install And Configure GitLab ] -------------------------------------- #
+
+#region ------ [ End: Prove GitLab Runs As Declared ] ----------------------------------------- #
+
+- name: 'END | Prove GitLab Runs As Declared'
+  vars:
+    __record__: "{{ gitlab_running.installer.version }} {{ __gitlab_config__.stat.checksum }}"
+    __release__: "{{ gitlab_running.package }} {{ gitlab_running.installer.version }}"
+    __fapolicyd_active__: >-
+      {{ (__gitlab_fapolicyd__.stdout | trim) == 'active' }}
+  block:
+
+    - name: 'END | Read The Version GitLab Installed'
+      changed_when: false
+      check_mode: false
+      register: '__gitlab_manifest__'
+
+      ansible.builtin.command:
+        argv: [ 'head', '-n', '1', '/opt/gitlab/version-manifest.txt' ]
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    # all=1 adds the database, Redis and Gitaly checks to the controller's own. Puma boots for
+    # minutes after a reconfigure. 60 tries 10 seconds apart are UNMEASURED: a bound until a live
+    # run measures the boot.
+    - name: 'END | Wait For GitLab To Report Ready'
+      delay: 10
+      register: '__gitlab_ready__'
+      retries: 60
+      until: ((__gitlab_ready__.json | default({})).status | default('')) == 'ok'
+
+      ansible.builtin.uri:
+        body_format: 'raw'
+        decompress: true
+        follow_redirects: 'safe'
+        force: false
+        force_basic_auth: false
+        headers: {}
+        http_agent: 'ansible-httpget'
+        method: 'GET'
+        remote_src: false
+        return_content: true
+        status_code: [ 200 ]
+        timeout: 30
+        unredirected_headers: []
+        unsafe_writes: false
+        url: 'http://127.0.0.1/-/readiness?all=1'
+        use_gssapi: false
+        use_netrc: true
+        use_proxy: true
+        validate_certs: true
+
+    # Read once GitLab reports ready, so it samples a settled node. runit reports one line per
+    # service, 'run:' for a service that is up; the exit status alone is not trusted to say every
+    # one is.
+    - name: 'END | Read The Service Status'
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      register: '__gitlab_status__'
+
+      ansible.builtin.command:
+        argv: [ 'gitlab-ctl', 'status' ]
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    - name: 'END | Read Whether GitLab Runs Its Crypto In FIPS Mode'
+      changed_when: false
+      check_mode: false
+      register: '__gitlab_fips__'
+
+      ansible.builtin.command:
+        argv: [ '/opt/gitlab/embedded/bin/ruby', '-ropenssl', '-e', 'print OpenSSL.fips_mode' ]
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    - name: 'END | Read What The Reconfigure Recorded'
+      register: '__gitlab_record__'
+
+      ansible.builtin.slurp:
+        armor: true
+        src: '/var/opt/gitlab/.nwarila-reconfigured'
+
+    - name: 'END | Require The Pinned Version, Running And Reconfigured As Declared'
+      ansible.builtin.assert:
+        fail_msg: >-
+          GitLab is not the declared install. The version manifest begins
+          '{{ __gitlab_manifest__.stdout }}' (declared '{{ __release__ }}'); gitlab-ctl status
+          exited {{ __gitlab_status__.rc }} with services not running:
+          {{ __gitlab_status__.stdout_lines | reject('match', '^run:') | list }}; OpenSSL
+          fips_mode printed '{{ __gitlab_fips__.stdout }}'; the record holds
+          '{{ __gitlab_record__.content | b64decode }}' (declared '{{ __record__ }}').
+        quiet: true
+        that:
+          - __gitlab_manifest__.stdout is match(__release__ | regex_escape ~ '([^0-9.]|$)')
+          - __gitlab_status__.rc == 0
+          - __gitlab_status__.stdout_lines | length > 0
+          - __gitlab_status__.stdout_lines | reject('match', '^run:') | list | length == 0
+          - __gitlab_fips__.stdout == 'true'
+          - (__gitlab_record__.content | b64decode) == __record__
+
+    # Read afresh, after any load above: the gitlab rule must be compiled into the loaded rules
+    # file. Whether it is in force, the push proof shows.
+    - name: 'END | Read The Rules fapolicyd Has Compiled'
+      changed_when: false
+      check_mode: false
+      register: '__gitlab_rules_loaded__'
+      when: __fapolicyd_active__ | bool
+
+      ansible.builtin.command:
+        argv: [ 'fapolicyd-cli', '--list' ]
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    - name: 'END | Require The Gitaly Rule In The Compiled Rules'
+      when: __fapolicyd_active__ | bool
+
+      ansible.builtin.assert:
+        fail_msg: >-
+          fapolicyd's compiled rules do not hold '{{ gitlab_running.fapolicyd_rule }}':
+          {{ __gitlab_rules_loaded__.stdout_lines }}
+        quiet: true
+        that: gitlab_running.fapolicyd_rule in __gitlab_rules_loaded__.stdout
+
+#endregion --- [ End: Prove GitLab Runs As Declared ] ----------------------------------------- #

@@ -1,0 +1,9 @@
+# Managed by the gitlab role; a local edit is overwritten on the next converge.
+# Every setting not named below keeps the package default.
+
+external_url '{{ gitlab_running.external_url }}'
+
+# Every bundled service shares this one node. Two of the settings GitLab documents for running in
+# a memory-constrained environment.
+prometheus_monitoring['enable'] = false
+sidekiq['concurrency'] = 10

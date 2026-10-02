@@ -1,0 +1,344 @@
+# =========================================================================================== #
+# File: 'ansible/playbooks/gitlab-aws.yml'
+# --- [ Description ] ----------------------------------------------------------------------- #
+#
+# Brings the ephemeral EC2 instance from "the API says it exists" to GitLab installed,
+# reconfigured and ready on a CIS-hardened RHEL 8 host, with every bundled service on one node.
+# An opt-in play proves it serves a git push and clone.
+#
+# The inventory decides how the host is reached; this play's ordered credential sets decide who
+# logs on. A new image answers only as its image account, with the launch key.
+#
+# Runs from the composed tree: the workflow overlays this repository onto the pinned framework
+# and uses its configuration, role search path, connection defaults, and explicit fact gathering.
+#
+# =========================================================================================== #
+---
+
+#region ------ [ Play: Inventory Contract ] --------------------------------------------------- #
+# The inventory already filters to this run's instance by its framework-set tags. This guards the
+# two states that filter cannot cover: an empty result, where nothing launched or nothing tagged,
+# and an invocation that never said which account it is deploying into.
+
+- name: 'PLAY | Validate The Ephemeral AWS Inventory Contract'
+  hosts: 'localhost'
+  # A run that selects one play by tag, as the push proof does, is refused on an empty inventory
+  # too, rather than reporting a green run that touched nothing.
+  tags: ['always']
+  tasks:
+    - name: 'INVENTORY | Require At Least One Filtered Host'
+      ansible.builtin.assert:
+        that: groups['gitlab_servers'] | default([]) | length >= 1
+        fail_msg: >-
+          Refusing to configure: the 'gitlab_servers' inventory group is empty. The dynamic EC2
+          inventory found no running instance tagged for this run -- a zero-host inventory is not
+          a successful deployment proof.
+        quiet: true
+
+    # Account-derived values are passed EXPLICITLY on the invocation, never read from the
+    # environment by a role, so the play and the deploy identity cannot disagree.
+    - name: 'INVENTORY | Require The AWS Deployment Identity'
+      ansible.builtin.assert:
+        that:
+          - aws_account_id is defined
+          - aws_account_id is match('^[0-9]{12}$')
+          - aws_region is defined
+          - aws_region is match('^[a-z]{2}(-[a-z]+)+-[0-9]$')
+        fail_msg: >-
+          aws_account_id and aws_region must be provided as extra-vars. The aws-deploy workflow
+          passes them from its own environment (the same values the OIDC role ARN and region
+          use); a local run must pass both explicitly.
+        quiet: true
+
+#endregion --- [ Play: Inventory Contract ] --------------------------------------------------- #
+
+#region ------ [ Play: Prepare The Hosts ] ---------------------------------------------------- #
+
+- name: 'PLAY | Prepare The Hosts (ephemeral AWS)'
+  hosts: 'gitlab_servers'
+  any_errors_fatal: true
+  vars:
+    launch_key_file: "{{ lookup('ansible.builtin.env', 'CI_PRIVATE_KEY') \
+      | default('~/.ssh/nwarila-ec2-key', true) | expanduser }}"
+    # The CIS RHEL 8 image answers only as its image account, authenticated by the account key
+    # pair it installed from instance metadata at first boot. Nothing here joins a directory, so
+    # there is no later identity to hand over to.
+    credential_sets:
+      - name: 'image-administrator'
+        connection: 'ssh'
+        user: 'ec2-user'
+        private_key_file: "{{ launch_key_file }}"
+
+  #region ------ [ Roles ] -------------------------------------------------------------------- #
+  roles:
+    # The image account must reach uid 0 through non-interactive sudo; every later play escalates.
+    - role: 'credential_resolver'
+      tags: ['always']
+      vars:
+        credential_resolver_candidates: "{{ credential_sets }}"
+        credential_resolver_require_elevated: true
+        credential_resolver_wait_pause_seconds: 10
+        credential_resolver_wait_rounds: 60
+
+    - role: 'host_readiness'
+
+    # RHEL 8 ships Python 3.6, below ansible-core's floor; the bootstrap installs the Python 3.12
+    # the inventory names for every later module, over raw, before any module runs.
+    - role: 'os_bootstrap'
+
+  #endregion --- [ Roles ] -------------------------------------------------------------------- #
+
+#endregion --- [ Play: Prepare The Hosts ] ---------------------------------------------------- #
+
+#region ------ [ Play: GitLab ] --------------------------------------------------------------- #
+# Tagged so a run can build the host alone (--skip-tags products) when what is under test is the
+# ground GitLab stands on.
+
+- name: 'PLAY | GitLab (ephemeral AWS)'
+  hosts: 'gitlab_servers'
+  any_errors_fatal: true
+  become: true
+  tags: ['products']
+
+  #region ------ [ Roles ] -------------------------------------------------------------------- #
+  roles:
+    - role: 'gitlab'
+      vars:
+        gitlab:
+
+          # What is installed, stated where a reader can see it. The digest is the SHA-256 that
+          # GitLab's signed yum metadata records for gitlab-fips-19.4.1-fips.0.el8.x86_64.rpm;
+          # the application repository carries those bytes at the key the role composes from
+          # the version. A version bump is these two values.
+          installer:
+            bucket: "{{ aws_account_id }}-apprepo"
+            version: '19.4.1'
+            sha256: '339d4a04b89e67d6108642642a68ed31c3eaae46b8c50a09a4667c4610e3520b'
+
+          # The node's private address, from the EC2 inventory: GitLab is reached only from
+          # inside the network.
+          external_url: "http://{{ aws_private_ip_address }}"
+
+  #endregion --- [ Roles ] -------------------------------------------------------------------- #
+
+#endregion --- [ Play: GitLab ] --------------------------------------------------------------- #
+
+#region ------ [ Play: Git Push And Clone Proof (opt-in) ] ------------------------------------ #
+# Proves GitLab serves git end to end: a commit pushed over HTTP creates a project, and a clone
+# of that project reads the same commit back. It adds a project on every run, so it is no part of
+# a converge: tagged 'never', the workflow asks for it by tag once, between the first converge
+# and the second.
+#
+# Root's initial password is read on the host and reaches git only as environment config
+# (http.extraHeader), handed over on stdin: never in a URL or in argv, and never written to a
+# file. Ansible's own 'environment' keyword is not used for it, because it lands on the command
+# line sudo logs.
+
+- name: 'PLAY | Prove GitLab Serves A Git Push And Clone (opt-in)'
+  hosts: 'gitlab_servers'
+  any_errors_fatal: true
+  become: true
+  tags: ['never', 'gitlab_proof']
+  vars:
+    __proof_git__: '/opt/gitlab/embedded/bin/git'
+    __proof_url__: >-
+      http://127.0.0.1/root/push-proof-{{ lookup('ansible.builtin.env', 'GITHUB_RUN_ID') }}.git
+    # Runs the git command line it is given with the header read from stdin set as git
+    # environment config, and fails rather than prompting for a credential.
+    __proof_with_header__: >-
+      IFS= read -r header &&
+      export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader
+      GIT_CONFIG_VALUE_0="${header}" &&
+      exec "$@"
+    __proof_header__: >-
+      Authorization: Basic {{ ('root:' ~ (__proof_password__.content | b64decode
+      | regex_search('^Password: (\S+)$', '\1', multiline=True) | first)) | b64encode }}
+
+  tasks:
+    - name: 'PROCESS | Push A Commit And Clone It Back'
+      vars:
+        __source__: "{{ __proof_workspace__.path }}/source"
+        __clone__: "{{ __proof_workspace__.path }}/clone"
+      block:
+
+        # Asked first, outside no_log, so a missing file fails by name, not as hidden output.
+        - name: 'BEGIN | Read Whether The Initial Root Password Exists'
+          register: '__proof_password_file__'
+
+          ansible.builtin.stat:
+            checksum_algorithm: 'sha1'
+            follow: false
+            get_attributes: false
+            get_checksum: false
+            get_mime: false
+            get_selinux_context: false
+            path: '/etc/gitlab/initial_root_password'
+
+        - name: 'VERIFY | Require The Initial Root Password'
+          ansible.builtin.assert:
+            fail_msg: >-
+              /etc/gitlab/initial_root_password does not exist: the first reconfigure writes
+              it, and the first reconfigure after 24 hours removes it. The push proof signs in
+              with it.
+            quiet: true
+            that: __proof_password_file__.stat.exists
+
+        - name: 'BEGIN | Read The Initial Root Password'
+          no_log: true
+          register: '__proof_password__'
+
+          ansible.builtin.slurp:
+            armor: true
+            src: '/etc/gitlab/initial_root_password'
+
+        # Readable by root alone, and under /root rather than a noexec temporary directory.
+        - name: 'PROCESS | Create The Proof Workspace'
+          changed_when: false
+          register: '__proof_workspace__'
+
+          ansible.builtin.tempfile:
+            path: '/root'
+            prefix: 'gitlab-proof-'
+            state: 'directory'
+            suffix: ''
+
+        - name: 'PROCESS | Create The Source Repository'
+          changed_when: false
+
+          ansible.builtin.command:
+            argv: [ "{{ __proof_git__ }}", 'init', '--initial-branch=main', "{{ __source__ }}" ]
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        # An empty commit is still an object Gitaly must store and serve back.
+        - name: 'PROCESS | Make One Commit'
+          changed_when: false
+
+          ansible.builtin.command:
+            argv:
+              - "{{ __proof_git__ }}"
+              - '-C'
+              - "{{ __source__ }}"
+              - '-c'
+              - 'user.name=GitLab proof'
+              - '-c'
+              - 'user.email=proof@localhost'
+              - 'commit'
+              - '--allow-empty'
+              - '--message'
+              - 'Prove a push and clone round trip'
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'BEGIN | Read The Commit To Push'
+          changed_when: false
+          register: '__proof_source_head__'
+
+          ansible.builtin.command:
+            argv: [ "{{ __proof_git__ }}", '-C', "{{ __source__ }}", 'rev-parse', 'HEAD' ]
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        # Pushing to a project that does not exist creates it, private, under root.
+        - name: 'PROCESS | Push The Commit To A New Project'
+          changed_when: __proof_push__.rc == 0
+          failed_when: false
+          no_log: true
+          register: '__proof_push__'
+
+          ansible.builtin.command:
+            argv:
+              - '/bin/sh'
+              - '-c'
+              - "{{ __proof_with_header__ }}"
+              - 'sh'
+              - "{{ __proof_git__ }}"
+              - '-C'
+              - "{{ __source__ }}"
+              - 'push'
+              - "{{ __proof_url__ }}"
+              - 'HEAD:refs/heads/main'
+            expand_argument_vars: false
+            stdin: "{{ __proof_header__ }}"
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'PROCESS | Clone The Project Back'
+          changed_when: false
+          failed_when: false
+          no_log: true
+          register: '__proof_clone__'
+
+          ansible.builtin.command:
+            argv:
+              - '/bin/sh'
+              - '-c'
+              - "{{ __proof_with_header__ }}"
+              - 'sh'
+              - "{{ __proof_git__ }}"
+              - 'clone'
+              - "{{ __proof_url__ }}"
+              - "{{ __clone__ }}"
+            expand_argument_vars: false
+            stdin: "{{ __proof_header__ }}"
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        # git's own messages carry no credential, so they are shown here, where the two tasks
+        # above had to hide their arguments.
+        - name: 'VERIFY | Require The Push And The Clone To Succeed'
+          ansible.builtin.assert:
+            fail_msg: >-
+              The round trip through {{ __proof_url__ }} failed. push exited
+              {{ __proof_push__.rc }}: {{ __proof_push__.stderr_lines }}; clone exited
+              {{ __proof_clone__.rc }}: {{ __proof_clone__.stderr_lines }}.
+            quiet: true
+            that:
+              - __proof_push__.rc == 0
+              - __proof_clone__.rc == 0
+
+        - name: 'BEGIN | Read The Cloned Commit'
+          changed_when: false
+          register: '__proof_clone_head__'
+
+          ansible.builtin.command:
+            argv: [ "{{ __proof_git__ }}", '-C', "{{ __clone__ }}", 'rev-parse', 'HEAD' ]
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'VERIFY | Require The Clone To Hold The Pushed Commit'
+          ansible.builtin.assert:
+            fail_msg: >-
+              The clone of {{ __proof_url__ }} holds {{ __proof_clone_head__.stdout }}, but
+              {{ __proof_source_head__.stdout }} was pushed.
+            quiet: true
+            that: __proof_clone_head__.stdout == __proof_source_head__.stdout
+
+        - name: 'INFO | Report The Round Trip'
+          ansible.builtin.debug:
+            msg: >-
+              Pushed {{ __proof_source_head__.stdout }} in {{ __proof_push__.delta }} and cloned
+              {{ __proof_clone_head__.stdout }} back in {{ __proof_clone__.delta }}.
+            verbosity: 0
+
+      always:
+
+        - name: 'CLEANUP | Remove The Proof Workspace'
+          changed_when: false
+          when: __proof_workspace__.path is defined
+
+          ansible.builtin.file:
+            access_time_format: '%Y%m%d%H%M.%S'
+            follow: true
+            force: false
+            modification_time_format: '%Y%m%d%H%M.%S'
+            path: "{{ __proof_workspace__.path }}"
+            recurse: false
+            state: 'absent'
+            unsafe_writes: false
+
+#endregion --- [ Play: Git Push And Clone Proof (opt-in) ] ------------------------------------ #

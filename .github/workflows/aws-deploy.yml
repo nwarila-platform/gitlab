@@ -42,7 +42,7 @@ name: AWS Deploy
     paths:
       - 'terraform/**'
       - 'ansible/**'
-      - '.framework-pin'                      # a pin bump changes what is deployed
+      - '.github/ansible-framework-pin'       # a pin bump changes what is deployed
       - '.github/terraform-framework-pin'
       - '.github/workflows/aws-deploy.yml'
   schedule:
@@ -195,11 +195,10 @@ jobs:
             }
             printf '%s=%s\n' "${name}" "${pin}" >> "${GITHUB_OUTPUT}"
           }
-          # The ansible-framework pin is the single root .framework-pin, read by BOTH this workflow
-          # and scripts/compose-and-run.sh, so local and CI can never diverge. The terraform pin
-          # stays under .github/ because only CI consumes terraform.
+          # Both framework pins live under .github/. The ansible pin is read by this workflow
+          # and by scripts/compose-and-run.sh from one path, so local and CI can never diverge.
           emit_pin terraform .github/terraform-framework-pin
-          emit_pin ansible .framework-pin
+          emit_pin ansible .github/ansible-framework-pin
 
       - name: Checkout aws-terraform-framework (pinned)
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -376,6 +375,63 @@ jobs:
             --extra-vars state=present                                         \
             --inventory "${GITHUB_WORKSPACE}/ansible/inventory/aws_ec2.yml"
 
+      # The opt-in proof play (nessus precedent): a git push creates a project over HTTP and a
+      # clone must read the same commit back. It adds a project, so it runs once, here, and the
+      # second converge after it still judges only what the role manages. The budget is
+      # unmeasured until the first live run.
+      - name: Prove GitLab serves a git push and clone
+        timeout-minutes: 15
+        working-directory: .frameworks/ansible-framework
+        env:
+          ANSIBLE_CONFIG: ${{ github.workspace }}/.frameworks/ansible-framework/ansible.cfg
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          ansible-playbook "${GITHUB_WORKSPACE}/ansible/playbooks/gitlab-aws.yml" \
+            --tags gitlab_proof                                                \
+            --extra-vars aws_account_id="${AWS_ACCOUNT_ID}"                    \
+            --extra-vars aws_region="${AWS_REGION}"                            \
+            --extra-vars env=test                                              \
+            --extra-vars state=present                                         \
+            --inventory "${GITHUB_WORKSPACE}/ansible/inventory/aws_ec2.yml"
+
+      # Idempotency gate (nessus precedent): a settled node reports NO change on a second converge.
+      # The role reads before it writes, so any change here is drift it failed to settle.
+      - name: Prove a second converge changes nothing
+        timeout-minutes: 30
+        working-directory: .frameworks/ansible-framework
+        env:
+          ANSIBLE_CONFIG: ${{ github.workspace }}/.frameworks/ansible-framework/ansible.cfg
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          recap="$(ansible-playbook "${GITHUB_WORKSPACE}/ansible/playbooks/gitlab-aws.yml" \
+            --extra-vars aws_account_id="${AWS_ACCOUNT_ID}"                             \
+            --extra-vars aws_region="${AWS_REGION}"                                     \
+            --extra-vars env=test                                                       \
+            --extra-vars state=present                                                  \
+            --inventory "${GITHUB_WORKSPACE}/ansible/inventory/aws_ec2.yml" 2>&1 | tee /dev/stderr)"
+          # The controller answers the inventory-contract play and reports changed=0 on its own
+          # recap line; judging it would let it satisfy the rule for a host that changed.
+          hosts="$(printf '%s\n' "${recap}" \
+            | grep -E '^[^ ]+ +: +ok=[0-9]+' | grep -vE '^localhost +:' || true)"
+          if [ -z "${hosts}" ]; then
+            echo "::error::no play recap found -- the converge did not run to a recap" >&2
+            exit 1
+          fi
+          # Counted, not matched with grep -q -v: implementations disagree on the exit status of
+          # an inverted quiet match, and a health gate must not depend on which grep is installed.
+          busy="$(printf '%s\n' "${hosts}" | grep -cvE 'changed=0 +unreachable=0 +failed=0\b' || true)"
+          if [ "${busy}" -ne 0 ]; then
+            echo "::error::second converge: ${busy} host(s) changed something or failed" >&2
+            exit 1
+          fi
+          echo "second converge: every node reported changed=0"
+
       - name: Hold the converged guest for interactive work
         if: >-
           !cancelled() &&
@@ -387,7 +443,7 @@ jobs:
           HOLD_MINUTES: ${{ inputs.hold_minutes }}
         run: |
           set -euo pipefail
-          instance_id="$(
+          instance_ids="$(
             aws ec2 describe-instances \
               --filters "Name=tag:RepositoryId,Values=${GITHUB_REPOSITORY_ID}" \
                         "Name=tag:RunId,Values=${GITHUB_RUN_ID}" \
@@ -395,18 +451,18 @@ jobs:
                         "Name=tag:Environment,Values=test" \
                         "Name=instance-state-name,Values=running" \
               --query 'Reservations[].Instances[].InstanceId' \
-              --output text 2>/dev/null || true
+              --output text 2>/dev/null | tr '\t' ' ' || true
           )"
-          if [[ ! "${instance_id}" =~ ^i-[0-9a-f]+$ ]]; then
-            instance_id='unavailable'
+          if [[ ! "${instance_ids}" =~ ^i-[0-9a-f]+( i-[0-9a-f]+)*$ ]]; then
+            instance_ids='unavailable'
           fi
 
           remaining_minutes="${HOLD_MINUTES}"
-          echo "Holding EC2 instance ${instance_id} for ${remaining_minutes} minutes."
+          echo "Holding EC2 instance(s) ${instance_ids} for ${remaining_minutes} minutes."
           while (( remaining_minutes > 0 )); do
             sleep 300
             remaining_minutes=$((remaining_minutes - 5))
-            echo "Hold heartbeat for EC2 instance ${instance_id}: ${remaining_minutes} minutes remaining."
+            echo "Hold heartbeat for EC2 instance(s) ${instance_ids}: ${remaining_minutes} minutes remaining."
           done
           exit 0
 
