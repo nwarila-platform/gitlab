@@ -2,12 +2,20 @@
 # File: 'ansible/playbooks/gitlab-aws.yml'
 # --- [ Description ] ----------------------------------------------------------------------- #
 #
-# Brings the ephemeral EC2 instance from "the API says it exists" to GitLab installed,
-# reconfigured and ready on a CIS-hardened RHEL 8 host, with every bundled service on one node.
-# An opt-in play proves it serves a git push and clone.
+# Brings the ephemeral EC2 instances from "the API says they exist" to one distributed GitLab on
+# CIS-hardened RHEL 8: two Rails nodes in two zones behind an internal network load balancer, a
+# Gitaly node and a Redis node, on an RDS PostgreSQL database and S3 object storage.
 #
-# The inventory decides how the host is reached; this play's ordered credential sets decide who
+# The inventory decides how each host is reached; this play's ordered credential sets decide who
 # logs on. A new image answers only as its image account, with the launch key.
+#
+# The workflow passes what Terraform built -- the database's address and the ARN of the secret
+# RDS keeps its master credentials in, the load balancer's name and its target groups -- as
+# extra-vars, as it does the account and the region, so the play and the stack cannot disagree.
+#
+# The nodes are configured one role at a time, in the only order that works: Redis first, whose
+# first reconfigure generates the secrets every node shares; then Gitaly, which needs the shared
+# shell secret; then the Rails node that migrates the database; then the other Rails node.
 #
 # Runs from the composed tree: the workflow overlays this repository onto the pinned framework
 # and uses its configuration, role search path, connection defaults, and explicit fact gathering.
@@ -16,24 +24,41 @@
 ---
 
 #region ------ [ Play: Inventory Contract ] --------------------------------------------------- #
-# The inventory already filters to this run's instance by its framework-set tags. This guards the
-# two states that filter cannot cover: an empty result, where nothing launched or nothing tagged,
-# and an invocation that never said which account it is deploying into.
+# The inventory already filters to this run's instances by their framework-set tags. This guards
+# what that filter cannot: a topology that is not the declared one, and an invocation that never
+# said which account or which stack it is configuring.
 
 - name: 'PLAY | Validate The Ephemeral AWS Inventory Contract'
   hosts: 'localhost'
-  # A run that selects one play by tag, as the push proof does, is refused on an empty inventory
-  # too, rather than reporting a green run that touched nothing.
+  # A run that selects one play by tag, as the proof does, is refused on a wrong topology too,
+  # rather than reporting a green run that touched nothing.
   tags: ['always']
   tasks:
-    - name: 'INVENTORY | Require At Least One Filtered Host'
+    # Two Rails nodes in two zones, because one proves nothing about losing a node or a zone.
+    - name: 'INVENTORY | Require The Distributed Topology'
+      vars:
+        __rails__: "{{ groups['gitlab_rails'] | default([]) }}"
+        __roles__: >-
+          {{ (groups['gitlab_rails'] | default([])) + (groups['gitlab_gitaly'] | default([]))
+             + (groups['gitlab_redis'] | default([])) }}
+
       ansible.builtin.assert:
-        that: groups['gitlab_servers'] | default([]) | length >= 1
         fail_msg: >-
-          Refusing to configure: the 'gitlab_servers' inventory group is empty. The dynamic EC2
-          inventory found no running instance tagged for this run -- a zero-host inventory is not
-          a successful deployment proof.
+          Refusing to configure: the dynamic EC2 inventory found a different topology tagged for
+          this run than terraform/aws.tfvars declares -- two gitlab_rails hosts in two zones, one
+          gitlab_gitaly and one gitlab_redis, nothing else. Found rails {{ __rails__ }}, gitaly
+          {{ groups['gitlab_gitaly'] | default([]) }}, redis
+          {{ groups['gitlab_redis'] | default([]) }}, servers
+          {{ groups['gitlab_servers'] | default([]) }}.
         quiet: true
+        that:
+          - __rails__ | length == 2
+          - groups['gitlab_gitaly'] | default([]) | length == 1
+          - groups['gitlab_redis'] | default([]) | length == 1
+          - groups['gitlab_servers'] | default([]) | sort == __roles__ | sort
+          - >-
+            __rails__ | map('extract', hostvars, ['aws_placement', 'availability_zone'])
+            | unique | length == 2
 
     # Account-derived values are passed EXPLICITLY on the invocation, never read from the
     # environment by a role, so the play and the deploy identity cannot disagree.
@@ -49,6 +74,24 @@
           passes them from its own environment (the same values the OIDC role ARN and region
           use); a local run must pass both explicitly.
         quiet: true
+
+    - name: 'INVENTORY | Require The Stack Endpoints'
+      ansible.builtin.assert:
+        fail_msg: >-
+          gitlab_database (address, port, master_user_secret_arn), gitlab_load_balancer_dns,
+          gitlab_target_group_arn and gitlab_ssh_target_group_arn must be provided as
+          extra-vars. The aws-deploy workflow reads them from Terraform's outputs after apply; a
+          local run reads the same outputs and passes them explicitly.
+        quiet: true
+        that:
+          - gitlab_database.address | default('') is match('^[a-z0-9.-]+$')
+          - gitlab_database.port | default(0) | int > 0
+          - >-
+            gitlab_database.master_user_secret_arn | default('')
+            is match('^arn:aws:secretsmanager:')
+          - gitlab_load_balancer_dns | default('') is match('^[A-Za-z0-9.-]+$')
+          - gitlab_target_group_arn | default('') is match('^arn:aws:elasticloadbalancing:')
+          - gitlab_ssh_target_group_arn | default('') is match('^arn:aws:elasticloadbalancing:')
 
 #endregion --- [ Play: Inventory Contract ] --------------------------------------------------- #
 
@@ -71,7 +114,8 @@
 
   #region ------ [ Roles ] -------------------------------------------------------------------- #
   roles:
-    # The image account must reach uid 0 through non-interactive sudo; every later play escalates.
+    # The image account must reach uid 0 through non-interactive sudo; every later play
+    # escalates.
     - role: 'credential_resolver'
       tags: ['always']
       vars:
@@ -90,15 +134,399 @@
 
 #endregion --- [ Play: Prepare The Hosts ] ---------------------------------------------------- #
 
-#region ------ [ Play: GitLab ] --------------------------------------------------------------- #
-# Tagged so a run can build the host alone (--skip-tags products) when what is under test is the
+#region ------ [ Play: The Host Firewall Is nftables ] ---------------------------------------- #
+# The fleet decision nessus records: the host firewall is nftables itself, not firewalld. The
+# security groups already decide which peers reach each port; this ruleset closes everything
+# else on the host. Each node opens SSH and the ports its role serves.
+#
+# Tagged so a run can build the hosts alone (--skip-tags products) when what is under test is the
 # ground GitLab stands on.
 
-- name: 'PLAY | GitLab (ephemeral AWS)'
+- name: 'PLAY | The Host Firewall Is nftables'
   hosts: 'gitlab_servers'
   any_errors_fatal: true
   become: true
   tags: ['products']
+  vars:
+    # The names and ports this deployment uses, stated once: the firewall, the role inputs and
+    # the proof all read them.
+    <<: &gitlab_site
+      gitlab_database_name: 'gitlabhq_production'
+      gitlab_database_role: 'gitlab'
+      # RDS's initial database, the db_name in terraform/aws.tfvars; GitLab never uses it.
+      gitlab_master_database: 'gitlab'
+      # GitLab's required extensions, and pgaudit, which the parameter group loads.
+      gitlab_database_extensions: [ 'amcheck', 'btree_gist', 'pg_trgm', 'pgaudit', 'plpgsql' ]
+      gitlab_host_key_dir: '/root/nwarila-gitlab-sshd-host-keys'
+      gitlab_ports:
+        http: 80
+        sshd: 2222
+        gitaly: 8075
+        redis: 6379
+    __gitlab_ports__: >-
+      {{ ([gitlab_ports.http, gitlab_ports.sshd] if 'gitlab_rails' in group_names else [])
+         + ([gitlab_ports.gitaly] if 'gitlab_gitaly' in group_names else [])
+         + ([gitlab_ports.redis] if 'gitlab_redis' in group_names else []) }}
+
+  tasks:
+    - name: 'PROCESS | Install nftables'
+      ansible.builtin.dnf:
+        allow_downgrade: false
+        allowerasing: false
+        autoremove: false
+        bugfix: false
+        cacheonly: false
+        disable_gpg_check: false
+        disable_plugin: []
+        disablerepo: []
+        download_only: false
+        enable_plugin: []
+        enablerepo: []
+        exclude: []
+        install_weak_deps: true
+        installroot: '/'
+        lock_timeout: 30
+        name: [ 'nftables' ]
+        security: false
+        skip_broken: false
+        sslverify: true
+        state: 'present'
+        update_cache: false
+        update_only: false
+        use_backend: 'auto'
+        validate_certs: true
+
+    # credential_resolver publishes a port the winning set leaves out as null, so SSH's own 22.
+    # Unlike keycloak's ruleset, the service ports carry no rate limit: the security groups admit
+    # only the GitLab nodes and the load balancer, and the Rails nodes open their Gitaly and
+    # Redis pools at boot in bursts a limit could drop. SSH keeps its limit.
+    - name: 'PROCESS | Write The Host nftables Ruleset'
+      register: '__gitlab_nftables_ruleset__'
+
+      ansible.builtin.copy:
+        backup: false
+        content: |
+          #!/usr/sbin/nft -f
+          # Managed by ansible/playbooks/gitlab-aws.yml; a local edit is overwritten.
+          flush ruleset
+
+          table inet filter {
+              chain input {
+                  type filter hook input priority 0; policy drop;
+                  ct state established,related accept
+                  ct state invalid drop
+                  iif "lo" accept
+                  ip saddr 127.0.0.0/8 drop
+                  ip6 saddr ::1 drop
+                  meta l4proto { icmp, ipv6-icmp } accept
+                  tcp dport {{ ansible_port | default(22, true) }} ct state new limit rate 25/second burst 50 packets accept
+                  tcp dport { {{ __gitlab_ports__ | join(', ') }} } ct state new accept
+              }
+              chain forward {
+                  type filter hook forward priority 0; policy drop;
+              }
+              chain output {
+                  type filter hook output priority 0; policy accept;
+              }
+          }
+        decrypt: true
+        dest: '/etc/sysconfig/nftables.conf'
+        follow: false
+        force: true
+        group: 'root'
+        mode: '0600'
+        owner: 'root'
+        remote_src: false
+        unsafe_writes: false
+        validate: '/usr/sbin/nft -c -f %s'
+
+    # Stopping firewalld removes its own rules, so until nftables loads a moment later the host
+    # filters nothing -- which cannot drop the session running this. Masked, so nothing starts it
+    # again behind this ruleset.
+    - name: 'PROCESS | Stop And Mask firewalld'
+      ansible.builtin.systemd_service:
+        daemon_reexec: false
+        daemon_reload: false
+        force: false
+        masked: true
+        name: 'firewalld'
+        no_block: false
+        scope: 'system'
+        state: 'stopped'
+
+    # Unmasked as well: the CIS remediation for running firewalld masks nftables, and enabling a
+    # masked unit fails after firewalld is already stopped, leaving the host unfiltered.
+    - name: 'PROCESS | Enable And Start nftables'
+      register: '__gitlab_nftables_service__'
+
+      ansible.builtin.systemd_service:
+        daemon_reexec: false
+        daemon_reload: false
+        enabled: true
+        force: false
+        masked: false
+        name: 'nftables'
+        no_block: false
+        scope: 'system'
+        state: 'started'
+
+    - name: 'PROCESS | Load A Changed Ruleset'
+      when:
+        - __gitlab_nftables_ruleset__ is changed
+        - __gitlab_nftables_service__ is not changed
+
+      ansible.builtin.systemd_service:
+        daemon_reexec: false
+        daemon_reload: false
+        force: false
+        name: 'nftables'
+        no_block: false
+        scope: 'system'
+        state: 'reloaded'
+
+#endregion --- [ Play: The Host Firewall Is nftables ] ---------------------------------------- #
+
+#region ------ [ Play: Controller Package Cache And Network Facts ] --------------------------- #
+# The package is fetched to the runner once and copied to each node from there; the cache lives
+# for this playbook run and is removed at its end. The nodes' subnets are where the load
+# balancer's health checks and the proof client come from, so their CIDRs are GitLab's monitoring
+# allowlist; sorted, so the allowlist and gitlab.rb are the same on every run.
+
+- name: 'PLAY | Controller Package Cache And Network Facts'
+  hosts: 'localhost'
+  tags: ['products']
+  tasks:
+    - name: 'PROCESS | Create The Controller Package Cache'
+      changed_when: false
+      check_mode: false
+      register: '__gitlab_package_cache__'
+
+      ansible.builtin.tempfile:
+        path: '/tmp'
+        prefix: 'gitlab-cache-'
+        state: 'directory'
+        suffix: ''
+
+    - name: 'BEGIN | Read The Subnets The Nodes Run In'
+      register: '__gitlab_subnets__'
+
+      amazon.aws.ec2_vpc_subnet_info:
+        debug_botocore_endpoint_logs: false
+        filters: {}
+        region: "{{ aws_region }}"
+        subnet_ids: >-
+          {{ groups['gitlab_servers'] | map('extract', hostvars, 'aws_subnet_id')
+             | unique | sort }}
+        validate_certs: true
+
+    - name: 'BEGIN | Record The Node Subnet CIDRs'
+      ansible.builtin.set_fact:
+        cacheable: false
+        gitlab_system_subnet_cidrs: >-
+          {{ __gitlab_subnets__.subnets | map(attribute='cidr_block') | unique | sort }}
+
+#endregion --- [ Play: Controller Package Cache And Network Facts ] --------------------------- #
+
+#region ------ [ Play: Run Secrets ] ---------------------------------------------------------- #
+# The Redis password, the Gitaly token and the password of GitLab's database role are generated
+# once per deployment, on the Redis node, and read back on every converge: gitlab.rb holds them
+# and is hashed into the reconfigure record, so a value drawn afresh on each run could never
+# settle. They live under /root, outside /etc/gitlab, whose mode reconfigure resets.
+
+- name: 'PLAY | Generate And Read The Run Secrets'
+  hosts: 'gitlab_redis'
+  any_errors_fatal: true
+  become: true
+  tags: ['products']
+  tasks:
+    # Letters and digits only: each lands inside a Ruby string in gitlab.rb.
+    - name: 'PROCESS | Generate The Run Secrets Once'
+      no_log: true
+
+      ansible.builtin.copy:
+        backup: false
+        content: >-
+          {{ {'redis_password': lookup('ansible.builtin.password', '/dev/null', length=64,
+                                       chars=['ascii_letters', 'digits']),
+              'gitaly_token': lookup('ansible.builtin.password', '/dev/null', length=64,
+                                     chars=['ascii_letters', 'digits']),
+              'database_password': lookup('ansible.builtin.password', '/dev/null', length=64,
+                                          chars=['ascii_letters', 'digits'])} | to_json }}
+        decrypt: true
+        dest: '/root/nwarila-gitlab-run-secrets.json'
+        follow: false
+        force: false
+        group: 'root'
+        mode: '0600'
+        owner: 'root'
+        remote_src: false
+        unsafe_writes: false
+
+    - name: 'BEGIN | Read The Run Secrets'
+      no_log: true
+      register: '__gitlab_run_secrets_file__'
+
+      ansible.builtin.slurp:
+        armor: true
+        src: '/root/nwarila-gitlab-run-secrets.json'
+
+    - name: 'BEGIN | Publish The Run Secrets To The Later Plays'
+      no_log: true
+
+      ansible.builtin.set_fact:
+        cacheable: false
+        gitlab_run_secrets: "{{ __gitlab_run_secrets_file__.content | b64decode | from_json }}"
+
+#endregion --- [ Play: Run Secrets ] ---------------------------------------------------------- #
+
+#region ------ [ Play: Share The gitlab-sshd Host Keys ] -------------------------------------- #
+# Every Rails node must present the same SSH host keys behind the load balancer. They are
+# generated once, on the Rails node that migrates the database, kept root-only under /root, and
+# copied to the other Rails node through the controller, never S3 or a log; Ansible briefly
+# stages each copy in an owner-only temporary file on the runner and on the node. The gitlab role
+# installs them for gitlab-sshd; the host's own sshd and its keys are untouched. No ED25519:
+# GitLab's FIPS guidance says ED25519 keys might not be fully supported.
+
+- name: 'PLAY | Share The gitlab-sshd Host Keys'
+  hosts: 'gitlab_rails'
+  any_errors_fatal: true
+  become: true
+  tags: ['products']
+  vars:
+    <<: *gitlab_site
+    __origin__: "{{ groups['gitlab_rails'] | sort | first }}"
+    __key_files__:
+      - 'ssh_host_ecdsa_key'
+      - 'ssh_host_ecdsa_key.pub'
+      - 'ssh_host_rsa_key'
+      - 'ssh_host_rsa_key.pub'
+
+  tasks:
+    - name: 'PROCESS | Create The Shared Host Key Directory'
+      ansible.builtin.file:
+        access_time_format: '%Y%m%d%H%M.%S'
+        follow: true
+        force: false
+        group: 'root'
+        mode: '0700'
+        modification_time_format: '%Y%m%d%H%M.%S'
+        owner: 'root'
+        path: "{{ gitlab_host_key_dir }}"
+        recurse: false
+        state: 'directory'
+        unsafe_writes: false
+
+    - name: 'PROCESS | Generate The Shared Host Keys On The Deploy Node'
+      loop:
+        - type: 'rsa'
+          bits: '3072'
+        - type: 'ecdsa'
+          bits: '256'
+      loop_control: { label: "{{ item.type }}" }
+      when: inventory_hostname == __origin__
+
+      ansible.builtin.command:
+        argv:
+          - 'ssh-keygen'
+          - '-q'
+          - '-N'
+          - ''
+          - '-C'
+          - ''
+          - '-t'
+          - "{{ item.type }}"
+          - '-b'
+          - "{{ item.bits }}"
+          - '-f'
+          - "{{ gitlab_host_key_dir }}/ssh_host_{{ item.type }}_key"
+        creates: "{{ gitlab_host_key_dir }}/ssh_host_{{ item.type }}_key"
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    # run_once runs on the play's first host, which need not be the deploy node: delegated there.
+    # Every host receives the registered result.
+    - name: 'BEGIN | Read The Shared Host Keys On The Deploy Node'
+      delegate_to: "{{ __origin__ }}"
+      loop: "{{ __key_files__ }}"
+      loop_control: { label: "{{ item }}" }
+      no_log: true
+      register: '__gitlab_host_keys__'
+      run_once: true
+
+      ansible.builtin.slurp:
+        armor: true
+        src: "{{ gitlab_host_key_dir }}/{{ item }}"
+
+    # Never overwritten: a node that already holds keys keeps them, and the check below says
+    # whether they are the deploy node's.
+    - name: 'PROCESS | Copy The Shared Host Keys To The Other Rails Node'
+      loop: "{{ __gitlab_host_keys__.results }}"
+      loop_control: { label: "{{ __key_read__.item }}", loop_var: '__key_read__' }
+      no_log: true
+      when: inventory_hostname != __origin__
+
+      ansible.builtin.copy:
+        backup: false
+        content: "{{ __key_read__.content | b64decode }}"
+        decrypt: true
+        dest: "{{ gitlab_host_key_dir }}/{{ __key_read__.item }}"
+        follow: false
+        force: false
+        group: 'root'
+        mode: "{{ (__key_read__.item is search('[.]pub$')) | ternary('0644', '0600') }}"
+        owner: 'root'
+        remote_src: false
+        unsafe_writes: false
+
+    - name: 'END | Read The Shared Host Key Fingerprints'
+      changed_when: false
+      check_mode: false
+      loop: [ 'ecdsa', 'rsa' ]
+      loop_control: { label: "{{ item }}" }
+      register: '__gitlab_host_key_fingerprints__'
+
+      ansible.builtin.command:
+        argv:
+          - 'ssh-keygen'
+          - '-l'
+          - '-f'
+          - "{{ gitlab_host_key_dir }}/ssh_host_{{ item }}_key.pub"
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    # ssh-keygen -l prints '<bits> <fingerprint> ...'; the fingerprint is the second field.
+    - name: 'END | Require Every Rails Node To Hold The Deploy Node''s Host Keys'
+      vars:
+        __fingerprints__: >-
+          {{ __gitlab_host_key_fingerprints__.results
+             | map(attribute='stdout') | map('split', ' ') | map(attribute=1) | list }}
+        __origin_fingerprints__: >-
+          {{ hostvars[__origin__].__gitlab_host_key_fingerprints__.results
+             | map(attribute='stdout') | map('split', ' ') | map(attribute=1) | list }}
+
+      ansible.builtin.assert:
+        fail_msg: >-
+          {{ inventory_hostname }} holds host keys {{ __fingerprints__ }} in
+          {{ gitlab_host_key_dir }}, but the deploy node {{ __origin__ }} holds
+          {{ __origin_fingerprints__ }}. A client that reached one node through the load
+          balancer would refuse the other.
+        quiet: true
+        that: __fingerprints__ == __origin_fingerprints__
+
+#endregion --- [ Play: Share The gitlab-sshd Host Keys ] -------------------------------------- #
+
+#region ------ [ Play: GitLab Redis ] --------------------------------------------------------- #
+# The first node configured: its first reconfigure generates the secrets every node shares.
+
+- name: 'PLAY | GitLab Redis (ephemeral AWS)'
+  hosts: 'gitlab_redis'
+  any_errors_fatal: true
+  become: true
+  tags: ['products']
+  vars:
+    <<: *gitlab_site
 
   #region ------ [ Roles ] -------------------------------------------------------------------- #
   roles:
@@ -106,63 +534,433 @@
       vars:
         gitlab:
 
-          # What is installed, stated where a reader can see it. The digest is the SHA-256 that
-          # GitLab's signed yum metadata records for gitlab-fips-19.4.1-fips.0.el8.x86_64.rpm;
-          # the application repository carries those bytes at the key the role composes from
-          # the version. A version bump is these two values.
-          installer:
+          # What is installed, stated where a reader can see it, and once for every play: the
+          # digest is the SHA-256 that GitLab's signed yum metadata records for
+          # gitlab-fips-19.4.1-fips.0.el8.x86_64.rpm, and the application repository carries
+          # those bytes at the key the role composes from the version. A version bump is these
+          # two values. The package is fetched into the controller cache once.
+          installer: &gitlab_installer
             bucket: "{{ aws_account_id }}-apprepo"
             version: '19.4.1'
             sha256: '339d4a04b89e67d6108642642a68ed31c3eaae46b8c50a09a4667c4610e3520b'
+            cache_dir: "{{ hostvars['localhost'].__gitlab_package_cache__.path }}"
 
-          # The node's private address, from the EC2 inventory: GitLab is reached only from
-          # inside the network.
-          external_url: "http://{{ aws_private_ip_address }}"
+          node_role: 'redis'
+          redis:
+            port: "{{ gitlab_ports.redis }}"
+            password: "{{ gitlab_run_secrets.redis_password }}"
 
   #endregion --- [ Roles ] -------------------------------------------------------------------- #
 
-#endregion --- [ Play: GitLab ] --------------------------------------------------------------- #
+#endregion --- [ Play: GitLab Redis ] --------------------------------------------------------- #
 
-#region ------ [ Play: Git Push And Clone Proof (opt-in) ] ------------------------------------ #
-# Proves GitLab serves git end to end: a commit pushed over HTTP creates a project, and a clone
-# of that project reads the same commit back. It adds a project on every run, so it is no part of
-# a converge: tagged 'never', the workflow asks for it by tag once, between the first converge
-# and the second.
-#
-# Root's initial password is read on the host and reaches git only as environment config
-# (http.extraHeader), handed over on stdin: never in a URL or in argv, and never written to a
-# file. Ansible's own 'environment' keyword is not used for it, because it lands on the command
-# line sudo logs.
+#region ------ [ Play: Read The Shared Secrets ] ---------------------------------------------- #
+# Read from the first configured node and written to every other node before its first
+# reconfigure, through the controller, never S3 or a log; Ansible briefly stages each copy in an
+# owner-only temporary file on the runner and on the node.
 
-- name: 'PLAY | Prove GitLab Serves A Git Push And Clone (opt-in)'
+- name: 'PLAY | Read The Secrets Every Node Shares'
+  hosts: 'gitlab_redis'
+  any_errors_fatal: true
+  become: true
+  tags: ['products']
+  tasks:
+    - name: 'BEGIN | Read The First Node''s gitlab-secrets.json'
+      no_log: true
+      register: '__gitlab_secrets_file__'
+
+      ansible.builtin.slurp:
+        armor: true
+        src: '/etc/gitlab/gitlab-secrets.json'
+
+    - name: 'BEGIN | Publish The Shared Secrets To The Later Plays'
+      no_log: true
+
+      ansible.builtin.set_fact:
+        cacheable: false
+        gitlab_shared_secrets_json: "{{ __gitlab_secrets_file__.content | b64decode }}"
+
+#endregion --- [ Play: Read The Shared Secrets ] ---------------------------------------------- #
+
+#region ------ [ Play: GitLab Gitaly ] -------------------------------------------------------- #
+
+- name: 'PLAY | GitLab Gitaly (ephemeral AWS)'
+  hosts: 'gitlab_gitaly'
+  any_errors_fatal: true
+  become: true
+  tags: ['products']
+  vars:
+    __origin__: "{{ groups['gitlab_redis'] | first }}"
+
+  #region ------ [ Roles ] -------------------------------------------------------------------- #
+  roles:
+    - role: 'gitlab'
+      vars:
+        gitlab:
+          installer: *gitlab_installer
+          node_role: 'gitaly'
+          secrets_json: "{{ hostvars[__origin__].gitlab_shared_secrets_json }}"
+          gitaly:
+            token: "{{ hostvars[__origin__].gitlab_run_secrets.gitaly_token }}"
+            # Gitaly calls GitLab's internal API through the load balancer: it is a client of
+            # the listener, never a target of it.
+            internal_api_url: "http://{{ gitlab_load_balancer_dns }}"
+
+  #endregion --- [ Roles ] -------------------------------------------------------------------- #
+
+#endregion --- [ Play: GitLab Gitaly ] -------------------------------------------------------- #
+
+#region ------ [ Play: GitLab Rails, The Deploy Node ] ---------------------------------------- #
+# One Rails node migrates the database, and its first reconfigure loads the schema and seeds the
+# root account. It is the first by name, never by inventory order, so every run picks the same.
+# Both Rails patterns also resolve, to no host, without this run's inventory, as in the
+# credential-free syntax check; a real run has already required two Rails nodes.
+
+- name: 'PLAY | GitLab Rails, The Deploy Node (ephemeral AWS)'
+  hosts: "{{ groups['gitlab_rails'] | default(['gitlab_rails']) | sort | first }}"
+  any_errors_fatal: true
+  become: true
+  tags: ['products']
+  vars:
+    <<: *gitlab_site
+    __origin__: "{{ groups['gitlab_redis'] | first }}"
+    # RDS keeps the master credentials in Secrets Manager and rotates them. They are read here,
+    # on the controller, only for this node, which creates GitLab's role, database and
+    # extensions with them, and never written to the log.
+    gitlab_database_credentials: >-
+      {{ lookup('amazon.aws.secretsmanager_secret', gitlab_database.master_user_secret_arn,
+                region=aws_region) | from_json }}
+
+  #region ------ [ Roles ] -------------------------------------------------------------------- #
+  roles:
+    - role: 'gitlab'
+      vars:
+        gitlab:
+          <<: &gitlab_rails
+            installer: *gitlab_installer
+            node_role: 'rails'
+            # The load balancer is internal and TLS-less: every client is inside the VPC. TLS
+            # arrives with a certificate.
+            external_url: "http://{{ gitlab_load_balancer_dns }}"
+            secrets_json: "{{ hostvars[__origin__].gitlab_shared_secrets_json }}"
+            monitoring_whitelist: >-
+              {{ ['127.0.0.0/8', '::1/128'] + hostvars['localhost'].gitlab_system_subnet_cidrs }}
+            # GitLab's own role and database, which the deploy node creates.
+            database:
+              host: "{{ gitlab_database.address }}"
+              port: "{{ gitlab_database.port }}"
+              name: "{{ gitlab_database_name }}"
+              username: "{{ gitlab_database_role }}"
+              password: "{{ hostvars[__origin__].gitlab_run_secrets.database_password }}"
+            redis:
+              host: "{{ hostvars[groups['gitlab_redis'] | first].aws_private_ip_address }}"
+              port: "{{ gitlab_ports.redis }}"
+              password: "{{ hostvars[__origin__].gitlab_run_secrets.redis_password }}"
+            gitaly:
+              address: >-
+                tcp://{{ hostvars[groups['gitlab_gitaly'] | first].aws_private_ip_address
+                }}:{{ gitlab_ports.gitaly }}
+              token: "{{ hostvars[__origin__].gitlab_run_secrets.gitaly_token }}"
+            object_store:
+              bucket: "{{ aws_account_id }}-gitlab-objects"
+              prefix: "runs/{{ lookup('ansible.builtin.env', 'GITHUB_RUN_ID') }}"
+              region: "{{ aws_region }}"
+            sshd:
+              port: "{{ gitlab_ports.sshd }}"
+              host_key_source_dir: "{{ gitlab_host_key_dir }}"
+          auto_migrate: true
+          database_bootstrap:
+            enabled: true
+            master_database: "{{ gitlab_master_database }}"
+            master_username: "{{ gitlab_database_credentials.username }}"
+            master_password: "{{ gitlab_database_credentials.password }}"
+            extensions: "{{ gitlab_database_extensions }}"
+
+  #endregion --- [ Roles ] -------------------------------------------------------------------- #
+
+#endregion --- [ Play: GitLab Rails, The Deploy Node ] ---------------------------------------- #
+
+#region ------ [ Play: GitLab Rails, The Other Node ] ----------------------------------------- #
+
+- name: 'PLAY | GitLab Rails, The Other Node (ephemeral AWS)'
+  hosts: "gitlab_rails:!{{ groups['gitlab_rails'] | default(['gitlab_rails']) | sort | first }}"
+  any_errors_fatal: true
+  become: true
+  tags: ['products']
+  vars:
+    <<: *gitlab_site
+    __origin__: "{{ groups['gitlab_redis'] | first }}"
+
+  #region ------ [ Roles ] -------------------------------------------------------------------- #
+  roles:
+    - role: 'gitlab'
+      vars:
+        gitlab:
+          <<: *gitlab_rails
+          auto_migrate: false
+
+  #endregion --- [ Roles ] -------------------------------------------------------------------- #
+
+#endregion --- [ Play: GitLab Rails, The Other Node ] ----------------------------------------- #
+
+#region ------ [ Play: Verify The Cluster ] --------------------------------------------------- #
+# Read-only, so a second converge still reports no change: every node holds the secrets the first
+# node generated, and Gitaly reaches GitLab's internal API through the load balancer with them.
+
+- name: 'PLAY | Verify The Nodes Agree'
   hosts: 'gitlab_servers'
+  any_errors_fatal: true
+  become: true
+  tags: ['products']
+  vars:
+    __origin__: "{{ groups['gitlab_redis'] | first }}"
+    # The secrets every node must hold alike. A node also writes back the secrets its own
+    # gitlab.rb sets, such as a Rails node's Gitaly token, so the files differ beyond these.
+    __shared__:
+      gitlab_rails:
+        - 'secret_key_base'
+        - 'db_key_base'
+        - 'otp_key_base'
+        - 'encrypted_settings_key_base'
+        - 'openid_connect_signing_key'
+        - 'active_record_encryption_primary_key'
+        - 'active_record_encryption_deterministic_key'
+        - 'active_record_encryption_key_derivation_salt'
+      gitlab_shell: [ 'secret_token' ]
+      gitlab_workhorse: [ 'secret_token' ]
+
+  tasks:
+    - name: 'BEGIN | Read Each Node''s gitlab-secrets.json'
+      no_log: true
+      register: '__gitlab_node_secrets__'
+
+      ansible.builtin.slurp:
+        armor: true
+        src: '/etc/gitlab/gitlab-secrets.json'
+
+    # Names only: the values never leave this fact.
+    - name: 'BEGIN | List The Shared Secrets That Differ From The First Node''s'
+      no_log: true
+      vars:
+        __mine__: "{{ __gitlab_node_secrets__.content | b64decode | from_json }}"
+        __theirs__: >-
+          {{ hostvars[__origin__].__gitlab_node_secrets__.content | b64decode | from_json }}
+
+      ansible.builtin.set_fact:
+        __gitlab_secrets_differ__: >-
+          {%- set differ = [] -%}
+          {%- for section, keys in __shared__.items() -%}
+          {%- for key in keys -%}
+          {%- if (__mine__[section] | default({}))[key] | default(none)
+                 != (__theirs__[section] | default({}))[key] | default(none) -%}
+          {%- set _ = differ.append(section ~ '.' ~ key) -%}
+          {%- endif -%}
+          {%- endfor -%}
+          {%- endfor -%}
+          {{ differ }}
+        cacheable: false
+
+    - name: 'END | Require Every Node To Hold The Shared Secrets'
+      ansible.builtin.assert:
+        fail_msg: >-
+          {{ inventory_hostname }}'s gitlab-secrets.json differs from {{ __origin__ }}'s in
+          {{ __gitlab_secrets_differ__ }}: it signs or encrypts with a key the other nodes do
+          not hold.
+        quiet: true
+        that: __gitlab_secrets_differ__ | length == 0
+
+    # Gitaly's own self-check calls GitLab's internal API through the load balancer, which
+    # proves the route, the shared shell secret, and Rails answering behind the listener.
+    # rc-contract: gitaly check exits 0 when every check passes and 1 when one fails.
+    - name: 'END | Run Gitaly''s Self-Check'
+      become: true
+      become_user: 'git'
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      register: '__gitlab_gitaly_check__'
+      when: inventory_hostname in groups['gitlab_gitaly']
+
+      ansible.builtin.command:
+        argv:
+          - '/opt/gitlab/embedded/bin/gitaly'
+          - 'check'
+          - '/var/opt/gitlab/gitaly/config.toml'
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    - name: 'END | Require Gitaly To Reach GitLab'
+      when: inventory_hostname in groups['gitlab_gitaly']
+
+      ansible.builtin.assert:
+        fail_msg: >-
+          gitaly check exited {{ __gitlab_gitaly_check__.rc }}:
+          {{ __gitlab_gitaly_check__.stdout_lines }} {{ __gitlab_gitaly_check__.stderr_lines }}
+        quiet: true
+        that:
+          - __gitlab_gitaly_check__.rc == 0
+          - __gitlab_gitaly_check__.stdout is search('Check: OK')
+
+#endregion --- [ Play: Verify The Cluster ] --------------------------------------------------- #
+
+#region ------ [ Play: Remove The Controller Package Cache ] ---------------------------------- #
+# A failed run never reaches this play; its runner is discarded with the cache.
+
+- name: 'PLAY | Remove The Controller Package Cache'
+  hosts: 'localhost'
+  tags: ['products']
+  tasks:
+    - name: 'CLEANUP | Remove The Controller Package Cache'
+      changed_when: false
+      when: __gitlab_package_cache__.path is defined
+
+      ansible.builtin.file:
+        access_time_format: '%Y%m%d%H%M.%S'
+        follow: true
+        force: false
+        modification_time_format: '%Y%m%d%H%M.%S'
+        path: "{{ __gitlab_package_cache__.path }}"
+        recurse: false
+        state: 'absent'
+        unsafe_writes: false
+
+#endregion --- [ Play: Remove The Controller Package Cache ] ---------------------------------- #
+
+#region ------ [ Play: Prove The Distributed Shape (opt-in) ] --------------------------------- #
+# What makes this deployment distributed, proved rather than assumed, from the Gitaly node: the
+# only node that is the load balancer's client and never its target.
+#   1. both target groups report both Rails nodes healthy;
+#   2. root signs in through the load balancer, and both Rails nodes honour that session, which
+#      lives in Redis;
+#   3. a commit pushed over HTTP creates a project and clones back over HTTP;
+#   4. the database is GitLab's own role over TLS 1.3 with the parameter group's values in force,
+#      every login role holds a SCRAM verifier, plaintext is refused, and its log shows
+#      connections and DDL audited and no password other than a verifier;
+#   5. an upload lands in S3 under this run's prefix and reads back identically from both Rails
+#      nodes; only the Rails nodes may write there, and only under runs/;
+#   6. git over SSH through the load balancer meets the shared ECDSA host key, very likely on
+#      both nodes, clones the same commit, and pushes one that HTTP then reads;
+#   7. with the deploy node's GitLab stopped, HTTP, SSH, the upload and the session are still
+#      served; the node rejoins and keeps the session.
+#
+# It adds a project, keys and objects and stops a node, so it is tagged 'never': an ordinary
+# converge, and the second converge that must report no change, never run it. The workflow asks
+# for it by tag. Root's password, the access token and the session cookie reach git, curl and
+# GitLab only on stdin or in module arguments under no_log: never argv, a URL or a file.
+
+- name: 'PLAY | Prove The Distributed Shape Serves Through The Load Balancer (opt-in)'
+  hosts: 'gitlab_gitaly'
   any_errors_fatal: true
   become: true
   tags: ['never', 'gitlab_proof']
   vars:
-    __proof_git__: '/opt/gitlab/embedded/bin/git'
-    __proof_url__: >-
-      http://127.0.0.1/root/push-proof-{{ lookup('ansible.builtin.env', 'GITHUB_RUN_ID') }}.git
+    <<: *gitlab_site
+    __nlb__: "http://{{ gitlab_load_balancer_dns }}"
+    __deploy__: "{{ groups['gitlab_rails'] | sort | first }}"
+    __rails__: "{{ groups['gitlab_rails'] | sort }}"
+    __run__: "{{ lookup('ansible.builtin.env', 'GITHUB_RUN_ID') }}"
+    __project_api__: "{{ __nlb__ }}/api/v4/projects/root%2Fpush-proof-{{ __run__ }}"
+    __http_url__: "{{ __nlb__ }}/root/push-proof-{{ __run__ }}.git"
+    __ssh_url__: "git@{{ gitlab_load_balancer_dns }}:root/push-proof-{{ __run__ }}.git"
+    __git__: '/opt/gitlab/embedded/bin/git'
+    __target_groups__: [ "{{ gitlab_target_group_arn }}", "{{ gitlab_ssh_target_group_arn }}" ]
     # Runs the git command line it is given with the header read from stdin set as git
     # environment config, and fails rather than prompting for a credential.
-    __proof_with_header__: >-
+    __with_header__: >-
       IFS= read -r header &&
       export GIT_TERMINAL_PROMPT=0 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.extraHeader
       GIT_CONFIG_VALUE_0="${header}" &&
       exec "$@"
-    __proof_header__: >-
+    __header__: >-
       Authorization: Basic {{ ('root:' ~ (__proof_password__.content | b64decode
       | regex_search('^Password: (\S+)$', '\1', multiline=True) | first)) | b64encode }}
+    # Strict host keys against the deploy node's shared ECDSA key, and only that algorithm, so a
+    # node presenting any other key fails the connection. The name alone is checked: the load
+    # balancer's addresses differ by zone.
+    __ssh_command__: >-
+      ssh -p 22 -i {{ __proof_workspace__.path }}/id_ecdsa -o IdentitiesOnly=yes
+      -o BatchMode=yes -o StrictHostKeyChecking=yes
+      -o UserKnownHostsFile={{ __proof_workspace__.path }}/known_hosts -o CheckHostIP=no
+      -o HostKeyAlgorithms=ecdsa-sha2-nistp256
+    # RDS keeps the master credentials in Secrets Manager; read on the controller to create
+    # rds_tools, and to read the settings and, through rds_tools, the password types, which only
+    # the master user may read.
+    gitlab_database_credentials: >-
+      {{ lookup('amazon.aws.secretsmanager_secret', gitlab_database.master_user_secret_arn,
+                region=aws_region) | from_json }}
+    __psql__:
+      - '/bin/sh'
+      - '-c'
+      - 'IFS= read -r PGPASSWORD && export PGPASSWORD && exec "$@"'
+      - 'psql'
+      - '/opt/gitlab/embedded/bin/psql'
+      - '-X'
+      - '-w'
+      - '-q'
+      - '-A'
+      - '-t'
+      - '-v'
+      - 'ON_ERROR_STOP=1'
+      - '-f'
+      - '-'
+      - '-d'
+    __master_conninfo__: >-
+      host={{ gitlab_database.address }} port={{ gitlab_database.port }}
+      user={{ gitlab_database_credentials.username }} dbname={{ gitlab_master_database }}
+      sslmode=verify-full sslrootcert=/etc/gitlab/rds-ca-bundle.pem
+    # The values the parameter group declares, read from its one declaration.
+    __parameters__: >-
+      {{ (lookup('ansible.builtin.file', playbook_dir ~ '/../../dependencies/aws/estate.yml')
+          | from_yaml).db_parameter_groups[0].parameters }}
 
   tasks:
-    - name: 'PROCESS | Push A Commit And Clone It Back'
-      vars:
-        __source__: "{{ __proof_workspace__.path }}/source"
-        __clone__: "{{ __proof_workspace__.path }}/clone"
+    - name: 'PROCESS | Prove The Distributed Shape'
       block:
 
+        #region ------ [ Proof: Both Rails Nodes Serve Behind Both Listeners ] ---------------- #
+
+        # Read on the controller with the runner's credentials: the guests hold none.
+        # UNMEASURED: the bound covers two passing health checks ten seconds apart, with margin.
+        - name: 'END | Wait Until Both Target Groups Report Both Rails Nodes Healthy'
+          become: false
+          changed_when: false
+          delay: 10
+          delegate_to: 'localhost'
+          loop: "{{ __target_groups__ }}"
+          loop_control: { label: "{{ item.split('/')[-2] }}" }
+          register: '__proof_targets__'
+          retries: 30
+          run_once: true
+          until: __proof_targets__.stdout | trim == '2'
+          vars:
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+          ansible.builtin.command:
+            argv:
+              - 'aws'
+              - 'elbv2'
+              - 'describe-target-health'
+              - '--region'
+              - "{{ aws_region }}"
+              - '--target-group-arn'
+              - "{{ item }}"
+              - '--query'
+              - "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])"
+              - '--output'
+              - 'text'
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        #endregion --- [ Proof: Both Rails Nodes Serve Behind Both Listeners ] ---------------- #
+
+        #region ------ [ Proof: Root Signs In Through The Load Balancer ] --------------------- #
+
         # Asked first, outside no_log, so a missing file fails by name, not as hidden output.
+        # Only the node that seeded the database holds it.
         - name: 'BEGIN | Read Whether The Initial Root Password Exists'
+          delegate_to: "{{ __deploy__ }}"
           register: '__proof_password_file__'
 
           ansible.builtin.stat:
@@ -177,13 +975,14 @@
         - name: 'VERIFY | Require The Initial Root Password'
           ansible.builtin.assert:
             fail_msg: >-
-              /etc/gitlab/initial_root_password does not exist: the first reconfigure writes
-              it, and the first reconfigure after 24 hours removes it. The push proof signs in
-              with it.
+              /etc/gitlab/initial_root_password does not exist on {{ __deploy__ }}: the first
+              reconfigure that seeds the database writes it, and the first reconfigure after 24
+              hours removes it. The proof signs in with it.
             quiet: true
             that: __proof_password_file__.stat.exists
 
         - name: 'BEGIN | Read The Initial Root Password'
+          delegate_to: "{{ __deploy__ }}"
           no_log: true
           register: '__proof_password__'
 
@@ -202,11 +1001,142 @@
             state: 'directory'
             suffix: ''
 
+        - name: 'BEGIN | Open The Sign-In Form Through The Load Balancer'
+          changed_when: false
+          register: '__proof_form__'
+
+          ansible.builtin.uri:
+            body_format: 'raw'
+            decompress: true
+            follow_redirects: 'none'
+            force: false
+            force_basic_auth: false
+            headers: {}
+            http_agent: 'ansible-httpget'
+            method: 'GET'
+            remote_src: false
+            return_content: true
+            status_code: [ 200 ]
+            timeout: 30
+            unredirected_headers: []
+            unsafe_writes: false
+            url: "{{ __nlb__ }}/users/sign_in"
+            use_gssapi: false
+            use_netrc: false
+            use_proxy: false
+            validate_certs: true
+
+        # The form's CSRF token is bound to the session cookie the form set; a sign-in that
+        # succeeds answers with a redirect away from the form and a new session. no_log hides why
+        # a request failed, so each that carries a credential is judged by the assert after it.
+        - name: 'PROCESS | Sign In As Root Through The Load Balancer'
+          changed_when: false
+          ignore_errors: true
+          no_log: true
+          register: '__proof_sign_in__'
+
+          ansible.builtin.uri:
+            body:
+              authenticity_token: >-
+                {{ __proof_form__.content
+                   | regex_search('name="authenticity_token" value="([^"]+)"', '\1') | first }}
+              user[login]: 'root'
+              user[password]: >-
+                {{ __proof_password__.content | b64decode
+                   | regex_search('^Password: (\S+)$', '\1', multiline=True) | first }}
+            body_format: 'form-urlencoded'
+            decompress: true
+            follow_redirects: 'none'
+            force: false
+            force_basic_auth: false
+            headers:
+              Cookie: "{{ __proof_form__.cookies_string }}"
+            http_agent: 'ansible-httpget'
+            method: 'POST'
+            remote_src: false
+            return_content: false
+            status_code: [ 302 ]
+            timeout: 30
+            unredirected_headers: []
+            unsafe_writes: false
+            url: "{{ __nlb__ }}/users/sign_in"
+            use_gssapi: false
+            use_netrc: false
+            use_proxy: false
+            validate_certs: true
+
+        - name: 'VERIFY | Require The Sign-In To Leave The Form'
+          ansible.builtin.assert:
+            fail_msg: >-
+              Root's sign-in through the load balancer answered
+              {{ __proof_sign_in__.status | default('nothing') }}, redirecting to
+              '{{ __proof_sign_in__.location | default('') }}'; a 302 away from the form, with a
+              new session, was expected.
+            quiet: true
+            that:
+              - __proof_sign_in__.status | default(0) == 302
+              - __proof_sign_in__.location | default('') is not search('/users/sign_in')
+              - __proof_sign_in__.cookies['_gitlab_session'] | default('') | length > 0
+
+        # Each node asked on its own loopback, so the load balancer cannot route both questions
+        # to the same node: a session born behind the balancer is known to both.
+        # rc-contract: uri reports the HTTP status GitLab answered; the assert below reads it.
+        - name: 'END | Read The Signed-In User On Each Rails Node'
+          changed_when: false
+          delegate_to: "{{ item }}"
+          failed_when: false
+          loop: "{{ __rails__ }}"
+          loop_control: { label: "{{ item }}" }
+          no_log: true
+          register: '__proof_session__'
+
+          ansible.builtin.uri:
+            body_format: 'raw'
+            decompress: true
+            follow_redirects: 'none'
+            force: false
+            force_basic_auth: false
+            headers:
+              Cookie: "_gitlab_session={{ __proof_sign_in__.cookies['_gitlab_session'] }}"
+            http_agent: 'ansible-httpget'
+            method: 'GET'
+            remote_src: false
+            return_content: true
+            status_code: [ 200 ]
+            timeout: 30
+            unredirected_headers: []
+            unsafe_writes: false
+            url: 'http://127.0.0.1/api/v4/user'
+            use_gssapi: false
+            use_netrc: false
+            use_proxy: false
+            validate_certs: true
+
+        - name: 'VERIFY | Require Both Rails Nodes To Know The Session'
+          ansible.builtin.assert:
+            fail_msg: >-
+              The session answered {{ __proof_session__.results | map(attribute='status',
+              default='nothing') | list }} with users {{ __proof_session__.results
+              | map(attribute='json.username', default='') | list }} on {{ __rails__ }}; root on
+              both was expected.
+            quiet: true
+            that: >-
+              __proof_session__.results | map(attribute='json.username', default='')
+              | reject('equalto', 'root') | list | length == 0
+
+        #endregion --- [ Proof: Root Signs In Through The Load Balancer ] --------------------- #
+
+        #region ------ [ Proof: Git Over HTTP Through The Load Balancer ] --------------------- #
+
         - name: 'PROCESS | Create The Source Repository'
           changed_when: false
 
           ansible.builtin.command:
-            argv: [ "{{ __proof_git__ }}", 'init', '--initial-branch=main', "{{ __source__ }}" ]
+            argv:
+              - "{{ __git__ }}"
+              - 'init'
+              - '--initial-branch=main'
+              - "{{ __proof_workspace__.path }}/source"
             expand_argument_vars: false
             stdin_add_newline: true
             strip_empty_ends: true
@@ -217,9 +1147,9 @@
 
           ansible.builtin.command:
             argv:
-              - "{{ __proof_git__ }}"
+              - "{{ __git__ }}"
               - '-C'
-              - "{{ __source__ }}"
+              - "{{ __proof_workspace__.path }}/source"
               - '-c'
               - 'user.name=GitLab proof'
               - '-c'
@@ -237,13 +1167,18 @@
           register: '__proof_source_head__'
 
           ansible.builtin.command:
-            argv: [ "{{ __proof_git__ }}", '-C', "{{ __source__ }}", 'rev-parse', 'HEAD' ]
+            argv:
+              - "{{ __git__ }}"
+              - '-C'
+              - "{{ __proof_workspace__.path }}/source"
+              - 'rev-parse'
+              - 'HEAD'
             expand_argument_vars: false
             stdin_add_newline: true
             strip_empty_ends: true
 
         # Pushing to a project that does not exist creates it, private, under root.
-        - name: 'PROCESS | Push The Commit To A New Project'
+        - name: 'PROCESS | Push The Commit To A New Project Over HTTP'
           changed_when: __proof_push__.rc == 0
           failed_when: false
           no_log: true
@@ -253,20 +1188,20 @@
             argv:
               - '/bin/sh'
               - '-c'
-              - "{{ __proof_with_header__ }}"
+              - "{{ __with_header__ }}"
               - 'sh'
-              - "{{ __proof_git__ }}"
+              - "{{ __git__ }}"
               - '-C'
-              - "{{ __source__ }}"
+              - "{{ __proof_workspace__.path }}/source"
               - 'push'
-              - "{{ __proof_url__ }}"
+              - "{{ __http_url__ }}"
               - 'HEAD:refs/heads/main'
             expand_argument_vars: false
-            stdin: "{{ __proof_header__ }}"
+            stdin: "{{ __header__ }}"
             stdin_add_newline: true
             strip_empty_ends: true
 
-        - name: 'PROCESS | Clone The Project Back'
+        - name: 'PROCESS | Clone The Project Back Over HTTP'
           changed_when: false
           failed_when: false
           no_log: true
@@ -276,14 +1211,14 @@
             argv:
               - '/bin/sh'
               - '-c'
-              - "{{ __proof_with_header__ }}"
+              - "{{ __with_header__ }}"
               - 'sh'
-              - "{{ __proof_git__ }}"
+              - "{{ __git__ }}"
               - 'clone'
-              - "{{ __proof_url__ }}"
-              - "{{ __clone__ }}"
+              - "{{ __http_url__ }}"
+              - "{{ __proof_workspace__.path }}/clone"
             expand_argument_vars: false
-            stdin: "{{ __proof_header__ }}"
+            stdin: "{{ __header__ }}"
             stdin_add_newline: true
             strip_empty_ends: true
 
@@ -292,7 +1227,7 @@
         - name: 'VERIFY | Require The Push And The Clone To Succeed'
           ansible.builtin.assert:
             fail_msg: >-
-              The round trip through {{ __proof_url__ }} failed. push exited
+              The round trip through {{ __http_url__ }} failed. push exited
               {{ __proof_push__.rc }}: {{ __proof_push__.stderr_lines }}; clone exited
               {{ __proof_clone__.rc }}: {{ __proof_clone__.stderr_lines }}.
             quiet: true
@@ -300,35 +1235,1360 @@
               - __proof_push__.rc == 0
               - __proof_clone__.rc == 0
 
-        - name: 'BEGIN | Read The Cloned Commit'
+        - name: 'BEGIN | Read The Commit Cloned Over HTTP'
           changed_when: false
           register: '__proof_clone_head__'
 
           ansible.builtin.command:
-            argv: [ "{{ __proof_git__ }}", '-C', "{{ __clone__ }}", 'rev-parse', 'HEAD' ]
+            argv:
+              - "{{ __git__ }}"
+              - '-C'
+              - "{{ __proof_workspace__.path }}/clone"
+              - 'rev-parse'
+              - 'HEAD'
             expand_argument_vars: false
             stdin_add_newline: true
             strip_empty_ends: true
 
-        - name: 'VERIFY | Require The Clone To Hold The Pushed Commit'
+        - name: 'VERIFY | Require The HTTP Clone To Hold The Pushed Commit'
           ansible.builtin.assert:
             fail_msg: >-
-              The clone of {{ __proof_url__ }} holds {{ __proof_clone_head__.stdout }}, but
+              The clone of {{ __http_url__ }} holds {{ __proof_clone_head__.stdout }}, but
               {{ __proof_source_head__.stdout }} was pushed.
             quiet: true
             that: __proof_clone_head__.stdout == __proof_source_head__.stdout
 
-        - name: 'INFO | Report The Round Trip'
+        #endregion --- [ Proof: Git Over HTTP Through The Load Balancer ] --------------------- #
+
+        #region ------ [ Proof: The Database Is GitLab's Own, Over TLS, As Declared ] --------- #
+
+        # Generated on the controller and handed to GitLab on stdin. GitLab's token minting
+        # documentation states a 20-character token.
+        - name: 'PROCESS | Draw The Proof Access Token'
+          no_log: true
+          run_once: true
+
+          ansible.builtin.set_fact:
+            __proof_token__: >-
+              {{ lookup('ansible.builtin.password', '/dev/null', length=20,
+                        chars=['ascii_letters', 'digits']) }}
+            cacheable: false
+
+        # One Rails runner on the deploy node: it mints root's access token from stdin (api
+        # scope, one day), then reports, over GitLab's own database connection, who it connects
+        # as and what the server says. pg_stat_ssl covers every backend of that role, both nodes'
+        # Puma and Sidekiq included. The JSON is the runner's last line; a failure is named by
+        # the assert after it, which no_log would otherwise hide.
+        - name: 'PROCESS | Mint The Access Token And Read The Database Through GitLab'
+          changed_when: true
+          delegate_to: "{{ __deploy__ }}"
+          ignore_errors: true
+          no_log: true
+          register: '__proof_runner__'
+
+          ansible.builtin.command:
+            argv:
+              - 'gitlab-rails'
+              - 'runner'
+              - |
+                token = User.find_by_username!('root').personal_access_tokens.create(
+                  scopes: ['api'], name: 'proof-{{ __run__ }}', expires_at: 1.day.from_now)
+                token.set_token(STDIN.gets.to_s.strip)
+                token.save!
+                db = ApplicationRecord.connection
+                puts({
+                  user: db.select_value('SELECT current_user'),
+                  server_version: db.select_value('SHOW server_version'),
+                  max_connections: db.select_value('SHOW max_connections'),
+                  shared_buffers: db.select_value('SHOW shared_buffers'),
+                  statement_timeout: db.select_value('SHOW statement_timeout'),
+                  backends: db.select_rows(<<~SQL).map do |ssl, version, count|
+                    SELECT s.ssl, s.version, count(*)
+                    FROM pg_stat_ssl s JOIN pg_stat_activity a USING (pid)
+                    WHERE a.usename = current_user AND a.backend_type = 'client backend'
+                    GROUP BY 1, 2
+                  SQL
+                    { ssl: ssl, version: version, count: count }
+                  end,
+                  extensions: db.select_values('SELECT extname FROM pg_extension ORDER BY 1')
+                }.to_json)
+            expand_argument_vars: false
+            stdin: "{{ __proof_token__ }}"
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'VERIFY | Require The Rails Runner To Succeed'
+          ansible.builtin.assert:
+            fail_msg: >-
+              gitlab-rails runner exited {{ __proof_runner__.rc }}:
+              {{ __proof_runner__.stderr_lines[-15:]
+                 | map('regex_replace', 'SCRAM-SHA-256[$][A-Za-z0-9+/=:$]*', '<verifier>')
+                 | list }}
+            quiet: true
+            that: __proof_runner__.rc == 0
+
+        - name: 'INFO | Report The Database As GitLab Sees It'
+          vars:
+            __facts__: "{{ __proof_runner__.stdout_lines | last | from_json }}"
+
           ansible.builtin.debug:
-            msg: >-
-              Pushed {{ __proof_source_head__.stdout }} in {{ __proof_push__.delta }} and cloned
-              {{ __proof_clone_head__.stdout }} back in {{ __proof_clone__.delta }}.
+            msg: "{{ __facts__ }}"
             verbosity: 0
 
+        - name: 'VERIFY | Require GitLab''s Own Role Over TLS 1.3 With The Required Settings'
+          vars:
+            __facts__: "{{ __proof_runner__.stdout_lines | last | from_json }}"
+
+          ansible.builtin.assert:
+            fail_msg: >-
+              GitLab's database connection is not as declared: {{ __facts__ }}. Expected user
+              {{ gitlab_database_role }}, PostgreSQL 17, max_connections 400, shared_buffers 2GB,
+              statement_timeout 1min, every backend of the role on TLSv1.3, and the extensions
+              {{ gitlab_database_extensions }} installed.
+            quiet: true
+            that:
+              - __facts__.user == gitlab_database_role
+              - __facts__.server_version is match('17[.]')
+              - __facts__.max_connections == '400'
+              - __facts__.shared_buffers == '2GB'
+              - __facts__.statement_timeout == '1min'
+              - __facts__.backends | length > 0
+              - __facts__.backends | rejectattr('ssl') | list | length == 0
+              - >-
+                __facts__.backends | rejectattr('version', 'equalto', 'TLSv1.3')
+                | list | length == 0
+              - gitlab_database_extensions | difference(__facts__.extensions) | length == 0
+
+        # pg_settings source and pending_restart, and the password type of every role, are the
+        # master user's to read; rds_tools provides the latter and is created for it, in RDS's
+        # initial database only. Every run's database is new, so the create is this task's
+        # change; one that finds rds_tools already there fails, and the assert after it names
+        # psql's error.
+        - name: 'PROCESS | Create rds_tools And Read The Settings As The Master User'
+          changed_when: __proof_master_read__.rc == 0
+          delegate_to: "{{ __deploy__ }}"
+          ignore_errors: true
+          no_log: true
+          register: '__proof_master_read__'
+
+          ansible.builtin.command:
+            argv: "{{ __psql__ + [__master_conninfo__] }}"
+            expand_argument_vars: false
+            stdin: |-
+              {{ gitlab_database_credentials.password }}
+              CREATE EXTENSION rds_tools;
+              SELECT json_build_object(
+                'settings', (SELECT json_agg(json_build_object(
+                                 'name', name, 'setting', setting, 'source', source,
+                                 'pending_restart', pending_restart))
+                             FROM pg_settings
+                             WHERE name IN ('{{ __parameters__.keys() | join("', '") }}')),
+                'roles', (SELECT json_agg(json_build_object(
+                              'role', t.rolname, 'type', t.encryption_type))
+                          FROM rds_tools.role_password_encryption_type() t
+                          JOIN pg_roles r ON r.rolname = t.rolname WHERE r.rolcanlogin));
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'VERIFY | Require psql To Have Created rds_tools And Read The Settings'
+          ansible.builtin.assert:
+            fail_msg: >-
+              psql exited {{ __proof_master_read__.rc }}:
+              {{ __proof_master_read__.stderr_lines
+                 | map('regex_replace', 'SCRAM-SHA-256[$][A-Za-z0-9+/=:$]*', '<verifier>')
+                 | list }}
+            quiet: true
+            that: __proof_master_read__.rc == 0
+
+        - name: 'INFO | Report The Settings In Force And The Password Types'
+          ansible.builtin.debug:
+            msg: "{{ __proof_master_read__.stdout | from_json }}"
+            verbosity: 0
+
+        - name: 'VERIFY | Require The Parameter Group In Force And Only SCRAM Verifiers'
+          vars:
+            __read__: "{{ __proof_master_read__.stdout | from_json }}"
+            __settings__: "{{ __read__.settings | default([], true) }}"
+            __roles__: "{{ __read__.roles | default([], true) }}"
+
+          ansible.builtin.assert:
+            fail_msg: >-
+              The database does not run as declared. Settings not read:
+              {{ __parameters__.keys() | difference(__settings__ | map(attribute='name')) }};
+              not from the parameter group's configuration file, or waiting for a restart:
+              {{ __settings__ | rejectattr('source', 'equalto', 'configuration file') | list
+                 + __settings__ | selectattr('pending_restart') | list }}; login roles with a
+              password that is not a SCRAM verifier: {{ __roles__ | rejectattr('type', 'none')
+                 | rejectattr('type', 'equalto', 'scram-sha-256') | list }}; the GitLab roles
+              read
+              {{ __roles__ | selectattr('role', 'in',
+                 [gitlab_database_role, gitlab_database_credentials.username]) | list }}.
+            quiet: true
+            that:
+              - >-
+                __parameters__.keys() | difference(__settings__ | map(attribute='name'))
+                | length == 0
+              - >-
+                __settings__ | rejectattr('source', 'equalto', 'configuration file')
+                | list | length == 0
+              - __settings__ | selectattr('pending_restart') | list | length == 0
+              - >-
+                __roles__ | rejectattr('type', 'none')
+                | rejectattr('type', 'equalto', 'scram-sha-256') | list | length == 0
+              - >-
+                __roles__ | selectattr('role', 'in',
+                [gitlab_database_role, gitlab_database_credentials.username])
+                | selectattr('type', 'equalto', 'scram-sha-256') | list | length == 2
+
+        # rds.force_ssl refuses a plaintext connection before authentication, so no password is
+        # offered: one asked for here would mean the plaintext connection got that far.
+        # rc-contract: psql(1) exits 2 when the connection fails.
+        - name: 'BEGIN | Attempt A Plaintext Database Connection'
+          changed_when: false
+          delegate_to: "{{ __deploy__ }}"
+          failed_when: false
+          register: '__proof_plaintext__'
+
+          ansible.builtin.command:
+            argv:
+              - '/opt/gitlab/embedded/bin/psql'
+              - '-X'
+              - '-w'
+              - '-d'
+              - >-
+                host={{ gitlab_database.address }} port={{ gitlab_database.port }}
+                user={{ gitlab_database_role }} dbname={{ gitlab_database_name }} sslmode=disable
+              - '-c'
+              - 'SELECT 1'
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'VERIFY | Require The Plaintext Connection To Be Refused'
+          ansible.builtin.assert:
+            fail_msg: >-
+              A plaintext connection was not refused for want of encryption: psql exited
+              {{ __proof_plaintext__.rc }}: {{ __proof_plaintext__.stderr }}
+            quiet: true
+            that:
+              - __proof_plaintext__.rc != 0
+              - __proof_plaintext__.stderr is search('no encryption')
+
+        # Read with the runner's credentials, which may read only this database's logs. Every log
+        # file the instance holds: it is this run's.
+        - name: 'BEGIN | List The Database Log Files'
+          become: false
+          changed_when: false
+          delegate_to: 'localhost'
+          register: '__proof_log_files__'
+          run_once: true
+          vars:
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+          ansible.builtin.command:
+            argv:
+              - 'aws'
+              - 'rds'
+              - 'describe-db-log-files'
+              - '--region'
+              - "{{ aws_region }}"
+              - '--db-instance-identifier'
+              - "{{ gitlab_database.address.split('.') | first }}"
+              - '--query'
+              - 'DescribeDBLogFiles[].LogFileName'
+              - '--output'
+              - 'json'
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        # The logs hold statement text, so they stay out of the job log; the check below reports
+        # counts only.
+        # rc-contract: aws(1) exits 0 on success, and 254 or 255 when the request fails.
+        - name: 'BEGIN | Read The Database Logs'
+          become: false
+          changed_when: false
+          delegate_to: 'localhost'
+          failed_when: false
+          loop: "{{ __proof_log_files__.stdout | from_json }}"
+          loop_control: { label: "{{ item }}" }
+          no_log: true
+          register: '__proof_logs__'
+          run_once: true
+          vars:
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+          ansible.builtin.command:
+            argv:
+              - 'aws'
+              - 'rds'
+              - 'download-db-log-file-portion'
+              - '--region'
+              - "{{ aws_region }}"
+              - '--db-instance-identifier'
+              - "{{ gitlab_database.address.split('.') | first }}"
+              - '--log-file-name'
+              - "{{ item }}"
+              - '--starting-token'
+              - '0'
+              - '--output'
+              - 'text'
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'VERIFY | Require Every Database Log To Have Been Read'
+          ansible.builtin.assert:
+            fail_msg: >-
+              Reading the database logs failed: {{ __proof_logs__.results
+              | rejectattr('rc', 'equalto', 0) | map(attribute='stderr') | list }}
+            quiet: true
+            that: __proof_logs__.results | rejectattr('rc', 'equalto', 0) | list | length == 0
+
+        # A failed statement is logged with its text, so a role statement may appear; it can only
+        # ever carry the verifier the role sent, never a password.
+        - name: 'VERIFY | Require Logged Connections, Audited DDL And No Password'
+          vars:
+            __log__: "{{ __proof_logs__.results | map(attribute='stdout') | join('\n') }}"
+            __passwords__: "{{ __log__ | regex_findall(\"PASSWORD '\") | length }}"
+            __verifiers__: >-
+              {{ __log__ | regex_findall("PASSWORD 'SCRAM-SHA-256[$]") | length }}
+
+          ansible.builtin.assert:
+            fail_msg: >-
+              The database log ({{ __proof_logs__.results | length }} file(s)) shows
+              {{ __log__ | regex_findall('connection authorized') | length }} authorized
+              connection(s) and {{ __log__ | regex_findall('AUDIT: SESSION,[0-9]+,[0-9]+,DDL,')
+              | length }} audited DDL statement(s); {{ __passwords__ }} PASSWORD literal(s), of
+              which {{ __verifiers__ }} are SCRAM verifiers.
+            quiet: true
+            that:
+              - __log__ is search('connection authorized')
+              - >-
+                __log__ is search('AUDIT: SESSION,[0-9]+,[0-9]+,DDL,')
+              - __passwords__ | int == __verifiers__ | int
+
+        #endregion --- [ Proof: The Database Is GitLab's Own, Over TLS, As Declared ] --------- #
+
+        #region ------ [ Proof: Objects Land In S3 Under This Run ] --------------------------- #
+
+        - name: 'PROCESS | Write The Upload'
+          changed_when: false
+
+          ansible.builtin.command:
+            argv:
+              - 'dd'
+              - 'if=/dev/urandom'
+              - "of={{ __proof_workspace__.path }}/upload-proof.bin"
+              - 'bs=65536'
+              - 'count=1'
+              - 'status=none'
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'BEGIN | Read The Upload Digest'
+          register: '__proof_upload_file__'
+
+          ansible.builtin.stat:
+            checksum_algorithm: 'sha256'
+            follow: false
+            get_attributes: false
+            get_checksum: true
+            get_mime: false
+            get_selinux_context: false
+            path: "{{ __proof_workspace__.path }}/upload-proof.bin"
+
+        # A failure is named by the assert after it, which no_log would otherwise hide.
+        - name: 'PROCESS | Upload The File Through The Load Balancer'
+          changed_when: true
+          ignore_errors: true
+          no_log: true
+          register: '__proof_upload__'
+
+          ansible.builtin.uri:
+            body:
+              file:
+                filename: "{{ __proof_workspace__.path }}/upload-proof.bin"
+                mime_type: 'application/octet-stream'
+            body_format: 'form-multipart'
+            decompress: true
+            follow_redirects: 'none'
+            force: false
+            force_basic_auth: false
+            headers:
+              PRIVATE-TOKEN: "{{ __proof_token__ }}"
+            http_agent: 'ansible-httpget'
+            method: 'POST'
+            remote_src: false
+            return_content: true
+            status_code: [ 201 ]
+            timeout: 60
+            unredirected_headers: []
+            unsafe_writes: false
+            url: "{{ __project_api__ }}/uploads"
+            use_gssapi: false
+            use_netrc: false
+            use_proxy: false
+            validate_certs: true
+
+        - name: 'VERIFY | Require The Upload To Be Stored'
+          ansible.builtin.assert:
+            fail_msg: >-
+              The upload answered {{ __proof_upload__.status | default('nothing') }}:
+              {{ (__proof_upload__.json | default({})).message | default(__proof_upload__.msg
+              | default('')) }}
+            quiet: true
+            that: __proof_upload__.status | default(0) == 201
+
+        # The upload's address is a capability, readable by anyone who holds it, and the run's
+        # logs are public: only what identifies the bytes is shown.
+        - name: 'INFO | Report The Upload'
+          ansible.builtin.debug:
+            msg: >-
+              Uploaded {{ __proof_upload_file__.stat.size }} bytes, sha256
+              {{ __proof_upload_file__.stat.checksum }}.
+            verbosity: 0
+
+        # The token is a request header, so the reads are no_log; what they fetched is judged by
+        # its digest on disk below.
+        # rc-contract: get_url reports the HTTP status GitLab answered; the asserts read it.
+        - name: 'END | Read The Upload Back From Each Rails Node'
+          changed_when: false
+          delegate_to: "{{ item }}"
+          failed_when: false
+          loop: "{{ __rails__ }}"
+          loop_control: { label: "{{ item }}" }
+          no_log: true
+          register: '__proof_upload_reads__'
+
+          ansible.builtin.get_url:
+            backup: false
+            checksum: ''
+            decompress: true
+            dest: "/root/gitlab-upload-proof-{{ __run__ }}.bin"
+            force: true
+            force_basic_auth: false
+            group: 'root'
+            headers:
+              PRIVATE-TOKEN: "{{ __proof_token__ }}"
+            http_agent: 'ansible-httpget'
+            mode: '0600'
+            owner: 'root'
+            timeout: 60
+            unredirected_headers: []
+            unsafe_writes: false
+            url: >-
+              http://127.0.0.1/api/v4/projects/root%2Fpush-proof-{{ __run__
+              }}/uploads/{{ __proof_upload__.json.id }}
+            use_gssapi: false
+            use_netrc: false
+            use_proxy: false
+            validate_certs: true
+
+        - name: 'BEGIN | Read The Digest Of The Upload Each Rails Node Served'
+          delegate_to: "{{ item }}"
+          loop: "{{ __rails__ }}"
+          loop_control: { label: "{{ item }}" }
+          register: '__proof_upload_copies__'
+
+          ansible.builtin.stat:
+            checksum_algorithm: 'sha256'
+            follow: false
+            get_attributes: false
+            get_checksum: true
+            get_mime: false
+            get_selinux_context: false
+            path: "/root/gitlab-upload-proof-{{ __run__ }}.bin"
+
+        - name: 'VERIFY | Require Both Rails Nodes To Serve The Uploaded Bytes'
+          ansible.builtin.assert:
+            fail_msg: >-
+              The upload has sha256 {{ __proof_upload_file__.stat.checksum }}; {{ __rails__ }}
+              answered {{ __proof_upload_reads__.results
+              | map(attribute='status_code', default='nothing') | list }} and served
+              {{ __proof_upload_copies__.results
+              | map(attribute='stat.checksum', default='nothing') | list }}.
+            quiet: true
+            that: >-
+              __proof_upload_copies__.results | map(attribute='stat.checksum', default='')
+              | reject('equalto', __proof_upload_file__.stat.checksum) | list | length == 0
+
+        # The object store's own listing, read with the deploy node's instance profile through
+        # the framework's boto3 environment: the upload's key ends in its secret and file name.
+        - name: 'BEGIN | List This Run''s Uploads In The Bucket'
+          delegate_to: "{{ __deploy__ }}"
+          register: '__proof_upload_keys__'
+          vars:
+            ansible_python_interpreter: '/opt/ansible/venv/bin/python'
+
+          amazon.aws.s3_object:
+            bucket: "{{ aws_account_id }}-gitlab-objects"
+            ceph: false
+            debug_botocore_endpoint_logs: false
+            dualstack: false
+            encrypt: true
+            encryption_mode: 'AES256'
+            expiry: 600
+            ignore_nonexistent_bucket: true
+            max_keys: 1000
+            mode: 'list'
+            overwrite: 'always'
+            permission: [ 'private' ]
+            prefix: "runs/{{ __run__ }}/uploads/"
+            purge_tags: true
+            region: "{{ aws_region }}"
+            retries: 0
+            sig_v4: true
+            validate_bucket_name: true
+            validate_certs: true
+
+        # The key's tail, the upload's secret and file name, is a capability: neither it nor any
+        # key is printed.
+        - name: 'VERIFY | Require The Upload Under This Run''s Prefix'
+          vars:
+            __suffix__: "{{ __proof_upload__.json.url | regex_replace('^/uploads/', '') }}"
+
+          ansible.builtin.assert:
+            fail_msg: >-
+              None of the {{ __proof_upload_keys__.s3_keys | default([]) | length }} key(s)
+              under runs/{{ __run__ }}/uploads/ ends in the upload's secret and file name, so
+              the upload is not stored under this run's prefix.
+            quiet: true
+            that: >-
+              __proof_upload_keys__.s3_keys | default([])
+              | select('search', (__suffix__ | regex_escape) ~ '$') | list | length == 1
+
+        #endregion --- [ Proof: Objects Land In S3 Under This Run ] --------------------------- #
+
+        #region ------ [ Proof: Only The Rails Nodes Write, And Only Under runs/ ] ------------ #
+
+        # 16 MiB, past boto3's multipart threshold, so the multipart grants are exercised too.
+        - name: 'PROCESS | Write A Probe Object On The Deploy Node'
+          changed_when: false
+          delegate_to: "{{ __deploy__ }}"
+
+          ansible.builtin.command:
+            argv:
+              - 'dd'
+              - 'if=/dev/urandom'
+              - "of=/root/gitlab-s3-probe-{{ __run__ }}.bin"
+              - 'bs=1048576'
+              - 'count=16'
+              - 'status=none'
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'PROCESS | Put, Get And Delete The Probe Under This Run'
+          delegate_to: "{{ __deploy__ }}"
+          loop:
+            - mode: 'put'
+              object: "runs/{{ __run__ }}/proof/probe"
+            - mode: 'get'
+              object: "runs/{{ __run__ }}/proof/probe"
+            - mode: 'delobj'
+              object: "runs/{{ __run__ }}/proof/probe"
+          loop_control: { label: "{{ item.mode }} {{ item.object }}" }
+          vars:
+            ansible_python_interpreter: '/opt/ansible/venv/bin/python'
+
+          amazon.aws.s3_object:
+            bucket: "{{ aws_account_id }}-gitlab-objects"
+            ceph: false
+            debug_botocore_endpoint_logs: false
+            dest: >-
+              {{ ('/root/gitlab-s3-probe-' ~ __run__ ~ '.read')
+                 if item.mode == 'get' else omit }}
+            dualstack: false
+            encrypt: true
+            encryption_mode: 'AES256'
+            expiry: 600
+            ignore_nonexistent_bucket: true
+            mode: "{{ item.mode }}"
+            object: "{{ item.object }}"
+            overwrite: 'always'
+            permission: [ 'private' ]
+            prefix: ''
+            purge_tags: true
+            region: "{{ aws_region }}"
+            retries: 0
+            sig_v4: true
+            src: >-
+              {{ ('/root/gitlab-s3-probe-' ~ __run__ ~ '.bin') if item.mode == 'put' else omit }}
+            validate_bucket_name: true
+            validate_certs: true
+
+        # A refusal is the expected answer, and the assert after it requires exactly that.
+        - name: 'PROCESS | Attempt A Put Outside runs/ From The Deploy Node'
+          delegate_to: "{{ __deploy__ }}"
+          ignore_errors: true
+          register: '__proof_put_outside__'
+          vars:
+            ansible_python_interpreter: '/opt/ansible/venv/bin/python'
+
+          amazon.aws.s3_object:
+            bucket: "{{ aws_account_id }}-gitlab-objects"
+            ceph: false
+            debug_botocore_endpoint_logs: false
+            dualstack: false
+            encrypt: true
+            encryption_mode: 'AES256'
+            expiry: 600
+            ignore_nonexistent_bucket: true
+            mode: 'put'
+            object: "other/{{ __run__ }}/probe"
+            overwrite: 'always'
+            permission: [ 'private' ]
+            prefix: ''
+            purge_tags: true
+            region: "{{ aws_region }}"
+            retries: 0
+            sig_v4: true
+            src: "/root/gitlab-s3-probe-{{ __run__ }}.bin"
+            validate_bucket_name: true
+            validate_certs: true
+
+        - name: 'VERIFY | Require The Put Outside runs/ To Be Denied'
+          ansible.builtin.assert:
+            fail_msg: >-
+              The deploy node's put to other/ was not refused for want of a grant: it answered
+              {{ __proof_put_outside__.msg | default('success') }}.
+            quiet: true
+            that:
+              - __proof_put_outside__ is failed
+              - __proof_put_outside__.msg | default('') is search('AccessDenied')
+
+        # This node carries the SSM-only org profile; a refusal is the expected answer.
+        - name: 'END | Attempt To List This Run From The Gitaly Node'
+          ignore_errors: true
+          register: '__proof_list_gitaly__'
+          vars:
+            ansible_python_interpreter: '/opt/ansible/venv/bin/python'
+
+          amazon.aws.s3_object:
+            bucket: "{{ aws_account_id }}-gitlab-objects"
+            ceph: false
+            debug_botocore_endpoint_logs: false
+            dualstack: false
+            encrypt: true
+            encryption_mode: 'AES256'
+            expiry: 600
+            ignore_nonexistent_bucket: true
+            max_keys: 1000
+            mode: 'list'
+            overwrite: 'always'
+            permission: [ 'private' ]
+            prefix: "runs/{{ __run__ }}/"
+            purge_tags: true
+            region: "{{ aws_region }}"
+            retries: 0
+            sig_v4: true
+            validate_bucket_name: true
+            validate_certs: true
+
+        - name: 'VERIFY | Require The Gitaly Node''s Listing To Be Denied'
+          ansible.builtin.assert:
+            fail_msg: >-
+              The Gitaly node's listing of runs/ was not refused for want of a grant: it
+              answered {{ __proof_list_gitaly__.msg | default('success') }}.
+            quiet: true
+            that:
+              - __proof_list_gitaly__ is failed
+              - __proof_list_gitaly__.msg | default('') is search('AccessDenied')
+
+        #endregion --- [ Proof: Only The Rails Nodes Write, And Only Under runs/ ] ------------ #
+
+        #region ------ [ Proof: Git Over SSH Through The Load Balancer ] ---------------------- #
+
+        - name: 'PROCESS | Generate The Proof SSH Key'
+          changed_when: false
+
+          ansible.builtin.command:
+            argv:
+              - 'ssh-keygen'
+              - '-q'
+              - '-N'
+              - ''
+              - '-C'
+              - "ssh-proof-{{ __run__ }}"
+              - '-t'
+              - 'ecdsa'
+              - '-b'
+              - '256'
+              - '-f'
+              - "{{ __proof_workspace__.path }}/id_ecdsa"
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'BEGIN | Read The Proof SSH Public Key'
+          register: '__proof_ssh_public__'
+
+          ansible.builtin.slurp:
+            armor: true
+            src: "{{ __proof_workspace__.path }}/id_ecdsa.pub"
+
+        # A failure is named by the assert after it, which no_log would otherwise hide.
+        - name: 'PROCESS | Register The Proof SSH Key For Root'
+          changed_when: true
+          ignore_errors: true
+          no_log: true
+          register: '__proof_ssh_key__'
+
+          ansible.builtin.uri:
+            body:
+              expires_at: >-
+                {{ '%Y-%m-%dT%H:%M:%SZ'
+                   | strftime((now(utc=true).timestamp() + 86400) | int, utc=true) }}
+              key: "{{ __proof_ssh_public__.content | b64decode | trim }}"
+              title: "ssh-proof-{{ __run__ }}"
+            body_format: 'json'
+            decompress: true
+            follow_redirects: 'none'
+            force: false
+            force_basic_auth: false
+            headers:
+              PRIVATE-TOKEN: "{{ __proof_token__ }}"
+            http_agent: 'ansible-httpget'
+            method: 'POST'
+            remote_src: false
+            return_content: true
+            status_code: [ 201 ]
+            timeout: 30
+            unredirected_headers: []
+            unsafe_writes: false
+            url: "{{ __nlb__ }}/api/v4/user/keys"
+            use_gssapi: false
+            use_netrc: false
+            use_proxy: false
+            validate_certs: true
+
+        - name: 'VERIFY | Require The Proof SSH Key To Be Registered'
+          ansible.builtin.assert:
+            fail_msg: >-
+              Registering the proof SSH key answered
+              {{ __proof_ssh_key__.status | default('nothing') }}:
+              {{ (__proof_ssh_key__.json | default({})).message | default(__proof_ssh_key__.msg
+              | default('')) }}
+            quiet: true
+            that: __proof_ssh_key__.status | default(0) == 201
+
+        - name: 'BEGIN | Read The Shared ECDSA Host Key On The Deploy Node'
+          delegate_to: "{{ __deploy__ }}"
+          register: '__proof_host_key__'
+
+          ansible.builtin.slurp:
+            armor: true
+            src: "{{ gitlab_host_key_dir }}/ssh_host_ecdsa_key.pub"
+
+        - name: 'PROCESS | Trust Only The Shared Host Key For The Load Balancer'
+          changed_when: false
+
+          ansible.builtin.copy:
+            backup: false
+            content: |
+              {{ gitlab_load_balancer_dns }} {{ (__proof_host_key__.content
+              | b64decode).split()[:2] | join(' ') }}
+            decrypt: true
+            dest: "{{ __proof_workspace__.path }}/known_hosts"
+            follow: false
+            force: true
+            group: 'root'
+            mode: '0600'
+            owner: 'root'
+            remote_src: false
+            unsafe_writes: false
+
+        # Six connections very likely reach both nodes (all six land on one about 1 time in 32),
+        # and one presenting any other key fails strict checking. The role's END check and the
+        # host key play are what hold every node's key files to the shared ones. GitLab greets
+        # and closes; its greeting decides.
+        # rc-contract: ssh(1) exits with the remote command's status, or 255 on its own error.
+        - name: 'END | Greet GitLab Over SSH Through The Load Balancer'
+          changed_when: false
+          failed_when: false
+          loop: "{{ range(6) | list }}"
+          loop_control: { label: "connection {{ item + 1 }}" }
+          register: '__proof_ssh_greetings__'
+
+          ansible.builtin.command:
+            argv: "{{ __ssh_command__.split() + ['-T', 'git@' ~ gitlab_load_balancer_dns] }}"
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'VERIFY | Require Every SSH Connection To Be Greeted As Root'
+          ansible.builtin.assert:
+            fail_msg: >-
+              Not every SSH connection through the load balancer was greeted as root:
+              {{ __proof_ssh_greetings__.results | map(attribute='stdout') | list }}
+              {{ __proof_ssh_greetings__.results | map(attribute='stderr') | list }}
+            quiet: true
+            that: >-
+              __proof_ssh_greetings__.results | map(attribute='stdout')
+              | zip(__proof_ssh_greetings__.results | map(attribute='stderr')) | map('join', ' ')
+              | reject('search', 'Welcome to GitLab, @root!') | list | length == 0
+
+        - name: 'PROCESS | Clone The Project Over SSH'
+          changed_when: false
+
+          ansible.builtin.command:
+            argv:
+              - "{{ __git__ }}"
+              - '-c'
+              - "core.sshCommand={{ __ssh_command__ }}"
+              - 'clone'
+              - "{{ __ssh_url__ }}"
+              - "{{ __proof_workspace__.path }}/ssh-clone"
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'BEGIN | Read The Commit Cloned Over SSH'
+          changed_when: false
+          register: '__proof_ssh_head__'
+
+          ansible.builtin.command:
+            argv:
+              - "{{ __git__ }}"
+              - '-C'
+              - "{{ __proof_workspace__.path }}/ssh-clone"
+              - 'rev-parse'
+              - 'HEAD'
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'VERIFY | Require The SSH Clone To Hold The Commit Pushed Over HTTP'
+          ansible.builtin.assert:
+            fail_msg: >-
+              The SSH clone holds {{ __proof_ssh_head__.stdout }}, but
+              {{ __proof_source_head__.stdout }} was pushed over HTTP.
+            quiet: true
+            that: __proof_ssh_head__.stdout == __proof_source_head__.stdout
+
+        - name: 'PROCESS | Make One Commit To Push Over SSH'
+          changed_when: true
+
+          ansible.builtin.command:
+            argv:
+              - "{{ __git__ }}"
+              - '-C'
+              - "{{ __proof_workspace__.path }}/ssh-clone"
+              - '-c'
+              - "core.sshCommand={{ __ssh_command__ }}"
+              - '-c'
+              - 'user.name=GitLab proof'
+              - '-c'
+              - 'user.email=proof@localhost'
+              - 'commit'
+              - '--allow-empty'
+              - '--message'
+              - 'Prove a push over SSH'
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'PROCESS | Push Over SSH'
+          changed_when: true
+
+          ansible.builtin.command:
+            argv:
+              - "{{ __git__ }}"
+              - '-C'
+              - "{{ __proof_workspace__.path }}/ssh-clone"
+              - '-c'
+              - "core.sshCommand={{ __ssh_command__ }}"
+              - 'push'
+              - 'origin'
+              - 'HEAD:refs/heads/main'
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'BEGIN | Read The Commit Pushed Over SSH'
+          changed_when: false
+          register: '__proof_ssh_pushed__'
+
+          ansible.builtin.command:
+            argv:
+              - "{{ __git__ }}"
+              - '-C'
+              - "{{ __proof_workspace__.path }}/ssh-clone"
+              - 'rev-parse'
+              - 'HEAD'
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        # rc-contract: git exits 0 when it read the refs and 128 on a fatal error.
+        - name: 'BEGIN | Read The Branch Over HTTP'
+          changed_when: false
+          failed_when: false
+          no_log: true
+          register: '__proof_http_ref__'
+
+          ansible.builtin.command:
+            argv:
+              - '/bin/sh'
+              - '-c'
+              - "{{ __with_header__ }}"
+              - 'sh'
+              - "{{ __git__ }}"
+              - 'ls-remote'
+              - "{{ __http_url__ }}"
+              - 'refs/heads/main'
+            expand_argument_vars: false
+            stdin: "{{ __header__ }}"
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'VERIFY | Require HTTP To Serve The Commit Pushed Over SSH'
+          ansible.builtin.assert:
+            fail_msg: >-
+              HTTP reads main as '{{ __proof_http_ref__.stdout }}' (git exited
+              {{ __proof_http_ref__.rc }}: {{ __proof_http_ref__.stderr_lines }}), but
+              {{ __proof_ssh_pushed__.stdout }} was pushed over SSH.
+            quiet: true
+            that: >-
+              (__proof_http_ref__.stdout.split() | first | default(''))
+              == __proof_ssh_pushed__.stdout
+
+        #endregion --- [ Proof: Git Over SSH Through The Load Balancer ] ---------------------- #
+
+        #region ------ [ Proof: Losing A Rails Node Loses Nothing ] --------------------------- #
+
+        - name: 'PROCESS | Prove The Load Balancer Survives Losing The Deploy Node'
+          block:
+
+            - name: 'PROCESS | Stop GitLab On The Deploy Node'
+              changed_when: true
+              delegate_to: "{{ __deploy__ }}"
+
+              ansible.builtin.command:
+                argv: [ 'gitlab-ctl', 'stop' ]
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            # UNMEASURED: the bound covers two failed health checks ten seconds apart, with
+            # margin.
+            - name: 'END | Wait Until Both Target Groups Report One Healthy Node'
+              become: false
+              changed_when: false
+              delay: 10
+              delegate_to: 'localhost'
+              loop: "{{ __target_groups__ }}"
+              loop_control: { label: "{{ item.split('/')[-2] }}" }
+              register: '__proof_targets_down__'
+              retries: 30
+              run_once: true
+              until: __proof_targets_down__.stdout | trim == '1'
+              vars:
+                ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+              ansible.builtin.command:
+                argv:
+                  - 'aws'
+                  - 'elbv2'
+                  - 'describe-target-health'
+                  - '--region'
+                  - "{{ aws_region }}"
+                  - '--target-group-arn'
+                  - "{{ item }}"
+                  - '--query'
+                  - "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])"
+                  - '--output'
+                  - 'text'
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            # Ten answers in a row: a request routed to the stopped node fails the attempt, so a
+            # pass means the load balancer has taken it out of service.
+            - name: 'END | Require Ten Ready Answers In A Row Through The Load Balancer'
+              changed_when: false
+              delay: 10
+              register: '__proof_failover__'
+              retries: 12
+              until: __proof_failover__.rc == 0
+
+              ansible.builtin.command:
+                argv:
+                  - 'bash'
+                  - '-c'
+                  - >-
+                    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+                      curl --fail --silent --show-error --max-time 5 --output /dev/null "$1" ||
+                      exit 1;
+                    done
+                  - 'failover-probe'
+                  - "{{ __nlb__ }}/-/readiness"
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            # rc-contract: git exits 0 when it read the refs and 128 on a fatal error.
+            - name: 'END | Read The Branch Over HTTP With The Deploy Node Down'
+              changed_when: false
+              failed_when: false
+              no_log: true
+              register: '__proof_failover_http__'
+
+              ansible.builtin.command:
+                argv:
+                  - '/bin/sh'
+                  - '-c'
+                  - "{{ __with_header__ }}"
+                  - 'sh'
+                  - "{{ __git__ }}"
+                  - 'ls-remote'
+                  - "{{ __http_url__ }}"
+                  - 'refs/heads/main'
+                expand_argument_vars: false
+                stdin: "{{ __header__ }}"
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            - name: 'END | Read The Branch Over SSH With The Deploy Node Down'
+              changed_when: false
+              loop: [ 1, 2, 3 ]
+              loop_control: { label: "attempt {{ item }}" }
+              register: '__proof_failover_ssh__'
+
+              ansible.builtin.command:
+                argv:
+                  - "{{ __git__ }}"
+                  - '-c'
+                  - "core.sshCommand={{ __ssh_command__ }}"
+                  - 'ls-remote'
+                  - "{{ __ssh_url__ }}"
+                  - 'refs/heads/main'
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            # rc-contract: get_url reports the HTTP status GitLab answered; the assert reads it.
+            - name: 'END | Read The Upload Through The Load Balancer With The Deploy Node Down'
+              changed_when: false
+              failed_when: false
+              no_log: true
+              register: '__proof_failover_upload__'
+
+              ansible.builtin.get_url:
+                backup: false
+                checksum: ''
+                decompress: true
+                dest: "{{ __proof_workspace__.path }}/upload-failover.bin"
+                force: true
+                force_basic_auth: false
+                group: 'root'
+                headers:
+                  PRIVATE-TOKEN: "{{ __proof_token__ }}"
+                http_agent: 'ansible-httpget'
+                mode: '0600'
+                owner: 'root'
+                timeout: 60
+                unredirected_headers: []
+                unsafe_writes: false
+                url: "{{ __project_api__ }}/uploads/{{ __proof_upload__.json.id }}"
+                use_gssapi: false
+                use_netrc: false
+                use_proxy: false
+                validate_certs: true
+
+            - name: 'BEGIN | Read The Digest Of The Upload Served With The Deploy Node Down'
+              register: '__proof_failover_copy__'
+
+              ansible.builtin.stat:
+                checksum_algorithm: 'sha256'
+                follow: false
+                get_attributes: false
+                get_checksum: true
+                get_mime: false
+                get_selinux_context: false
+                path: "{{ __proof_workspace__.path }}/upload-failover.bin"
+
+            # rc-contract: uri reports the HTTP status GitLab answered; the assert reads it.
+            - name: 'END | Read The Session Through The Load Balancer With The Deploy Node Down'
+              changed_when: false
+              failed_when: false
+              no_log: true
+              register: '__proof_failover_session__'
+
+              ansible.builtin.uri:
+                body_format: 'raw'
+                decompress: true
+                follow_redirects: 'none'
+                force: false
+                force_basic_auth: false
+                headers:
+                  Cookie: "_gitlab_session={{ __proof_sign_in__.cookies['_gitlab_session'] }}"
+                http_agent: 'ansible-httpget'
+                method: 'GET'
+                remote_src: false
+                return_content: true
+                status_code: [ 200 ]
+                timeout: 30
+                unredirected_headers: []
+                unsafe_writes: false
+                url: "{{ __nlb__ }}/api/v4/user"
+                use_gssapi: false
+                use_netrc: false
+                use_proxy: false
+                validate_certs: true
+
+            - name: 'VERIFY | Require HTTP, SSH, The Upload And The Session To Survive'
+              ansible.builtin.assert:
+                fail_msg: >-
+                  With the deploy node down, HTTP read main as
+                  '{{ __proof_failover_http__.stdout }}'
+                  ({{ __proof_failover_http__.stderr_lines }}), SSH read
+                  {{ __proof_failover_ssh__.results | map(attribute='stdout') | list }} (expected
+                  {{ __proof_ssh_pushed__.stdout }}), the upload answered
+                  {{ __proof_failover_upload__.status_code | default('nothing') }} with sha256
+                  {{ __proof_failover_copy__.stat.checksum | default('nothing') }}, and the
+                  session answered {{ __proof_failover_session__.status | default('nothing') }}
+                  as
+                  '{{ (__proof_failover_session__.json | default({})).username | default('') }}'.
+                quiet: true
+                that:
+                  - >-
+                    (__proof_failover_http__.stdout.split() | first | default(''))
+                    == __proof_ssh_pushed__.stdout
+                  - >-
+                    __proof_failover_ssh__.results | map(attribute='stdout') | map('split')
+                    | map('first') | reject('equalto', __proof_ssh_pushed__.stdout)
+                    | list | length == 0
+                  - >-
+                    __proof_failover_copy__.stat.checksum | default('')
+                    == __proof_upload_file__.stat.checksum
+                  - >-
+                    (__proof_failover_session__.json | default({})).username | default('')
+                    == 'root'
+
+          always:
+
+            - name: 'PROCESS | Start GitLab On The Deploy Node Again'
+              changed_when: true
+              delegate_to: "{{ __deploy__ }}"
+
+              ansible.builtin.command:
+                argv: [ 'gitlab-ctl', 'start' ]
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            - name: 'END | Wait Until The Deploy Node Reports Ready Again'
+              delay: 10
+              delegate_to: "{{ __deploy__ }}"
+              register: '__proof_rejoined__'
+              retries: 60
+              until: ((__proof_rejoined__.json | default({})).status | default('')) == 'ok'
+
+              ansible.builtin.uri:
+                body_format: 'raw'
+                decompress: true
+                follow_redirects: 'none'
+                force: false
+                force_basic_auth: false
+                headers: {}
+                http_agent: 'ansible-httpget'
+                method: 'GET'
+                remote_src: false
+                return_content: true
+                status_code: [ 200 ]
+                timeout: 30
+                unredirected_headers: []
+                unsafe_writes: false
+                url: 'http://127.0.0.1/-/readiness?all=1'
+                use_gssapi: false
+                use_netrc: false
+                use_proxy: false
+                validate_certs: true
+
+        - name: 'END | Wait Until Both Target Groups Report Both Rails Nodes Healthy Again'
+          become: false
+          changed_when: false
+          delay: 10
+          delegate_to: 'localhost'
+          loop: "{{ __target_groups__ }}"
+          loop_control: { label: "{{ item.split('/')[-2] }}" }
+          register: '__proof_targets_again__'
+          retries: 30
+          run_once: true
+          until: __proof_targets_again__.stdout | trim == '2'
+          vars:
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+          ansible.builtin.command:
+            argv:
+              - 'aws'
+              - 'elbv2'
+              - 'describe-target-health'
+              - '--region'
+              - "{{ aws_region }}"
+              - '--target-group-arn'
+              - "{{ item }}"
+              - '--query'
+              - "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])"
+              - '--output'
+              - 'text'
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        # The session outlived the node it was not served from while that node was down, and the
+        # restarted node still knows it.
+        # rc-contract: uri reports the HTTP status GitLab answered; the assert below reads it.
+        - name: 'END | Read The Signed-In User On The Restarted Node'
+          changed_when: false
+          delegate_to: "{{ __deploy__ }}"
+          failed_when: false
+          no_log: true
+          register: '__proof_rejoined_session__'
+
+          ansible.builtin.uri:
+            body_format: 'raw'
+            decompress: true
+            follow_redirects: 'none'
+            force: false
+            force_basic_auth: false
+            headers:
+              Cookie: "_gitlab_session={{ __proof_sign_in__.cookies['_gitlab_session'] }}"
+            http_agent: 'ansible-httpget'
+            method: 'GET'
+            remote_src: false
+            return_content: true
+            status_code: [ 200 ]
+            timeout: 30
+            unredirected_headers: []
+            unsafe_writes: false
+            url: 'http://127.0.0.1/api/v4/user'
+            use_gssapi: false
+            use_netrc: false
+            use_proxy: false
+            validate_certs: true
+
+        - name: 'VERIFY | Require The Restarted Node To Know The Session'
+          ansible.builtin.assert:
+            fail_msg: >-
+              The restarted deploy node answered the session with
+              {{ __proof_rejoined_session__.status | default('nothing') }} as
+              '{{ __proof_rejoined_session__.json.username | default('') }}', not root.
+            quiet: true
+            that: __proof_rejoined_session__.json.username | default('') == 'root'
+
+        #endregion --- [ Proof: Losing A Rails Node Loses Nothing ] --------------------------- #
+
+      # Every cleanup runs whatever the others did, and the last task names each that failed. A
+      # cleanup that reads a registered result is still guarded on it, because a failed template
+      # is not a failed task.
       always:
+
+        - name: 'CLEANUP | Remove The Proof SSH Key From Root'
+          changed_when: true
+          delegate_to: "{{ __deploy__ }}"
+          failed_when: false
+          no_log: true
+          register: '__proof_cleanup_key__'
+          when: __proof_ssh_key__.json.id is defined
+
+          ansible.builtin.uri:
+            body_format: 'raw'
+            decompress: true
+            follow_redirects: 'none'
+            force: false
+            force_basic_auth: false
+            headers:
+              PRIVATE-TOKEN: "{{ __proof_token__ }}"
+            http_agent: 'ansible-httpget'
+            method: 'DELETE'
+            remote_src: false
+            return_content: false
+            status_code: [ 204 ]
+            timeout: 30
+            unredirected_headers: []
+            unsafe_writes: false
+            url: "http://127.0.0.1/api/v4/user/keys/{{ __proof_ssh_key__.json.id }}"
+            use_gssapi: false
+            use_netrc: false
+            use_proxy: false
+            validate_certs: true
+
+        - name: 'CLEANUP | Revoke The Proof Access Token'
+          changed_when: true
+          delegate_to: "{{ __deploy__ }}"
+          failed_when: false
+          no_log: true
+          register: '__proof_cleanup_token__'
+          when: (__proof_runner__.rc | default(1)) == 0
+
+          ansible.builtin.uri:
+            body_format: 'raw'
+            decompress: true
+            follow_redirects: 'none'
+            force: false
+            force_basic_auth: false
+            headers:
+              PRIVATE-TOKEN: "{{ __proof_token__ }}"
+            http_agent: 'ansible-httpget'
+            method: 'DELETE'
+            remote_src: false
+            return_content: false
+            status_code: [ 204 ]
+            timeout: 30
+            unredirected_headers: []
+            unsafe_writes: false
+            url: 'http://127.0.0.1/api/v4/personal_access_tokens/self'
+            use_gssapi: false
+            use_netrc: false
+            use_proxy: false
+            validate_certs: true
+
+        - name: 'CLEANUP | Remove The Proof Files From The Deploy Node'
+          changed_when: false
+          delegate_to: "{{ __deploy__ }}"
+          failed_when: false
+          loop:
+            - "/root/gitlab-s3-probe-{{ __run__ }}.bin"
+            - "/root/gitlab-s3-probe-{{ __run__ }}.read"
+          loop_control: { label: "{{ item }}" }
+          register: '__proof_cleanup_files__'
+
+          ansible.builtin.file:
+            access_time_format: '%Y%m%d%H%M.%S'
+            follow: true
+            force: false
+            modification_time_format: '%Y%m%d%H%M.%S'
+            path: "{{ item }}"
+            recurse: false
+            state: 'absent'
+            unsafe_writes: false
+
+        - name: 'CLEANUP | Remove The Read-Back Upload From Each Rails Node'
+          changed_when: false
+          delegate_to: "{{ item }}"
+          failed_when: false
+          loop: "{{ __rails__ }}"
+          loop_control: { label: "{{ item }}" }
+          register: '__proof_cleanup_uploads__'
+
+          ansible.builtin.file:
+            access_time_format: '%Y%m%d%H%M.%S'
+            follow: true
+            force: false
+            modification_time_format: '%Y%m%d%H%M.%S'
+            path: "/root/gitlab-upload-proof-{{ __run__ }}.bin"
+            recurse: false
+            state: 'absent'
+            unsafe_writes: false
 
         - name: 'CLEANUP | Remove The Proof Workspace'
           changed_when: false
+          failed_when: false
+          register: '__proof_cleanup_workspace__'
           when: __proof_workspace__.path is defined
 
           ansible.builtin.file:
@@ -341,4 +2601,42 @@
             state: 'absent'
             unsafe_writes: false
 
-#endregion --- [ Play: Git Push And Clone Proof (opt-in) ] ------------------------------------ #
+        # A skipped cleanup had nothing to remove.
+        - name: 'CLEANUP | Require Every Cleanup To Have Succeeded'
+          vars:
+            # Only status and msg are read: a no_log task's registered result still holds a body.
+            __left__: >-
+              {%- set left = [] -%}
+              {%- for what, result in [['the proof SSH key', __proof_cleanup_key__],
+                                       ['the proof access token', __proof_cleanup_token__]]
+                  if result is not skipped and result.status | default(-1) != 204 -%}
+              {%- set _ = left.append(what ~ ' through ' ~ __deploy__ ~ ': '
+                    ~ (('answered ' ~ result.status) if result.status | default(-1) != -1
+                       else result.msg | default('no answer'))) -%}
+              {%- endfor -%}
+              {%- for result in __proof_cleanup_files__.results
+                  if result.state | default('') != 'absent' -%}
+              {%- set _ = left.append(result.item ~ ' on ' ~ __deploy__ ~ ': '
+                    ~ result.msg | default('not removed')) -%}
+              {%- endfor -%}
+              {%- for result in __proof_cleanup_uploads__.results
+                  if result.state | default('') != 'absent' -%}
+              {%- set _ = left.append('the read-back upload on ' ~ result.item ~ ': '
+                    ~ result.msg | default('not removed')) -%}
+              {%- endfor -%}
+              {%- if __proof_cleanup_workspace__ is not skipped
+                     and __proof_cleanup_workspace__.state | default('') != 'absent' -%}
+              {%- set _ = left.append('the proof workspace on ' ~ inventory_hostname ~ ': '
+                    ~ __proof_cleanup_workspace__.msg | default('not removed')) -%}
+              {%- endif -%}
+              {{ left }}
+
+          ansible.builtin.assert:
+            fail_msg: >-
+              The proof could not clean up {{ __left__ | join('; ') }}. The key and the token
+              expire within a day, and the files go with the instances when the stack is
+              destroyed; a held stack keeps them until then.
+            quiet: true
+            that: __left__ | length == 0
+
+#endregion --- [ Play: Prove The Distributed Shape (opt-in) ] --------------------------------- #

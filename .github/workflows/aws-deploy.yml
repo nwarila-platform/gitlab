@@ -1,10 +1,15 @@
 # =========================================================================================== #
 # AWS Deploy — gitlab
 # ------------------------------------------------------------------------------------------- #
-# Ephemeral lifecycle: terraform init/apply -> ansible -> terraform destroy on the normal path.
-# Terraform is DATA-ONLY here (a plain tfvars, no .tf files); resources live in the pinned
+# Ephemeral lifecycle, as three jobs: aws-deploy (terraform init/apply -> converge -> proof ->
+# second converge), an optional hold, and destroy, then the incident report. Terraform is
+# DATA-ONLY here (a plain tfvars, no .tf files); resources live in the pinned
 # aws-terraform-framework, configuration in the pinned ansible-framework + this repo's role.
 #
+#   * The stack is two GitLab Rails nodes in two zones behind an internal network load balancer,
+#     a Gitaly node and a Redis node, an RDS PostgreSQL database and S3 object storage. The proof
+#     runs between the two converges, so the second, which must change nothing, also judges the
+#     node the proof stopped and started.
 #   * AWS credentials are issued only to this workflow at refs/heads/main. Pull requests use
 #     the credential-free quality workflow; feature-branch workflow code never reaches AWS.
 #   * Reachability: direct SSH to a subnet-assigned public IPv4. At runtime the framework adds
@@ -13,16 +18,19 @@
 #     as well — that one adding RDP, so a person can work on a held host. This configuration
 #     creates no EIP and has no NAT. The playbook performs the bounded direct-SSH readiness
 #     check because readiness_gate remains disabled.
-#   * AWS credentials are exchanged before provisioning and refreshed before eligible teardown.
-#     The initial 7,800-second session covers normal deployment work; the teardown refresh uses a
-#     modest 3,600-second session so long holds do not reach destroy with expired credentials.
-#     The 330-minute job budget includes a four-hour hold plus measured-path margin and stays below
-#     the runner's 360-minute execution limit. It is not a teardown guarantee: abnormal delay can
-#     exhaust the job budget before destroy and strand paid resources. That risk is accepted for
-#     this temporary proof bed.
+#   * Each job takes its own credentials. aws-deploy exchanges a 7,800-second session before
+#     provisioning and refreshes it before each of the three playbook runs, so no step outlives
+#     its session. The hold holds none: it only waits. destroy exchanges a 3,600-second session
+#     on a fresh runner and destroys from the same state key.
+#   * Budgets: aws-deploy 300 minutes (its step bounds sum to about 262), hold 245 for the
+#     largest 240-minute choice, destroy 45; every job stays below the runner's 360-minute
+#     execution limit. destroy runs whatever happened before it, and cancelling a held run to end
+#     the hold early still destroys -- and, as for any cancel, marks the run failed and opens the
+#     incident, which is expected. A force-cancel, a scheduling failure between jobs or a stale
+#     state lock can still strand paid resources; the out-of-process reaper is the backstop for
+#     the first two, and a stale lock needs a human force-unlock.
 #   * One fixed state key; this workflow's concurrency group prevents overlapping applies and
-#     never cancels a live lifecycle. A later lifecycle can clean predecessor state before apply;
-#     no age-gated reaper exists for a run killed before destroy.
+#     never cancels a live lifecycle. A later lifecycle can clean predecessor state before apply.
 #   * Protected-main pushes that touch the deploy inputs — terraform, ansible, the framework
 #     pins, this workflow — prove immediately; an off-minute weekly schedule proves recurrence.
 #     One durable incident is updated on failure and closed after the next successful lifecycle.
@@ -77,12 +85,15 @@ jobs:
     needs: main-ref
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    # The 330-minute budget leaves measured-path margin around a 240-minute hold and remains below
-    # the runner's 360-minute execution limit; a timeout can still strand resources before teardown.
-    timeout-minutes: 330
+    # The step bounds sum to about 262 minutes; the hold and the teardown are jobs of their own.
+    timeout-minutes: 300
     permissions:
       id-token: write
       contents: read
+    # What the hold and the report need: whether anything was applied, and what it launched.
+    outputs:
+      applied: ${{ steps.tf-apply.outcome }}
+      instance_ids: ${{ steps.instances.outputs.ids }}
     env:
       AWS_REGION: us-east-1
       DEPLOY_ROLE: nwarila-platform_gitlab_runner
@@ -175,72 +186,6 @@ jobs:
             exit 1
           fi
           echo "staged key matches ${CI_KEY_NAME}"
-
-      # One-off, and removed by the next change: settles whether runner_rds's Multi-AZ pin holds,
-      # the one guard there that may fail open (dependencies/README.md, "Not yet proven live").
-      # Both requests carry the declared shape and every identity tag, and name the 'gitlab'
-      # subnet group, which must not exist yet. The control has to fail on that group: it then
-      # passed IAM, so AccessDenied on the probe, which adds only --multi-az, is the pin. Any
-      # other answer may mean a database is being created, so it is waited for and deleted.
-      - name: Probe whether the rds:MultiAz pin holds (one-off; the next change removes it)
-        timeout-minutes: 30
-        env:
-          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
-        run: |
-          set -euo pipefail
-          # Prints the error code of one CreateDBInstance, or 'created' if it was accepted.
-          attempt() {
-            local output rc=0
-            output="$(aws rds create-db-instance \
-              --db-instance-identifier gitlab --db-instance-class db.t4g.large \
-              --engine postgres --engine-version 17 --allocated-storage 20 \
-              --master-username gitlab_admin --manage-master-user-password \
-              --no-publicly-accessible --storage-encrypted \
-              --db-subnet-group-name gitlab --db-parameter-group-name gitlab \
-              --tags "Key=ManagedBy,Value=Terraform" "Key=Repository,Value=${GITHUB_REPOSITORY}" \
-                     "Key=RepositoryId,Value=${GITHUB_REPOSITORY_ID}" "Key=CommitSha,Value=${GITHUB_SHA}" \
-                     "Key=Environment,Value=test" "Key=RunId,Value=${GITHUB_RUN_ID}" \
-              "$@" 2>&1 > /dev/null)" || rc=$?
-            if [ "${rc}" -eq 0 ]; then
-              echo 'created'
-            elif [[ "${output}" =~ An\ error\ occurred\ \(([A-Za-z]+)\) ]]; then
-              echo "${BASH_REMATCH[1]}"
-            else
-              echo "unrecognized (rc ${rc}): ${output}"
-            fi
-          }
-          # Nothing else would delete a database this step started: it is in no Terraform state,
-          # so this run's destroy and a later run's predecessor cleanup never see it, and the
-          # reaper looks for instances only. The wait is bounded inside the step's budget and may
-          # fail, so the delete is attempted whatever it answered. If RDS refuses the delete, as
-          # it may for a database still creating, the step fails on that error and the database
-          # is deleted by hand.
-          remove_any_database() {
-            echo "::error::$1"
-            timeout 1200 aws rds wait db-instance-available --db-instance-identifier gitlab || true
-            aws rds delete-db-instance --db-instance-identifier gitlab \
-              --skip-final-snapshot --delete-automated-backups > /dev/null
-            exit 1
-          }
-
-          control="$(attempt)"
-          case "${control}" in
-            DBSubnetGroupNotFoundFault) ;;
-            AccessDenied)
-              echo '::error::The control was denied: the request shape is wrong, so the probe proves nothing.'
-              exit 1 ;;
-            *) remove_any_database "The control answered '${control}', not DBSubnetGroupNotFoundFault." ;;
-          esac
-
-          probe="$(attempt --multi-az)"
-          echo "control: ${control}; probe: ${probe}"
-          case "${probe}" in
-            AccessDenied) echo 'the rds:MultiAz pin holds: a Multi-AZ create is denied' ;;
-            DBSubnetGroupNotFoundFault)
-              echo '::error::The rds:MultiAz pin FAILS OPEN: a Multi-AZ create passed IAM. Stop; runner_rds must be revised.'
-              exit 1 ;;
-            *) remove_any_database "The probe answered '${probe}', not AccessDenied." ;;
-          esac
 
       - name: Read framework pins
         id: pins
@@ -352,7 +297,7 @@ jobs:
       # longer exists. Never adopt it: destroy under the same lock, then apply with a fresh key.
       # A live/out-of-band lock makes this fail closed.
       - name: Remove interrupted predecessor state before apply
-        timeout-minutes: 15
+        timeout-minutes: 30
         working-directory: .frameworks/aws-terraform-framework/terraform
         env:
           GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
@@ -373,7 +318,7 @@ jobs:
       # flag -- is what stops the file from renaming who this fresh deployment says it is.
       - name: Terraform apply
         id: tf-apply
-        timeout-minutes: 15
+        timeout-minutes: 30
         working-directory: .frameworks/aws-terraform-framework/terraform
         run: |
           set -euo pipefail
@@ -386,6 +331,28 @@ jobs:
             -var "run_id=${GITHUB_RUN_ID}"                                   \
             -var "runner_ip=${RUNNER_IP}"                                    \
             ${DEBUG_IP:+-var "debug_ip=${DEBUG_IP}"}
+
+      # What Terraform built and the playbook configures against: the database's address and the
+      # ARN of the secret RDS keeps its master credentials in, the load balancer's name, and the
+      # two target groups whose health the proof reads. Passed as an extra-vars file, as the
+      # account and region are passed, so the play and the stack cannot disagree. None of it is
+      # secret; the secret itself is read by the playbook.
+      - name: Read the stack's endpoints
+        working-directory: .frameworks/aws-terraform-framework/terraform
+        run: |
+          set -euo pipefail
+          terraform output -json \
+            | jq '{gitlab_database: (.aws_databases.value.gitlab
+                                     | {address, port, master_user_secret_arn}),
+                   gitlab_load_balancer_dns: .aws_load_balancer_dns_names.value.gitlab,
+                   gitlab_target_group_arn: .aws_target_group_arns.value["gitlab/rails-http"],
+                   gitlab_ssh_target_group_arn: .aws_target_group_arns.value["gitlab/rails-ssh"]}' \
+            > "${RUNNER_TEMP}/endpoints.json"
+          jq -e '.gitlab_database.address and .gitlab_database.master_user_secret_arn
+                 and .gitlab_load_balancer_dns and .gitlab_target_group_arn
+                 and .gitlab_ssh_target_group_arn' \
+            "${RUNNER_TEMP}/endpoints.json" > /dev/null \
+            || { echo '::error::Terraform outputs lack a database, load balancer or target group endpoint.'; exit 1; }
 
       # This repo's roles overlay onto the pinned framework tree. A framework-TRACKED role
       # path is refused so an overlay can never replace framework-owned code.
@@ -415,20 +382,33 @@ jobs:
             rsync -a --delete "${role_source}/" "${framework_dir}/applications/${role_name}/"
           done
 
-      # Readiness, configuration and the application proof all live in the playbook. The EC2
+      # Each playbook run reads Secrets Manager, S3 and the load balancer from the controller, so each
+      # starts on a fresh session: the path through the second converge outlasts one session.
+      - name: Refresh AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
+          role-session-name: aws-deploy-${{ github.run_id }}
+          role-duration-seconds: 7800
+
+      # Readiness, configuration and the cluster checks all live in the playbook. The EC2
       # inventory plugin filters live AWS instances to this repository and run before exposing
-      # one target. The budget guards against a hung converge without cutting a working one short.
+      # them. The four nodes converge one role at a time; the budget guards against a hung
+      # converge without cutting a working one short, and profile_tasks times every task.
       - name: Run the application playbook
-        timeout-minutes: 60
+        timeout-minutes: 120
         working-directory: .frameworks/ansible-framework
         env:
           ANSIBLE_CONFIG: ${{ github.workspace }}/.frameworks/ansible-framework/ansible.cfg
+          ANSIBLE_CALLBACKS_ENABLED: ansible.posix.profile_tasks
           # A secret reaches the shell through the environment, never by substitution into the
           # script text, so its value cannot be read as shell syntax. Forwarded on as an
           # extra-var below because the play requires it; same value the OIDC role ARN uses.
           AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
           # NOT extra-vars: the dynamic inventory reads these from the environment to pick this
-          # run's instance, and a lookup('env') has no command-line equivalent.
+          # run's instances, and a lookup('env') has no command-line equivalent.
           GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
@@ -439,14 +419,26 @@ jobs:
             --extra-vars aws_region="${AWS_REGION}"                            \
             --extra-vars env=test                                              \
             --extra-vars state=present                                         \
+            --extra-vars "@${RUNNER_TEMP}/endpoints.json"                      \
             --inventory "${GITHUB_WORKSPACE}/ansible/inventory/aws_ec2.yml"
 
-      # The opt-in proof play (nessus precedent): a git push creates a project over HTTP and a
-      # clone must read the same commit back. It adds a project, so it runs once, here, and the
-      # second converge after it still judges only what the role manages. The budget is
+      # The proof reads the load balancer's target health and the database's logs.
+      - name: Refresh AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
+          role-session-name: aws-deploy-${{ github.run_id }}
+          role-duration-seconds: 7800
+
+      # The opt-in proof play (nessus precedent): sign-in, git over HTTP and SSH, an upload in
+      # object storage and the database's settings, all through the load balancer, then losing
+      # a Rails node and its rejoin. It adds a project and stops a node, so it runs once, here,
+      # and the second converge after it still judges only what the role manages. The budget is
       # unmeasured until the first live run.
-      - name: Prove GitLab serves a git push and clone
-        timeout-minutes: 15
+      - name: Prove the distributed shape serves through the load balancer
+        timeout-minutes: 30
         working-directory: .frameworks/ansible-framework
         env:
           ANSIBLE_CONFIG: ${{ github.workspace }}/.frameworks/ansible-framework/ansible.cfg
@@ -461,12 +453,23 @@ jobs:
             --extra-vars aws_region="${AWS_REGION}"                            \
             --extra-vars env=test                                              \
             --extra-vars state=present                                         \
+            --extra-vars "@${RUNNER_TEMP}/endpoints.json"                      \
             --inventory "${GITHUB_WORKSPACE}/ansible/inventory/aws_ec2.yml"
+
+      # The second converge reads the same services the first did.
+      - name: Refresh AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.DEPLOY_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+          allowed-account-ids: ${{ secrets.AWS_ACCOUNT_ID }}
+          role-session-name: aws-deploy-${{ github.run_id }}
+          role-duration-seconds: 7800
 
       # Idempotency gate (nessus precedent): a settled node reports NO change on a second converge.
       # The role reads before it writes, so any change here is drift it failed to settle.
       - name: Prove a second converge changes nothing
-        timeout-minutes: 30
+        timeout-minutes: 45
         working-directory: .frameworks/ansible-framework
         env:
           ANSIBLE_CONFIG: ${{ github.workspace }}/.frameworks/ansible-framework/ansible.cfg
@@ -480,6 +483,7 @@ jobs:
             --extra-vars aws_region="${AWS_REGION}"                                     \
             --extra-vars env=test                                                       \
             --extra-vars state=present                                                  \
+            --extra-vars "@${RUNNER_TEMP}/endpoints.json"                               \
             --inventory "${GITHUB_WORKSPACE}/ansible/inventory/aws_ec2.yml" 2>&1 | tee /dev/stderr)"
           # The controller answers the inventory-contract play and reports changed=0 on its own
           # recap line; judging it would let it satisfy the rule for a host that changed.
@@ -498,15 +502,22 @@ jobs:
           fi
           echo "second converge: every node reported changed=0"
 
-      - name: Hold the converged guest for interactive work
-        if: >-
-          !cancelled() &&
-          github.event_name == 'workflow_dispatch' &&
-          inputs.hold_minutes != '0' &&
-          steps.tf-apply.outcome == 'success'
-        timeout-minutes: 245
+      - name: Remove the ephemeral private key
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -n "${CI_PRIVATE_KEY:-}" ]; then
+            rm -f -- "${CI_PRIVATE_KEY}"
+          fi
+
+      # For the hold's heartbeat, which holds no credentials of its own. Recorded after a failed
+      # converge too, so a held run names what it holds. A failed read records 'unavailable'
+      # rather than failing a job whose outcome is the lifecycle's.
+      - name: Record the instance ids
+        id: instances
+        if: always() && steps.tf-apply.outcome == 'success'
         env:
-          HOLD_MINUTES: ${{ inputs.hold_minutes }}
+          GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
         run: |
           set -euo pipefail
           instance_ids="$(
@@ -522,18 +533,98 @@ jobs:
           if [[ ! "${instance_ids}" =~ ^i-[0-9a-f]+( i-[0-9a-f]+)*$ ]]; then
             instance_ids='unavailable'
           fi
+          echo "ids=${instance_ids}" >> "${GITHUB_OUTPUT}"
 
+  # Its own job, so a four-hour hold is not part of aws-deploy's budget. It holds after a failed
+  # converge too, so a person can look at what failed. No credentials: the operator reaches the
+  # held hosts through the operator-address group the framework already built.
+  hold:
+    name: Hold the converged guests
+    needs: [aws-deploy]
+    if: >-
+      !cancelled() &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.hold_minutes != '0' &&
+      needs.aws-deploy.outputs.applied == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 245
+    permissions: {}
+    steps:
+      - name: Hold the converged guests for interactive work
+        env:
+          HOLD_MINUTES: ${{ inputs.hold_minutes }}
+          INSTANCE_IDS: ${{ needs.aws-deploy.outputs.instance_ids }}
+        run: |
+          set -euo pipefail
           remaining_minutes="${HOLD_MINUTES}"
-          echo "Holding EC2 instance(s) ${instance_ids} for ${remaining_minutes} minutes."
+          echo "Holding EC2 instance(s) ${INSTANCE_IDS} for ${remaining_minutes} minutes."
           while (( remaining_minutes > 0 )); do
             sleep 300
             remaining_minutes=$((remaining_minutes - 5))
-            echo "Hold heartbeat for EC2 instance(s) ${instance_ids}: ${remaining_minutes} minutes remaining."
+            echo "Hold heartbeat for EC2 instance(s) ${INSTANCE_IDS}: ${remaining_minutes} minutes remaining."
           done
-          exit 0
 
-      - name: Refresh AWS credentials for teardown (OIDC)
-        if: always() && steps.tf-init.outcome == 'success'
+  # Always, from a fresh runner, whatever happened before it: a failed or cancelled deploy or hold
+  # still leaves state to tear down, and an empty state destroys nothing. It needs no SSH key and
+  # no endpoints, only the account and the state key aws-deploy applied to.
+  destroy:
+    name: AWS teardown
+    needs: [main-ref, aws-deploy, hold]
+    if: always() && needs.main-ref.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      id-token: write
+      contents: read
+    env:
+      AWS_REGION: us-east-1
+      DEPLOY_ROLE: nwarila-platform_gitlab_runner
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Read the terraform framework pin
+        id: pins
+        run: |
+          set -euo pipefail
+          mapfile -t lines < .github/terraform-framework-pin
+          [ "${#lines[@]}" -eq 1 ] || { echo 'the pin must contain exactly one line' >&2; exit 1; }
+          pin="${lines[0]}"
+          [[ "${pin}" =~ ^[0-9a-f]{40}$ ]] || { echo 'the pin must be one lowercase 40-char SHA' >&2; exit 1; }
+          printf 'terraform=%s\n' "${pin}" >> "${GITHUB_OUTPUT}"
+
+      - name: Checkout aws-terraform-framework (pinned)
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: ${{ github.repository_owner }}/aws-terraform-framework
+          ref: ${{ steps.pins.outputs.terraform }}
+          path: .frameworks/aws-terraform-framework
+          persist-credentials: false
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: '1.15.1'
+          terraform_wrapper: false
+
+      # The framework validates runner_ip's shape even though a destroy opens nothing, so this
+      # runner's own address serves: the destroy acts only on what the state records.
+      - name: Discover and validate runner public IPv4
+        run: |
+          set -euo pipefail
+          runner_ip="$(curl -fsS https://checkip.amazonaws.com)"
+          ipv4_octet='(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+          if [[ ! "${runner_ip}" =~ ^${ipv4_octet}\.${ipv4_octet}\.${ipv4_octet}\.${ipv4_octet}$ ]]; then
+            echo "::error::Runner public address discovery did not return a bare IPv4 address."
+            exit 1
+          fi
+          echo "::add-mask::${runner_ip}"
+          echo "RUNNER_IP=${runner_ip}" >> "${GITHUB_ENV}"
+
+      - name: Configure AWS credentials for teardown (OIDC)
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.DEPLOY_ROLE }}
@@ -542,13 +633,21 @@ jobs:
           role-session-name: aws-deploy-${{ github.run_id }}-teardown
           role-duration-seconds: 3600
 
-      # Gated on INIT, not apply: a failed apply still leaves state to tear down.
-      - name: Terraform destroy (always)
-        id: tf-destroy
-        if: >-
-          always() &&
-          steps.tf-init.outcome == 'success'
-        timeout-minutes: 15
+      - name: Terraform init
+        working-directory: .frameworks/aws-terraform-framework/terraform
+        env:
+          AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          terraform init -input=false                                      \
+            -backend-config="bucket=${AWS_ACCOUNT_ID}-terraform"           \
+            -backend-config="key=${{ github.repository }}/aws-poc.tfstate" \
+            -backend-config="region=${AWS_REGION}"
+
+      # With refresh: the runner role reads the key aliases, image parameters and instance profile
+      # a refresh resolves. The lock timeout fails closed against an apply still holding the lock.
+      - name: Terraform destroy
+        timeout-minutes: 30
         working-directory: .frameworks/aws-terraform-framework/terraform
         env:
           GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
@@ -561,20 +660,11 @@ jobs:
             -var "repository=${GITHUB_REPOSITORY}"                           \
             -var "repository_id=${GITHUB_REPOSITORY_ID}"                     \
             -var "run_id=${GITHUB_RUN_ID}"                                   \
-            -var "runner_ip=${RUNNER_IP}"                                    \
-            ${DEBUG_IP:+-var "debug_ip=${DEBUG_IP}"}
-
-      - name: Remove the ephemeral private key
-        if: always()
-        run: |
-          set -euo pipefail
-          if [ -n "${CI_PRIVATE_KEY:-}" ]; then
-            rm -f -- "${CI_PRIVATE_KEY}"
-          fi
+            -var "runner_ip=${RUNNER_IP}"
 
   report:
     name: AWS lifecycle incident
-    needs: [main-ref, aws-deploy]
+    needs: [main-ref, aws-deploy, hold, destroy]
     if: always() && needs.main-ref.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -585,12 +675,23 @@ jobs:
       INCIDENT_LABEL: automation-incident
       INCIDENT_MARKER: '<!-- gitlab-automation:aws-lifecycle -->'
       INCIDENT_TITLE: '[automation] AWS lifecycle proof failed'
-      LIFECYCLE_RESULT: ${{ needs.aws-deploy.result }}
+      DEPLOY_RESULT: ${{ needs.aws-deploy.result }}
+      HOLD_RESULT: ${{ needs.hold.result }}
+      DESTROY_RESULT: ${{ needs.destroy.result }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Update or resolve the lifecycle incident
         run: |
           set -euo pipefail
+
+          # Healthy only when the stack was deployed and proven, any hold ended by itself, and
+          # the stack was destroyed; a skipped hold is a run that asked for none.
+          if [ "${DEPLOY_RESULT}" = success ] && [ "${DESTROY_RESULT}" = success ] \
+            && { [ "${HOLD_RESULT}" = success ] || [ "${HOLD_RESULT}" = skipped ]; }; then
+            LIFECYCLE_RESULT=success
+          else
+            LIFECYCLE_RESULT="deploy ${DEPLOY_RESULT}, hold ${HOLD_RESULT}, destroy ${DESTROY_RESULT}"
+          fi
 
           gh label create "${INCIDENT_LABEL}" --repo "${GITHUB_REPOSITORY}" --force \
             --color B60205 --description 'Owned exclusively by recurring automation incidents' > /dev/null
@@ -625,8 +726,8 @@ jobs:
           fi
 
           message="Lifecycle result: ${LIFECYCLE_RESULT}. Inspect ${RUN_URL}."
-          message="${message} Cleanup was attempted when initialization succeeded;"
-          message="${message} inspect the destroy and post-cleanup steps."
+          message="${message} The destroy job runs after every deploy and hold;"
+          message="${message} inspect it, and the reaper's run, for what may be left."
           if [ -z "${issue_number}" ]; then
             gh issue create --repo "${GITHUB_REPOSITORY}" \
               --label "${INCIDENT_LABEL}" --title "${INCIDENT_TITLE}" \

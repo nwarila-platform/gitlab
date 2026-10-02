@@ -2,16 +2,31 @@
 
 ## There is no static inventory, and that is deliberate
 
-The AWS deploy is **ephemeral**: every run creates a new instance, converges it, and destroys it.
-An instance id written into a file here would be wrong the moment the run that produced it ended.
+The AWS deploy is **ephemeral**: every run creates new instances, converges them, and destroys
+them. An instance id written into a file here would be wrong the moment the run that produced it
+ended.
 
-## `aws_ec2.yml` — one run's instance, describing itself
+## `aws_ec2.yml` — one run's instances, describing themselves
 
 The file is in two parts. The first is the only part that is about this repository: the region, the
-four tag filters that select one run's instance — `RepositoryId`, `RunId` and `Repository` from the
-workflow's own environment, and `Environment` from `ENVIRONMENT` or `test` — and the `gitlab_servers`
-group the play addresses. Everything below that is carried from the fleet's reference repository,
-with two differences a STIG-hardened RHEL host needs (see below).
+four tag filters that select one run's instances — `RepositoryId`, `RunId` and `Repository` from the
+workflow's own environment, and `Environment` from `ENVIRONMENT` or `test` — and the groups the
+plays address. Everything below that is carried from the fleet's reference repository, with two
+differences a STIG-hardened RHEL host needs (see below).
+
+Terraform stamps each system with a `Function` tag, and each group is built from it:
+
+| Group | Hosts |
+|---|---|
+| `gitlab_rails` | `Function` `gitlab-rails`: the two Rails nodes |
+| `gitlab_gitaly` | `Function` `gitlab-gitaly`: the Gitaly node |
+| `gitlab_redis` | `Function` `gitlab-redis`: the Redis node |
+| `gitlab_servers` | all three functions: every node the playbook configures |
+
+The playbook's first play requires exactly that topology: two Rails nodes in two zones, one Gitaly
+node and one Redis node. That they share one VPC is the Terraform framework's runner-ingress
+precondition. The playbook's node that migrates the database is the first Rails node by name,
+never by inventory order.
 
 Hosts are named by their **Name tag**, which is the hostname Terraform declares, so
 `inventory_hostname` is the system's own name and nothing downstream has to be told it again. Every
@@ -56,6 +71,7 @@ unchanged.
 ## Running the playbook by hand
 
 Export `GITHUB_REPOSITORY_ID`, `GITHUB_RUN_ID` and `GITHUB_REPOSITORY` plus AWS credentials, then
-point `-i` at `aws_ec2.yml` while the instance still exists. Set `ENVIRONMENT` if the deployment is
-not the default `test`. The play asserts its ownership contract, so a run whose tags do not match
+point `-i` at `aws_ec2.yml` while the instances still exist. Set `ENVIRONMENT` if the deployment is
+not the default `test`, and pass the stack's endpoints as the workflow does, from Terraform's
+outputs. The play asserts its ownership and topology contract, so a run whose tags do not match
 fails closed.

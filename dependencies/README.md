@@ -522,11 +522,11 @@ The documents use `<account-id>`, `<owner-id>`, `<repository-id>` and `<region>`
   instance role writing over TLS is allowed, and the same write without TLS, or from the deploy
   role, is explicitly denied. `--policy-input-list` must be a JSON list of documents: the CLI
   splits a bare document on its commas, and IAM rejects the pieces as invalid content.
-- **The subnet group is blocked.** `terraform/aws.tfvars` places its one system in one
-  availability zone. Every plan therefore exits 1 on the `gitlab` subnet group, naming how many
-  other changes are pending, and every `--apply` exits 1 on it after applying everything else,
-  naming how many it applied; 0 is the in-sync reading. Nothing consumes the group until a
-  database is declared, and the tfvars that declares one places systems in two zones.
+- **The subnet group follows the systems.** `terraform/aws.tfvars` places systems in two
+  availability zones, so the plan creates the `gitlab` subnet group over their two subnets. A
+  tfvars that placed every system in one zone would leave it blocked again: RDS refuses a subnet
+  group in one zone, so every plan would exit 1 on it, naming how many other changes are pending,
+  and every `--apply` would exit 1 on it after applying everything else.
 - **Network load balancer specifics.** The balancer forwards SSH to gitlab-sshd on port 2222 of
   the nodes, and its SSH target group health-checks HTTP on port 80, so a node whose GitLab is
   stopped leaves both target groups together. The HTTP target group checks its traffic port, and
@@ -534,7 +534,10 @@ The documents use `<account-id>`, `<owner-id>`, `<repository-id>` and `<region>`
   therefore carry both the traffic and the health checks, and it reaches the nodes on nothing
   else. With client IP preservation, which instance targets have by default, a node sees the
   client's address rather than the balancer's, and a node that reaches itself through the
-  balancer is dropped. The balancer's declaration settles both, with the nodes' own rules.
+  balancer is dropped. So no node is both a client and a target of a listener: the Rails nodes,
+  the targets, never call the balancer (KAS is off on them, and gitlab-shell and gitlab-sshd reach
+  GitLab's internal API locally), and the Gitaly node, its only client, is never a target. The
+  balancer's declaration and the nodes' own rules settle both.
 - **The parameter group's read shape is unproven.** The local test double reads back exactly the
   parameters this tree set, as strings, and ignores `--source`. If real RDS reads a value back in
   another form, or lists a parameter this tree did not set, every plan shows a MODIFY or a RESET,

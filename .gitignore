@@ -65,6 +65,7 @@
 !/ansible/applications/gitlab/README.md
 !/ansible/applications/gitlab/defaults/main.yml
 !/ansible/applications/gitlab/files/gitlab-package-signing-key.asc
+!/ansible/applications/gitlab/files/rds-ca-bundle.pem
 !/ansible/applications/gitlab/meta/main.yml
 !/ansible/applications/gitlab/tasks/main.yml
 !/ansible/applications/gitlab/tasks/present_redhat.yml

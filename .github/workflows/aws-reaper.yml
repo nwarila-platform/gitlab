@@ -4,8 +4,8 @@
 # The deploy workflow always destroys what it applies, but a killed runner, a job-budget
 # timeout, or an abnormal failure can strand paid resources with nobody left to clean them.
 # This workflow is that missing janitor: it runs OUT OF PROCESS (a broken deploy step cannot
-# suppress it), finds instances tagged to this repository that no live deploy accounts for,
-# and destroys the stack they belong to.
+# suppress it), finds billing resources -- instances, the database, the load balancer -- tagged
+# to this repository that no live deploy accounts for, and destroys the stack they belong to.
 #
 #   * IDENTITY: assumes the repository's REAPER role — describes, tag-scoped terminate/
 #     detach/revoke/delete, and state-file access only. It cannot create, run, tag, read
@@ -62,7 +62,7 @@ jobs:
     needs: main-ref
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       id-token: write
       contents: read
@@ -106,24 +106,41 @@ jobs:
           role-session-name: aws-reaper-${{ github.run_id }}
           role-duration-seconds: 3600
 
-      # Instances are the resources that bill by the minute, so they are the trigger. The
-      # secondary debris a stack leaves (groups, interfaces, state) is destroyed with the
-      # stack below, and anything instanceless is cleaned by the next deploy's predecessor
-      # step at zero standing cost.
-      - name: Look for stranded instances
+      # The resources that bill while they exist -- the instances, the database and the load
+      # balancer -- are the trigger. The secondary debris a stack leaves (groups, interfaces,
+      # state) is destroyed with the stack below, and anything that does not bill is cleaned by
+      # the next deploy's predecessor step at zero standing cost.
+      - name: Look for stranded billing resources
         id: stranded
         if: steps.live.outputs.stand_down == 'false'
         run: |
           set -euo pipefail
-          ids="$(aws ec2 describe-instances \
-            --filters "Name=tag:Repository,Values=${GITHUB_REPOSITORY}" \
-                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-            --query 'Reservations[].Instances[].InstanceId' --output text | tr '\t' ' ')"
+          # Without it, a failed describe inside "$(billing ...)" is swallowed and reads as nothing.
+          shopt -s inherit_errexit
+          # Everything tagged to this repository that bills while it exists: instances, the
+          # database and the load balancer. describe-tags takes at most 20 ARNs; an account past
+          # that fails this step loudly rather than reaping blind.
+          billing() {
+            aws ec2 describe-instances \
+              --filters "Name=tag:Repository,Values=${GITHUB_REPOSITORY}" \
+                        "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              --query 'Reservations[].Instances[].InstanceId' --output text
+            aws rds describe-db-instances --output text \
+              --query "DBInstances[?DBInstanceStatus!='deleting' && TagList[?Key=='Repository' && Value=='${GITHUB_REPOSITORY}']].DBInstanceIdentifier"
+            local arns
+            arns="$(aws elbv2 describe-load-balancers --query 'LoadBalancers[].LoadBalancerArn' --output text)"
+            if [ -n "${arns}" ]; then
+              # shellcheck disable=SC2086 # one argument per ARN
+              aws elbv2 describe-tags --resource-arns ${arns} --output text \
+                --query "TagDescriptions[?Tags[?Key=='Repository' && Value=='${GITHUB_REPOSITORY}']].ResourceArn"
+            fi
+          }
+          ids="$(billing | tr '\t\n' '  ' | xargs)"
           if [ -z "${ids}" ]; then
-            echo 'no stranded instances; nothing to reap'
+            echo 'no stranded billing resources; nothing to reap'
             echo 'found=false' >> "${GITHUB_OUTPUT}"
           else
-            echo "::warning::stranded instance(s) with no live deploy: ${ids}"
+            echo "::warning::stranded billing resource(s) with no live deploy: ${ids}"
             echo 'found=true' >> "${GITHUB_OUTPUT}"
           fi
 
@@ -184,7 +201,7 @@ jobs:
       # timeout fails closed against any lifecycle that started after the stand-down check.
       - name: Terraform destroy the stranded stack
         if: steps.stranded.outputs.found == 'true'
-        timeout-minutes: 15
+        timeout-minutes: 30
         working-directory: .frameworks/aws-terraform-framework/terraform
         env:
           GITHUB_REPOSITORY_ID: ${{ github.repository_id }}
@@ -201,19 +218,36 @@ jobs:
 
       # The destroy is judged by the account, not by terraform's report of itself: state
       # that lost track of an instance leaves it running and this is the step that says so.
-      - name: Prove nothing tagged to this repository is still running
+      - name: Prove nothing tagged to this repository is still billing
         if: steps.stranded.outputs.found == 'true'
         run: |
           set -euo pipefail
-          left="$(aws ec2 describe-instances \
-            --filters "Name=tag:Repository,Values=${GITHUB_REPOSITORY}" \
-                      "Name=instance-state-name,Values=pending,running,stopping,stopped" \
-            --query 'Reservations[].Instances[].InstanceId' --output text | tr '\t' ' ')"
+          # Without it, a failed describe inside "$(billing ...)" is swallowed and reads as nothing.
+          shopt -s inherit_errexit
+          # Everything tagged to this repository that bills while it exists: instances, the
+          # database and the load balancer. describe-tags takes at most 20 ARNs; an account past
+          # that fails this step loudly rather than reaping blind.
+          billing() {
+            aws ec2 describe-instances \
+              --filters "Name=tag:Repository,Values=${GITHUB_REPOSITORY}" \
+                        "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+              --query 'Reservations[].Instances[].InstanceId' --output text
+            aws rds describe-db-instances --output text \
+              --query "DBInstances[?DBInstanceStatus!='deleting' && TagList[?Key=='Repository' && Value=='${GITHUB_REPOSITORY}']].DBInstanceIdentifier"
+            local arns
+            arns="$(aws elbv2 describe-load-balancers --query 'LoadBalancers[].LoadBalancerArn' --output text)"
+            if [ -n "${arns}" ]; then
+              # shellcheck disable=SC2086 # one argument per ARN
+              aws elbv2 describe-tags --resource-arns ${arns} --output text \
+                --query "TagDescriptions[?Tags[?Key=='Repository' && Value=='${GITHUB_REPOSITORY}']].ResourceArn"
+            fi
+          }
+          left="$(billing | tr '\t\n' '  ' | xargs)"
           if [ -n "${left}" ]; then
-            echo "::error::instances survived the reap and need a human: ${left}"
+            echo "::error::billing resources survived the reap and need a human: ${left}"
             exit 1
           fi
-          echo 'the stack is gone; nothing tagged to this repository is running'
+          echo 'the stack is gone; nothing tagged to this repository is billing'
 
   report:
     name: Reaper incident

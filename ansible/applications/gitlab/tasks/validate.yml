@@ -6,6 +6,10 @@
 # so a missing or malformed input fails in a second rather than mid-converge at the cost of an
 # instance. meta/main.yml describes these inputs; this file enforces them.
 #
+# Every value gitlab.rb holds is written inside a Ruby single-quoted string or as a bare number
+# that reconfigure evaluates as root, so each is held to a shape that cannot leave its literal.
+# No message echoes a password or a token.
+#
 # ============================================================================================= #
 ---
 
@@ -33,13 +37,31 @@
 
 #endregion --- [ Validate: The Pinned Installer ] --------------------------------------------- #
 
+#region ------ [ Validate: The Node Role ] ---------------------------------------------------- #
+
+# check: safety-critical -- the node role selects which services run and which secrets and
+# addresses gitlab.rb carries.
+- name: 'VALIDATE | Require A Known Node Role'
+  when: (state | default('present') | string | lower | trim) == 'present'
+
+  ansible.builtin.assert:
+    fail_msg: >-
+      Refusing to deploy: node_role must be one of all-in-one, rails, gitaly or redis. Got
+      '{{ gitlab_running.node_role | default('') }}'.
+    quiet: true
+    that: gitlab_running.node_role | default('') in ['all-in-one', 'rails', 'gitaly', 'redis']
+
+#endregion --- [ Validate: The Node Role ] ---------------------------------------------------- #
+
 #region ------ [ Validate: The External URL ] ------------------------------------------------- #
 
 # check: safety-critical -- the URL lands inside a Ruby single-quoted string in gitlab.rb, which
 # reconfigure evaluates as root, so a quote, a backslash or whitespace in it would change what
 # reconfigure evaluates.
 - name: 'VALIDATE | Require An External URL'
-  when: (state | default('present') | string | lower | trim) == 'present'
+  when:
+    - (state | default('present') | string | lower | trim) == 'present'
+    - gitlab_running.node_role in ['all-in-one', 'rails']
 
   ansible.builtin.assert:
     fail_msg: >-
@@ -50,3 +72,146 @@
     that: gitlab_running.external_url | default('') is match('^https?://[^\'\\\\\s]+$')
 
 #endregion --- [ Validate: The External URL ] ------------------------------------------------- #
+
+#region ------ [ Validate: The Rails Inputs ] ------------------------------------------------- #
+
+# check: safety-critical -- every value below is written into gitlab.rb. The passwords and tokens
+# are run secrets the playbook generates as letters and digits only, so the shape is also what
+# proves the generator ran.
+- name: 'VALIDATE | Require The Rails Node Inputs'
+  vars:
+    __ipv4__: '([0-9]{1,3}[.]){3}[0-9]{1,3}'
+    __secret__: '^[A-Za-z0-9]{48,}$'
+    __cidr__: '^(([0-9]{1,3}[.]){3}[0-9]{1,3}/[0-9]{1,2}|[0-9a-f:]+/[0-9]{1,3})$'
+  when:
+    - (state | default('present') | string | lower | trim) == 'present'
+    - gitlab_running.node_role == 'rails'
+
+  ansible.builtin.assert:
+    fail_msg: >-
+      Refusing to deploy a Rails node: database.host must be a DNS name, database.name and
+      database.username PostgreSQL identifiers, database.port, redis.port and sshd.port numbers;
+      database.password, redis.password and gitaly.token at least 48 letters and digits;
+      redis.host an IPv4 address and gitaly.address tcp://<IPv4>:8075; object_store.bucket an S3
+      bucket name, object_store.prefix runs/<run id> and object_store.region an AWS region;
+      object_store.types GitLab object types other than pages; each monitoring_whitelist entry a
+      CIDR; auto_migrate a boolean; sshd.host_key_source_dir a directory directly under /root.
+      Got database host
+      '{{ gitlab_running.database.host }}', name '{{ gitlab_running.database.name }}',
+      username '{{ gitlab_running.database.username }}', redis host
+      '{{ gitlab_running.redis.host }}', gitaly address '{{ gitlab_running.gitaly.address }}',
+      object store prefix '{{ gitlab_running.object_store.prefix }}', types
+      {{ gitlab_running.object_store.types }}, monitoring whitelist
+      {{ gitlab_running.monitoring_whitelist }}, auto_migrate
+      '{{ gitlab_running.auto_migrate }}', sshd {{ gitlab_running.sshd }}.
+    quiet: true
+    that:
+      - gitlab_running.database.host is match('^[a-z0-9.-]+$')
+      - gitlab_running.database.port | string is match('^[0-9]{1,5}$')
+      - gitlab_running.database.name is match('^[a-z_][a-z0-9_]*$')
+      - gitlab_running.database.username is match('^[a-z_][a-z0-9_]*$')
+      - gitlab_running.database.password is match(__secret__)
+      - gitlab_running.redis.host is match('^' ~ __ipv4__ ~ '$')
+      - gitlab_running.redis.port | string is match('^[0-9]{1,5}$')
+      - gitlab_running.redis.password is match(__secret__)
+      - gitlab_running.gitaly.address is match('^tcp://' ~ __ipv4__ ~ ':8075$')
+      - gitlab_running.gitaly.token is match(__secret__)
+      - gitlab_running.object_store.bucket is match('^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')
+      - gitlab_running.object_store.prefix is match('^runs/[0-9]+$')
+      - gitlab_running.object_store.region is match('^[a-z]{2}(-[a-z]+)+-[0-9]$')
+      - gitlab_running.object_store.types | length > 0
+      - >-
+        gitlab_running.object_store.types | difference(['artifacts', 'external_diffs', 'lfs',
+        'uploads', 'packages', 'dependency_proxy', 'terraform_state', 'ci_secure_files',
+        'agent_plan_content', 'ci_catalog_bundles']) | length == 0
+      - gitlab_running.monitoring_whitelist | reject('match', __cidr__) | list | length == 0
+      - gitlab_running.auto_migrate is boolean
+      - gitlab_running.sshd.port | string is match('^[0-9]{1,5}$')
+      - gitlab_running.sshd.host_key_source_dir is match('^/root/[a-z0-9-]+$')
+
+# check: safety-critical -- the names land in psql's connection string and in SQL; the password
+# only on psql's standard input, so any character RDS generates is safe there.
+- name: 'VALIDATE | Require The Database Bootstrap Inputs'
+  when:
+    - (state | default('present') | string | lower | trim) == 'present'
+    - gitlab_running.node_role == 'rails'
+    - gitlab_running.database_bootstrap.enabled | bool
+
+  ansible.builtin.assert:
+    fail_msg: >-
+      Refusing to bootstrap the database: database_bootstrap.master_database and master_username
+      must be PostgreSQL identifiers, master_password must be set, and extensions must name
+      extensions. Got master_database '{{ gitlab_running.database_bootstrap.master_database }}',
+      master_username '{{ gitlab_running.database_bootstrap.master_username }}', extensions
+      {{ gitlab_running.database_bootstrap.extensions }}.
+    quiet: true
+    that:
+      - gitlab_running.database_bootstrap.master_database is match('^[a-z_][a-z0-9_]*$')
+      - gitlab_running.database_bootstrap.master_username is match('^[a-z_][a-z0-9_]*$')
+      - gitlab_running.database_bootstrap.master_password | length > 0
+      - >-
+        gitlab_running.database_bootstrap.extensions | reject('match', '^[a-z_][a-z0-9_]*$')
+        | list | length == 0
+
+#endregion --- [ Validate: The Rails Inputs ] ------------------------------------------------- #
+
+#region ------ [ Validate: The Gitaly And Redis Inputs ] -------------------------------------- #
+
+# check: safety-critical -- the token and the URL are written into gitlab.rb.
+- name: 'VALIDATE | Require The Gitaly Node Inputs'
+  when:
+    - (state | default('present') | string | lower | trim) == 'present'
+    - gitlab_running.node_role == 'gitaly'
+
+  ansible.builtin.assert:
+    fail_msg: >-
+      Refusing to deploy a Gitaly node: gitaly.token must be at least 48 letters and digits, and
+      gitaly.internal_api_url http://<DNS name>. Got internal_api_url
+      '{{ gitlab_running.gitaly.internal_api_url }}'.
+    quiet: true
+    that:
+      - gitlab_running.gitaly.token is match('^[A-Za-z0-9]{48,}$')
+      - gitlab_running.gitaly.internal_api_url is match('^http://[A-Za-z0-9.-]+$')
+
+# check: safety-critical -- the password is written into gitlab.rb.
+- name: 'VALIDATE | Require The Redis Node Inputs'
+  when:
+    - (state | default('present') | string | lower | trim) == 'present'
+    - gitlab_running.node_role == 'redis'
+
+  ansible.builtin.assert:
+    fail_msg: >-
+      Refusing to deploy a Redis node: redis.password must be at least 48 letters and digits.
+    quiet: true
+    that: gitlab_running.redis.password is match('^[A-Za-z0-9]{48,}$')
+
+#endregion --- [ Validate: The Gitaly And Redis Inputs ] -------------------------------------- #
+
+#region ------ [ Validate: The Shared Secrets ] ----------------------------------------------- #
+
+# check: safety-critical -- a node's first reconfigure generates every secret it finds missing,
+# so a copied file that lacks one would leave this node signing with a key no other node holds.
+- name: 'VALIDATE | Require Every Shared Secret In The Copied File'
+  loop:
+    - 'gitlab_rails.secret_key_base'
+    - 'gitlab_rails.db_key_base'
+    - 'gitlab_rails.otp_key_base'
+    - 'gitlab_shell.secret_token'
+    - 'gitlab_workhorse.secret_token'
+  loop_control: { label: "{{ item }}" }
+  vars:
+    __section__: >-
+      {{ (gitlab_running.secrets_json | from_json)[item.split('.')[0]] | default({}) }}
+  when:
+    - (state | default('present') | string | lower | trim) == 'present'
+    - gitlab_running.secrets_json | length > 0
+
+  ansible.builtin.assert:
+    fail_msg: >-
+      Refusing to deploy: secrets_json lacks {{ item }}: the origin's reconfigure did not
+      generate it. Check that a redis_master_role reconfigure writes the
+      {{ item.split('.')[0] }} section of gitlab-secrets.json.
+    quiet: true
+    that: __section__[item.split('.')[1]] | default('', true) | length > 0
+
+#endregion --- [ Validate: The Shared Secrets ] ----------------------------------------------- #
