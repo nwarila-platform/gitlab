@@ -844,7 +844,8 @@
 #      every login role holds a SCRAM verifier, plaintext is refused, and its log shows
 #      connections and DDL audited and no password other than a verifier;
 #   5. an upload lands in S3 under this run's prefix and reads back identically from both Rails
-#      nodes; only the Rails nodes may write there, and only under runs/;
+#      nodes; only the Rails nodes may write there, and only under runs/ and GitLab's own
+#      tmp/uploads/;
 #   6. git over SSH through the load balancer meets the shared ECDSA host key, very likely on
 #      both nodes, clones the same commit, and pushes one that HTTP then reads;
 #   7. with the deploy node's GitLab stopped, HTTP, SSH, the upload and the session are still
@@ -1584,17 +1585,20 @@
 
         #region ------ [ Proof: Objects Land In S3 Under This Run ] --------------------------- #
 
+        # 64 KiB of random bytes, base64-encoded on one line. uri's default multipart encoding
+        # sends a file base64 with a Content-Transfer-Encoding GitLab ignores, so GitLab stores
+        # the base64; 7or8bit sends bytes as they are but rewrites line endings, so none here.
         - name: 'PROCESS | Write The Upload'
           changed_when: false
 
           ansible.builtin.command:
             argv:
-              - 'dd'
-              - 'if=/dev/urandom'
-              - "of={{ __proof_workspace__.path }}/upload-proof.bin"
-              - 'bs=65536'
-              - 'count=1'
-              - 'status=none'
+              - '/usr/bin/python3.12'
+              - '-c'
+              - >-
+                import base64, os, sys;
+                open(sys.argv[1], "wb").write(base64.b64encode(os.urandom(49152)))
+              - "{{ __proof_workspace__.path }}/upload-proof.bin"
             expand_argument_vars: false
             stdin_add_newline: true
             strip_empty_ends: true
@@ -1624,6 +1628,7 @@
               file:
                 filename: "{{ __proof_workspace__.path }}/upload-proof.bin"
                 mime_type: 'application/octet-stream'
+                multipart_encoding: '7or8bit'
             body_format: 'form-multipart'
             decompress: true
             follow_redirects: 'none'
@@ -1774,7 +1779,7 @@
 
         #endregion --- [ Proof: Objects Land In S3 Under This Run ] --------------------------- #
 
-        #region ------ [ Proof: Only The Rails Nodes Write, And Only Under runs/ ] ------------ #
+        #region ------ [ Proof: Only The Rails Nodes Write, And Only Where GitLab Writes ] ---- #
 
         # 16 MiB, past boto3's multipart threshold, so the multipart grants are exercised too.
         - name: 'PROCESS | Write A Probe Object On The Deploy Node'
@@ -1915,7 +1920,7 @@
               - __proof_list_gitaly__ is failed
               - __proof_list_gitaly__.msg | default('') is search('AccessDenied')
 
-        #endregion --- [ Proof: Only The Rails Nodes Write, And Only Under runs/ ] ------------ #
+        #endregion --- [ Proof: Only The Rails Nodes Write, And Only Where GitLab Writes ] ---- #
 
         #region ------ [ Proof: Git Over SSH Through The Load Balancer ] ---------------------- #
 
