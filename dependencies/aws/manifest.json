@@ -14,7 +14,7 @@
         },
         {
           "name": "nwarila-platform_gitlab_instance_s3",
-          "version": "v1"
+          "version": "v2"
         }
       ],
       "inline": []
