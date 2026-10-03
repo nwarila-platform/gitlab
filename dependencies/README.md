@@ -471,28 +471,21 @@ The documents use `<account-id>`, `<owner-id>`, `<repository-id>` and `<region>`
     denied. If it is not, such a create runs on the default values, so this guard too would fail
     open. Once the framework pin passes `parameter_group_name`, every run names `gitlab`, so only
     a create that skips it would show this;
-  - whether a Multi-AZ create carries `rds:MultiAz`. If it does not, this pin admits Multi-AZ: it
-    is the other guard here that fails open. A pair of requests settles it without creating
-    anything. They run as a one-off step in an AWS Deploy run dispatched on `main`, the only place
-    the runner role can be assumed, before Multi-AZ is enabled and while the `gitlab` subnet group
-    does not exist, that is, before the first apply that creates it, which happens once
-    `terraform/aws.tfvars` places systems in two zones; afterwards the pair cannot run without
-    removing the group, because the control below would create a database.
-    - Both are `CreateDBInstance` with the declared shape and every identity request tag, naming
-      that subnet group. Only the second adds `--multi-az`.
-    - The first is the control. It must fail with `DBSubnetGroupNotFoundFault`, which proves the
-      request otherwise passes IAM: the create statement answers AccessDenied for any unmet
-      condition, so AccessDenied on the control means the request is wrong and proves nothing.
-    - Given that control, AccessDenied on the second means the pin holds, and
-      `DBSubnetGroupNotFoundFault` on both means it fails open;
   - `CreateListener` scoped to the network load balancer's ARN;
   - `SetSecurityGroups` inside the network load balancer's create;
-  - the provider's `tf-` target group names;
-  - the instance role passed through the framework's own launch path.
+  - the provider's `tf-` target group names.
 
-  Apart from the Multi-AZ pin and the parameter-group fallback, each is a narrowing, so a wrong
-  one fails closed as an AccessDenied naming the action. The fix is a reviewed edit here, never a
-  wildcard.
+  Apart from the parameter-group fallback, each is a narrowing, so a wrong one fails closed as an
+  AccessDenied naming the action. The fix is a reviewed edit here, never a wildcard.
+- **Settled live.**
+  - **The Multi-AZ pin holds.** A one-off probe step ran in AWS Deploy run 37088011024
+    (2026-10-03, on `main`), while the `gitlab` subnet group did not exist. The control
+    `CreateDBInstance`, in the declared shape, failed with `DBSubnetGroupNotFoundFault`, so it
+    passed IAM; the same request with `--multi-az` was `AccessDenied`. A Multi-AZ create
+    therefore carries `rds:MultiAz`, and the `BoolIfExists` pin denies it. CloudTrail recorded
+    both answers, and no database was created.
+  - **The instance role passes through the framework's launch path.** AWS Deploy run
+    37085763487 (2026-10-03) launched the node on `nwarila-ec2-gitlab-profile`.
 - **Measured.** keycloak's first live apply (2026-10-01) found that IAM's policy simulator does not
   evaluate service-prefixed tag keys such as `secretsmanager:ResourceTag/<key>`, even for a plain
   tag, while it does evaluate the global `aws:ResourceTag/<key>`, including for the `aws:`-prefixed
