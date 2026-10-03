@@ -158,6 +158,10 @@ the fleet's SSM baseline, neither the application repository nor an S3 secret.
 
 **`nwarila-platform_gitlab_instance_s3`** gets, puts and deletes objects, and aborts and lists
 multipart uploads, under `runs/` in the objects bucket, and lists the bucket only under `runs/`.
+It holds the same object actions under `tmp/uploads/`: GitLab writes a direct upload's temporary
+object there, at the bucket root whatever the bucket prefix, then copies it under the prefix and
+deletes it (`app/uploaders/object_storage.rb`; found live on 2026-10-03, when an upload answered
+500 with `AccessDenied` on `tmp/uploads/<id>`).
 Every statement requires `aws:ResourceAccount` to be this account, so a bucket of the same name in
 another account receives nothing. It grants no `GetBucketLocation` and no
 `ListBucketMultipartUploads`. If GitLab needs either, the AccessDenied names it, and the fix is a
@@ -299,7 +303,8 @@ role against requests its guards must allow and deny:
 - the reaper's and the admin role's boundaries;
 - passing the instance role: to EC2 and not to Lambda, and no other EC2 role; the runner and the
   admin role may, the reaper may not;
-- the instance role: object data and listing under `runs/`, and SSM. Outside `runs/`, a listing
+- the instance role: object data and listing under `runs/`, object data under `tmp/uploads/`, and
+  SSM. Outside those, a write elsewhere under `tmp/`, a listing
   without a prefix, a same-named bucket in another account, the application repository, ansible
   and state buckets, the bucket's configuration, and passing a role are all denied;
 - the admin role: objects under `runs/` and listing them, and nothing outside `runs/` or on the
@@ -402,8 +407,8 @@ The credential-free validator, `scripts/check-dependencies.py`, also checks:
   budgets (every job's timeout, read from the workflow; a job without one is refused), and a
   multipart abort no later than expiry;
 - that only `instance_s3` and two `admin_s3` statements reach the objects bucket, by its name or by
-  any wildcard IAM would match against it. Each reaches only the run-object actions under `runs/`,
-  in this account, and lists only `runs/*`;
+  any wildcard IAM would match against it. Each reaches only the run-object actions under `runs/`
+  (the instance role also under `tmp/uploads/`), in this account, and lists only `runs/*`;
 - that the bucket policy is exactly its two Deny statements, applies to every principal, and
   excepts none but the instance and admin roles; that its object deny is exactly the declared
   action set, which is broader than the grant because S3 authorizes a request naming a version,
@@ -435,7 +440,8 @@ The documents use `<account-id>`, `<owner-id>`, `<repository-id>` and `<region>`
   Center permission set (`AWSReservedSSO_github_nwarila-platform_*`), the same set that can assume
   every other repository's admin role.
 - **Per-run isolation is a convention.** Each run writes below its own prefix under `runs/`, but
-  IAM grants the whole of `runs/`, so one run could read or delete another's objects. The deploy's
+  IAM grants the whole of `runs/`, so one run could read or delete another's objects; GitLab's
+  direct-upload temporaries under `tmp/uploads/` are shared the same way. The deploy's
   concurrency group lets one run at a time hold the bed.
 - **Objects outlive the destroy.** Lifecycle cleans `runs/`, not the destroy: an object expires a
   day after it is written, which outlasts the run's summed job budgets. The account-administrator
