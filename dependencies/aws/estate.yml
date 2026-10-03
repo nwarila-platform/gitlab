@@ -83,7 +83,8 @@ security_groups:
     description: "GitLab nodes: membership the NLB admits"
     ingress: []
     egress: []
-# GitLab's object storage. Each run writes below its own prefix under runs/, and one lifecycle
+# GitLab's object storage. Each run writes below its own prefix under runs/, GitLab's
+# direct-upload temporaries land under tmp/uploads/ at the bucket root, and one lifecycle
 # rule over the whole bucket expires every object a day after it is written, which outlasts the
 # deploy run's summed job budgets. Versioning stays off, so an expired object is gone. The bucket
 # policy only denies: plain HTTP to everyone, and object data and key names to every principal

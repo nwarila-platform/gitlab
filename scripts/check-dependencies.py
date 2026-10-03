@@ -9,7 +9,8 @@ artifacts, and it adds more: no IAM statement negates an element; the database's
 holds GitLab's required settings and the STIG and CIS hardening that does not conflict with them,
 and is the only one the runner may create a database with; the runner reads only its own
 database's logs; a host may be launched only with an org EC2 role or GitLab's own instance role;
-and the objects bucket is reachable only by that role and the admin role, only under runs/, behind
+and the objects bucket is reachable only by that role and the admin role, only under runs/ (the
+instance role also under tmp/uploads/, for GitLab's direct-upload temporaries), behind
 a bucket policy that only denies. The manifest is checked by shape, so an export rewrites it
 without editing this file.
 """
@@ -137,14 +138,18 @@ READABLE_PROFILES = {
 }
 PASS_ROLE_CONDITION = {"StringEquals": {"iam:PassedToService": "ec2.amazonaws.com"}}
 
-# GitLab's object storage. Only the instance role and the admin role reach it, only under runs/,
-# and only in this account: a same-named bucket elsewhere receives nothing.
+# GitLab's object storage. Only the instance role and the admin role reach it, only under runs/
+# (and tmp/uploads/, below), and only in this account: a same-named bucket elsewhere receives
+# nothing.
 OBJECTS_BUCKET = "<account-id>-gitlab-objects"
 OBJECTS_ARN = f"arn:aws:s3:::{OBJECTS_BUCKET}"
 OBJECTS_POLICY = "gitlab-objects.policy.json"
 RUN_OBJECT_ACTIONS = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"]
 RUN_ACTIONS = {action.lower() for action in [*RUN_OBJECT_ACTIONS, "s3:ListBucket"]}
 RUN_RESOURCES = {OBJECTS_ARN, f"{OBJECTS_ARN}/runs/*"}
+# GitLab writes a direct upload's temporary object to tmp/uploads/ at the bucket root whatever the
+# bucket prefix, then copies it under the prefix; only the instance role, which GitLab runs as, may.
+INSTANCE_RESOURCES = RUN_RESOURCES | {f"{OBJECTS_ARN}/tmp/uploads/*"}
 RESOURCE_ACCOUNT = {"aws:ResourceAccount": "<account-id>"}
 ADMIN_RUN_SIDS = ["ListGitLabRunPrefix", "ManageGitLabRunObjects"]
 OBJECT_PRINCIPALS = [f"arn:aws:iam::<account-id>:role/{INSTANCE_ROLE}", f"arn:aws:iam::<account-id>:role/{PREFIX}_admin"]
@@ -332,7 +337,7 @@ def allows(statement: dict[str, Any], action: str) -> bool:
 def reaches_objects_bucket(statement: dict[str, Any]) -> bool:
     """Whether an Allow grants an S3 action on the objects bucket, by its name or by a wildcard IAM would match."""
     s3 = any(fnmatch.fnmatchcase("s3", pattern.lower().split(":", 1)[0]) for pattern in as_list(statement["Action"]))
-    probes = (OBJECTS_ARN, f"{OBJECTS_ARN}/runs/probe")
+    probes = (OBJECTS_ARN, f"{OBJECTS_ARN}/runs/probe", f"{OBJECTS_ARN}/tmp/uploads/probe")
     return (
         statement["Effect"] == "Allow"
         and s3
@@ -775,7 +780,7 @@ def check_bucket(buckets: Any) -> None:
 
 
 def check_objects_reach() -> None:
-    """Only the instance role and the admin role reach the objects bucket, and only under runs/."""
+    """Only the instance and admin roles reach the objects bucket, under runs/ (instance: tmp/uploads/)."""
     for path in policy_paths():
         statements = load_json(path)["Statement"]
         reaching = [statement for statement in statements if reaches_objects_bucket(statement)]
@@ -793,7 +798,8 @@ def check_objects_reach() -> None:
             actions = {action.lower() for action in as_list(statement["Action"])}
             require(actions <= RUN_ACTIONS, f"{label}: actions beyond the run-object set: {sorted(actions - RUN_ACTIONS)}")
             resources = set(as_list(statement["Resource"]))
-            require(resources <= RUN_RESOURCES, f"{label}: reaches beyond the bucket's runs/ prefix: {sorted(resources - RUN_RESOURCES)}")
+            allowed = INSTANCE_RESOURCES if path.stem == INSTANCE_POLICY else RUN_RESOURCES
+            require(resources <= allowed, f"{label}: reaches beyond runs/ (and, for the instance role, tmp/uploads/): {sorted(resources - allowed)}")
             conditions = statement.get("Condition", {})
             require(conditions.get("StringEquals") == RESOURCE_ACCOUNT, f"{label}: must carry exactly StringEquals {RESOURCE_ACCOUNT}")
             if "s3:listbucket" in actions:
