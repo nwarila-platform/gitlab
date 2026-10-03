@@ -6,10 +6,11 @@
 # DATA-ONLY here (a plain tfvars, no .tf files); resources live in the pinned
 # aws-terraform-framework, configuration in the pinned ansible-framework + this repo's role.
 #
-#   * The stack is two GitLab Rails nodes in two zones behind an internal network load balancer,
-#     a Gitaly node and a Redis node, an RDS PostgreSQL database and S3 object storage. The proof
-#     runs between the two converges, so the second, which must change nothing, also judges the
-#     node the proof stopped and started.
+#   * The stack is nine nodes: two GitLab Rails nodes in two zones behind an internal network
+#     load balancer, a Gitaly Cluster of three Gitaly nodes behind three Praefect nodes on the
+#     same load balancer, and a Redis node, with an RDS PostgreSQL database and S3 object
+#     storage. The proof runs between the two converges, so the second, which must change
+#     nothing, also judges the node the proof stopped and started.
 #   * AWS credentials are issued only to this workflow at refs/heads/main. Pull requests use
 #     the credential-free quality workflow; feature-branch workflow code never reaches AWS.
 #   * Reachability: direct SSH to a subnet-assigned public IPv4. At runtime the framework adds
@@ -334,7 +335,7 @@ jobs:
 
       # What Terraform built and the playbook configures against: the database's address and the
       # ARN of the secret RDS keeps its master credentials in, the load balancer's name, and the
-      # two target groups whose health the proof reads. Passed as an extra-vars file, as the
+      # three target groups whose health the proof reads. Passed as an extra-vars file, as the
       # account and region are passed, so the play and the stack cannot disagree. None of it is
       # secret; the secret itself is read by the playbook.
       - name: Read the stack's endpoints
@@ -346,13 +347,14 @@ jobs:
                                      | {address, port, master_user_secret_arn}),
                    gitlab_load_balancer_dns: .aws_load_balancer_dns_names.value.gitlab,
                    gitlab_target_group_arn: .aws_target_group_arns.value["gitlab/rails-http"],
-                   gitlab_ssh_target_group_arn: .aws_target_group_arns.value["gitlab/rails-ssh"]}' \
+                   gitlab_ssh_target_group_arn: .aws_target_group_arns.value["gitlab/rails-ssh"],
+                   gitlab_praefect_target_group_arn: .aws_target_group_arns.value["gitlab/praefect"]}' \
             > "${RUNNER_TEMP}/endpoints.json"
           jq -e '.gitlab_database.address and .gitlab_database.master_user_secret_arn
                  and .gitlab_load_balancer_dns and .gitlab_target_group_arn
-                 and .gitlab_ssh_target_group_arn' \
+                 and .gitlab_ssh_target_group_arn and .gitlab_praefect_target_group_arn' \
             "${RUNNER_TEMP}/endpoints.json" > /dev/null \
-            || { echo '::error::Terraform outputs lack a database, load balancer or target group endpoint.'; exit 1; }
+            || { echo '::error::Terraform outputs lack the database, the load balancer, or the rails-http, rails-ssh or praefect target group.'; exit 1; }
 
       # This repo's roles overlay onto the pinned framework tree. A framework-TRACKED role
       # path is refused so an overlay can never replace framework-owned code.

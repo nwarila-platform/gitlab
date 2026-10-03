@@ -14,7 +14,7 @@
 #                              the version manifest GitLab installs.
 #   gitlab.installer.sha256    Lowercase 64-character digest of that object, verified on the
 #                              controller and again on the GUEST before dnf installs it.
-#   gitlab.node_role           all-in-one (the default), rails, gitaly or redis.
+#   gitlab.node_role           all-in-one (the default), rails, gitaly, praefect or redis.
 #
 # all-in-one and rails:
 #
@@ -22,25 +22,37 @@
 #                              quotes, backslashes or whitespace: gitlab.rb holds it in a
 #                              Ruby string.
 #
+# rails and praefect:
+#
+#   gitlab.auto_migrate        True on exactly one node per database, which migrates it.
+#   gitlab.secrets_json        The first configured node's gitlab-secrets.json.
+#   gitlab.database.{host,port,name,username,password}
+#                              The external PostgreSQL and the service's own role in it.
+#   gitlab.database_bootstrap.{enabled,master_database,master_username,master_password}
+#                              On the one node that creates its service's role and database,
+#                              as the database's master user, before its first reconfigure.
+#
 # rails:
 #
-#   gitlab.auto_migrate        True on exactly one Rails node, which migrates the database.
-#   gitlab.secrets_json        The first configured node's gitlab-secrets.json.
 #   gitlab.monitoring_whitelist  CIDRs allowed to read the health endpoints.
-#   gitlab.database.{host,port,name,username,password}
-#                              The external PostgreSQL and GitLab's own role in it.
 #   gitlab.redis.{host,password}
 #   gitlab.gitaly.{address,token}
-#                              tcp://<address>:8075, and the token Gitaly shares.
+#                              tcp://<host>:<port> of the virtual storage 'default', and the
+#                              token it takes: Praefect's, through the load balancer.
 #   gitlab.object_store.{bucket,prefix,region}
 #                              Objects go to '<bucket>/<prefix>/<type>'.
 #   gitlab.sshd.host_key_source_dir
 #                              Root-only directory holding the shared gitlab-sshd host keys.
-#   gitlab.database_bootstrap.{enabled,master_database,master_username,master_password}
-#                              On the one Rails node that creates GitLab's role and database,
-#                              as the database's master user, before its first reconfigure.
 #
-# gitaly: gitlab.secrets_json, gitlab.gitaly.token, and gitlab.gitaly.internal_api_url, the
+# praefect:
+#
+#   gitlab.praefect.token      The token Gitaly clients present to Praefect.
+#   gitlab.praefect.nodes      Each Gitaly node as {storage, address: tcp://<IPv4>:<port>}.
+#   gitlab.gitaly.token        The token Praefect presents to every Gitaly node; never the
+#                              same as praefect.token.
+#
+# gitaly: gitlab.secrets_json, gitlab.gitaly.token (the token Praefect presents),
+# gitlab.gitaly.storage (this node's storage name) and gitlab.gitaly.internal_api_url, the
 # http:// URL of GitLab's internal API. redis: gitlab.redis.password.
 #
 # The controller fetches the package with its own credentials; the guest is never given any for
@@ -54,12 +66,12 @@ galaxy_info:
   author: 'nwarila-platform'
   description: >-
     GitLab for CIS-hardened RHEL 8, on one node or as one role of a distributed layout (Rails,
-    Gitaly or Redis). Installs the pinned, digest- and signature-verified gitlab-fips package,
-    shares one set of secrets across nodes, connects Rails to an external PostgreSQL as its own
-    unprivileged role over verified TLS, serves git over SSH with gitlab-sshd on shared host
-    keys, lets Gitaly execute its runtime binaries under fapolicyd, and reconfigures only when
-    the version or its inputs change -- then reads the version, the services, readiness and FIPS
-    mode back from GitLab itself.
+    Gitaly, Praefect or Redis). Installs the pinned, digest- and signature-verified gitlab-fips
+    package, shares one set of secrets across nodes, connects Rails and Praefect each to an
+    external PostgreSQL as its own unprivileged role over verified TLS, serves git over SSH with
+    gitlab-sshd on shared host keys, lets Gitaly execute its runtime binaries under fapolicyd,
+    and reconfigures only when the version or its inputs change -- then reads the version, the
+    services, readiness and FIPS mode back from GitLab itself.
   license: 'MIT'
   min_ansible_version: '2.21'
   platforms:

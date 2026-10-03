@@ -15,9 +15,11 @@
 groups:
   gitlab_servers: >-
     ((aws_ec2_tags | default(aws_tags)).Function | default('', true))
-    in ['gitlab-rails', 'gitlab-gitaly', 'gitlab-redis']
+    in ['gitlab-rails', 'gitlab-gitaly', 'gitlab-praefect', 'gitlab-redis']
   gitlab_rails: "((aws_ec2_tags | default(aws_tags)).Function | default('', true)) == 'gitlab-rails'"
   gitlab_gitaly: "((aws_ec2_tags | default(aws_tags)).Function | default('', true)) == 'gitlab-gitaly'"
+  gitlab_praefect: >-
+    ((aws_ec2_tags | default(aws_tags)).Function | default('', true)) == 'gitlab-praefect'
   gitlab_redis: "((aws_ec2_tags | default(aws_tags)).Function | default('', true)) == 'gitlab-redis'"
 
 #endregion --- [ This Repository ] ------------------------------------------------------------ #

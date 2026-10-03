@@ -535,16 +535,21 @@ The documents use `<account-id>`, `<owner-id>`, `<repository-id>` and `<region>`
   group in one zone, so every plan would exit 1 on it, naming how many other changes are pending,
   and every `--apply` would exit 1 on it after applying everything else.
 - **Network load balancer specifics.** The balancer forwards SSH to gitlab-sshd on port 2222 of
-  the nodes, and its SSH target group health-checks HTTP on port 80, so a node whose GitLab is
-  stopped leaves both target groups together. The HTTP target group checks its traffic port, and
-  so would a Praefect one on 2305. The three egress rules of `gitlab-lb`, 80, 2222 and 2305,
-  therefore carry both the traffic and the health checks, and it reaches the nodes on nothing
-  else. With client IP preservation, which instance targets have by default, a node sees the
-  client's address rather than the balancer's, and a node that reaches itself through the
-  balancer is dropped. So no node is both a client and a target of a listener: the Rails nodes,
-  the targets, never call the balancer (KAS is off on them, and gitlab-shell and gitlab-sshd reach
-  GitLab's internal API locally), and the Gitaly node, its only client, is never a target. The
-  balancer's declaration and the nodes' own rules settle both.
+  the Rails nodes, and its SSH target group health-checks HTTP on port 80, so a node whose GitLab
+  is stopped leaves both Rails target groups together. The HTTP target group checks its traffic
+  port, and the Praefect one checks 2305 with a TCP connect, as the reference architecture's
+  HAProxy checks Praefect. The three egress rules of `gitlab-lb`, 80, 2222 and 2305, therefore
+  carry both the traffic and the health checks, and it reaches the nodes on nothing else. With
+  client IP preservation, which instance targets have by default, a node sees the client's
+  address rather than the balancer's, and a node that reaches itself through the balancer is
+  dropped. The Rails listeners, 80 and 22, keep it; the Praefect listener, 2305, turns it off,
+  so a Praefect node sees every caller and every check arrive from the balancer and admits 2305
+  from `gitlab-lb` alone. No node is both a client and a target of one listener: a Rails node is
+  a target of 80 and 22 and a client of 2305 (KAS is off on it, and gitlab-shell and gitlab-sshd
+  reach GitLab's internal API locally); a Gitaly node is a client of 80 and 2305, and the first,
+  which runs the proofs, of 22, and a target of none; a Praefect node is a target of 2305 and a
+  client of none. 2305 keeps no client addresses, so it cannot hairpin. The balancer's
+  declaration and the nodes' own rules settle all of it.
 - **The parameter group's read shape is unproven.** The local test double reads back exactly the
   parameters this tree set, as strings, and ignores `--source`. If real RDS reads a value back in
   another form, or lists a parameter this tree did not set, every plan shows a MODIFY or a RESET,
