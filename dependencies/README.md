@@ -390,9 +390,11 @@ The documents use `<account-id>`, `<owner-id>`, `<repository-id>` and `<region>`
 - **The parameter group's read shape is unproven.** The local test double reads back exactly the
   parameters this tree set, as strings, and ignores `--source`. If real RDS reads a value back in
   another form, or lists a parameter this tree did not set, every plan shows a MODIFY or a RESET,
-  and an `--apply` then fails its re-plan, naming the parameter. In particular, whether
-  `--source user` lists `rds.force_ssl` and `password_encryption` once they are set to their
-  default values is unproven: if it does not, every plan shows them as a MODIFY.
+  and an `--apply` then fails its re-plan, naming the parameter. The first live apply
+  (2026-10-02) settled one case: `--source user` lists `password_encryption` once set, but not
+  `rds.force_ssl`, which RDS holds at 1 as a system value. Declared values therefore compare
+  against every source; only the reset of parameters this tree did not declare reads the
+  user-set ones.
 - **Some parameters may not be modifiable on RDS.** Before the first apply, the owner reads
   `aws rds describe-engine-default-parameters --db-parameter-group-family postgres17` for the
   `IsModifiable` and `ApplyType` of `log_line_prefix`, `log_replication_commands`,

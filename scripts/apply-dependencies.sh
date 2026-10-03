@@ -255,6 +255,7 @@ plan_estate() {
     # differs or is missing is written, and one set outside this tree is reset to the family default.
     while read -r group; do
         have=''
+        in_force=''
         if ! read_or_absent "${WORK}/pg.json" rds describe-db-parameter-groups --db-parameter-group-name "${group}" --output json; then
             say "DB parameter group ${group}" 'CREATE'; act pg-create "${group}"
         else
@@ -269,13 +270,17 @@ plan_estate() {
             say "DB parameter group ${group}" "present (${family})"
             have="$(aws_ rds describe-db-parameters --db-parameter-group-name "${group}" --source user --output json \
                     | jq -r '.Parameters[] | "\(.ParameterName)=\(.ParameterValue)"' | sort)"
+            # A declared value RDS already holds as a system value (rds.force_ssl on postgres17) is never
+            # listed as user-set, so declared values compare against every source.
+            in_force="$(aws_ rds describe-db-parameters --db-parameter-group-name "${group}" --output json \
+                    | jq -r '.Parameters[] | "\(.ParameterName)=\(.ParameterValue)"' | sort)"
         fi
         want="$(jq -r --arg n "${group}" '.db_parameter_groups[] | select(.name == $n) | .parameters | to_entries[]
                 | "\(.key)=\(.value)"' "${WORK}/estate.json" | sort)"
         while read -r key; do
             [ -n "${key}" ] || continue
             say "  ${group}" "MODIFY ${key}"; act pg-modify "${group}" "${key%%=*}"
-        done < <(comm -13 <(printf '%s\n' "${have}") <(printf '%s\n' "${want}"))
+        done < <(comm -13 <(printf '%s\n' "${in_force}") <(printf '%s\n' "${want}"))
         while read -r name; do
             [ -n "${name}" ] || continue
             say "  ${group}" "RESET ${name} (not declared)"; act pg-reset "${group}" "${name}"
