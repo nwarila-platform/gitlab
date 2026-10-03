@@ -158,7 +158,7 @@ string, as the RDS API takes it.
 | `log_connections` | `1` | STIG V-261866, V-261956, V-261960, V-261961; CIS 3.1.20 |
 | `log_disconnections` | `1` | STIG V-261866, V-261960, V-261961; CIS 3.1.21 |
 | `log_error_verbosity` | `verbose` | CIS 3.1.22 |
-| `log_line_prefix` | `%m:%r:%u@%d:[%p]:%l:%e:%s:%v:%x:%c:%q%a` | CIS 3.1.24; STIG V-261860, V-261866, V-261871 |
+| `log_line_prefix` | `%m:%r:%u@%d:[%p]:%l:%e:%s:%v:%x:%c:%q%a:` (one of the two values RDS accepts) | CIS 3.1.24; STIG V-261860, V-261866, V-261871 |
 | `log_replication_commands` | `1` | CIS 7.2 |
 | `client_min_messages` | `error` | STIG V-261908, V-261909. Rails sets `warning` for its own sessions |
 | `shared_preload_libraries` | `pg_stat_statements,pgaudit` | CIS 3.2 and the STIG's pgaudit rules (below); RDS's default library stays |

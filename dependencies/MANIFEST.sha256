@@ -1,6 +1,6 @@
-3adaf65d3a528b62ff418e1247c0bb4f578422a572a9e4ee9c13e6cca7ef3bd1  ./README.md
+ad8decbf8ff3c673fbdda720414896ad755ef17a56ae7c55ec88e75be011afce  ./README.md
 f8933c729fa4c6766fc7a98d0350f816162f9525b892f7529a8401154e471e10  ./aws/artifacts.yml
-342c2095164613797403ab0a916de948bfb7cd80310361bf5794777c8dc33e1e  ./aws/estate.yml
+092e531e7d196cc559ce31343c67e7657f164fecdd3237d4a619480e3e5c3bc1  ./aws/estate.yml
 d25df9865b954c4aa1f77b9f5c189138145fd88d7319f5cc363e80497e9ca7e9  ./aws/manifest.json
 6cd4de3dc34bf0a66a408ea5e2ce8da53c5697aba896f7b2d20ae432ffb656d5  ./aws/policies/nwarila-platform_gitlab_admin_s3.json
 5509907934641d4bee7aba157aa0c9f10c5b79bb232a5b251cec0a0a2dc5a63e  ./aws/policies/nwarila-platform_gitlab_admin_secretsmanager.json

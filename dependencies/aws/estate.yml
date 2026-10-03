@@ -46,7 +46,8 @@ db_parameter_groups:
       log_connections: "1"                          # STIG V-261866/V-261956/V-261960/V-261961; CIS 3.1.20
       log_disconnections: "1"                       # STIG V-261866/V-261960/V-261961; CIS 3.1.21
       log_error_verbosity: "verbose"                # CIS 3.1.22
-      log_line_prefix: "%m:%r:%u@%d:[%p]:%l:%e:%s:%v:%x:%c:%q%a"  # CIS 3.1.24; STIG V-261860/V-261866/V-261871
+      # RDS accepts exactly two prefixes, its default and this one; the trailing colon is part of it.
+      log_line_prefix: "%m:%r:%u@%d:[%p]:%l:%e:%s:%v:%x:%c:%q%a:"  # CIS 3.1.24; STIG V-261860/V-261866/V-261871
       log_replication_commands: "1"                 # CIS 7.2
       client_min_messages: "error"                  # STIG V-261908/V-261909
       # pgaudit, for DDL and role changes only: CIS 3.2; STIG V-261861/V-261865/V-261872/V-261942/
