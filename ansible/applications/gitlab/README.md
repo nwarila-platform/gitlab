@@ -220,3 +220,8 @@ must be listening on the port it serves its peers on. With fapolicyd running on 
 Gitaly, a fresh `fapolicyd-cli --list` must show the gitlab rule compiled into the loaded rules
 file; the proof shows whether it is in force. The readiness wait and the reconfigure are bounded
 in `tasks/present_redhat.yml`, and both bounds are unmeasured until a live run.
+
+The playbook's proof shows the Gitaly Cluster at work: Praefect connects over TLS 1.3 as its own
+role and holds its LISTEN connections from every Praefect node; a repository has three current
+replicas; with its primary's Gitaly stopped, a push over HTTP succeeds and every repository stays
+available; and once the node is back it is reconciled to the same checksum as the other two.

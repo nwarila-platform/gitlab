@@ -1021,12 +1021,18 @@
 #   6. git over SSH through the load balancer meets the shared ECDSA host key, very likely on
 #      both nodes, clones the same commit, and pushes one that HTTP then reads;
 #   7. with the deploy node's GitLab stopped, HTTP, SSH, the upload and the session are still
-#      served; the node rejoins and keeps the session.
+#      served; the node rejoins and keeps the session;
+#   8. Praefect's database is its own role over TLS 1.3, every Praefect node holds its LISTEN
+#      connections, and Praefect's role is a SCRAM one as GitLab's and the master user's are;
+#   9. the project's repository has three current replicas; with its primary's Gitaly stopped,
+#      a push over HTTP succeeds on a new primary and every repository stays available; the
+#      node is reconciled once it is back, and the three copies hold the same checksum.
 #
-# It adds a project, keys and objects and stops a node, so it is tagged 'never': an ordinary
-# converge, and the second converge that must report no change, never run it. The workflow asks
-# for it by tag. Root's password, the access token and the session cookie reach git, curl and
-# GitLab only on stdin or in module arguments under no_log: never argv, a URL or a file.
+# It adds a project, keys and objects and stops a Rails node and a Gitaly node, so it is tagged
+# 'never': an ordinary converge, and the second converge that must report no change, never run
+# it. The workflow asks for it by tag. Root's password, the access token and the session cookie
+# reach git, curl and GitLab only on stdin or in module arguments under no_log: never argv, a
+# URL or a file.
 
 - name: 'PLAY | Prove The Distributed Shape Serves Through The Load Balancer (opt-in)'
   hosts: "{{ groups['gitlab_gitaly'] | default(['gitlab_gitaly']) | sort | first }}"
@@ -1038,6 +1044,23 @@
     __nlb__: "http://{{ gitlab_load_balancer_dns }}"
     __deploy__: "{{ groups['gitlab_rails'] | sort | first }}"
     __rails__: "{{ groups['gitlab_rails'] | sort }}"
+    __praefect__: "{{ groups['gitlab_praefect'] | sort | first }}"
+    # Every Praefect node's private address, each holding LISTEN connections to its database.
+    __addresses__: >-
+      {{ groups['gitlab_praefect'] | map('extract', hostvars, 'aws_private_ip_address') | list }}
+    # Praefect's own command line, run as git, which may read config.toml; it dials its own
+    # listener.
+    __praefect_cli__:
+      - '/opt/gitlab/embedded/bin/praefect'
+      - '-config'
+      - '/var/opt/gitlab/praefect/config.toml'
+    # The proof project's repository in the virtual storage: GitLab's hashed path of its id.
+    __relative_path__: >-
+      {%- set hash = __proof_project__.json.id | string | hash('sha256') -%}
+      @hashed/{{ hash[0:2] }}/{{ hash[2:4] }}/{{ hash }}.git
+    __metadata__: >-
+      {{ __praefect_cli__ + ['metadata', '-virtual-storage', 'default', '-relative-path',
+                             __relative_path__] }}
     __run__: "{{ lookup('ansible.builtin.env', 'GITHUB_RUN_ID') }}"
     __project_api__: "{{ __nlb__ }}/api/v4/projects/root%2Fpush-proof-{{ __run__ }}"
     __http_url__: "{{ __nlb__ }}/root/push-proof-{{ __run__ }}.git"
@@ -1637,10 +1660,11 @@
               {{ __settings__ | rejectattr('source', 'equalto', 'configuration file') | list
                  + __settings__ | selectattr('pending_restart') | list }}; login roles with a
               password that is not a SCRAM verifier: {{ __roles__ | rejectattr('type', 'none')
-                 | rejectattr('type', 'equalto', 'scram-sha-256') | list }}; the GitLab roles
-              read
+                 | rejectattr('type', 'equalto', 'scram-sha-256') | list }}; the GitLab,
+              Praefect and master roles read
               {{ __roles__ | selectattr('role', 'in',
-                 [gitlab_database_role, gitlab_database_credentials.username]) | list }}.
+                 [gitlab_database_role, gitlab_praefect_database_role,
+                  gitlab_database_credentials.username]) | list }}.
             quiet: true
             that:
               - >-
@@ -1655,8 +1679,9 @@
                 | rejectattr('type', 'equalto', 'scram-sha-256') | list | length == 0
               - >-
                 __roles__ | selectattr('role', 'in',
-                [gitlab_database_role, gitlab_database_credentials.username])
-                | selectattr('type', 'equalto', 'scram-sha-256') | list | length == 2
+                [gitlab_database_role, gitlab_praefect_database_role,
+                 gitlab_database_credentials.username])
+                | selectattr('type', 'equalto', 'scram-sha-256') | list | length == 3
 
         # rds.force_ssl refuses a plaintext connection before authentication, so no password is
         # offered: one asked for here would mean the plaintext connection got that far.
@@ -2709,6 +2734,593 @@
             that: __proof_rejoined_session__.json.username | default('') == 'root'
 
         #endregion --- [ Proof: Losing A Rails Node Loses Nothing ] --------------------------- #
+
+        #region ------ [ Proof: Praefect's Database Is Its Own, Over TLS ] -------------------- #
+
+        # The proof runs only the tagged plays, so the run secrets play has not read them here.
+        - name: 'BEGIN | Read The Run Secrets On The Redis Node'
+          delegate_to: "{{ groups['gitlab_redis'] | first }}"
+          no_log: true
+          register: '__proof_run_secrets__'
+
+          ansible.builtin.slurp:
+            armor: true
+            src: '/root/nwarila-gitlab-run-secrets.json'
+
+        # As Praefect's own role, from the first Praefect node: the TLS version of every backend
+        # of that role, the addresses holding its LISTEN connections (each node opens two, for
+        # its read cache and its repository locks, and each issues 'listen <channel>;'), and the
+        # connection counts. A role always sees its own sessions.
+        # A listener reconnects on its own, so a short wait covers one caught reconnecting.
+        # UNMEASURED: 6 tries 5 seconds apart. A failure is named by the assert after it.
+        - name: 'BEGIN | Read Praefect''s Connections As Its Own Role'
+          changed_when: false
+          delay: 5
+          delegate_to: "{{ __praefect__ }}"
+          ignore_errors: true
+          no_log: true
+          register: '__proof_praefect_db__'
+          retries: 6
+          until: >-
+            __proof_praefect_db__.rc == 0
+            and __addresses__
+            | difference((__proof_praefect_db__.stdout | from_json).listeners) | length == 0
+
+          ansible.builtin.command:
+            argv: >-
+              {{ __psql__ + ['host=' ~ gitlab_database.address ~ ' port=' ~ gitlab_database.port
+                 ~ ' user=' ~ gitlab_praefect_database_role ~ ' dbname='
+                 ~ gitlab_praefect_database_name
+                 ~ ' sslmode=verify-full sslrootcert=/etc/gitlab/rds-ca-bundle.pem'] }}
+            expand_argument_vars: false
+            stdin: |-
+              {{ (__proof_run_secrets__.content | b64decode
+                  | from_json).praefect_database_password }}
+              SELECT json_build_object(
+                'backends', (SELECT coalesce(json_agg(json_build_object(
+                                 'ssl', b.ssl, 'version', b.version, 'count', b.n)), '[]')
+                             FROM (SELECT s.ssl, s.version, count(*) AS n
+                                   FROM pg_stat_ssl s JOIN pg_stat_activity a USING (pid)
+                                   WHERE a.usename = current_user
+                                     AND a.backend_type = 'client backend'
+                                   GROUP BY 1, 2) b),
+                'listeners', (SELECT coalesce(json_agg(host(client_addr)
+                                                       ORDER BY host(client_addr)), '[]')
+                              FROM pg_stat_activity
+                              WHERE usename = current_user AND query LIKE 'listen %'),
+                'connections', (SELECT count(*) FROM pg_stat_activity
+                                WHERE usename = current_user),
+                'instance_connections', (SELECT count(*) FROM pg_stat_activity
+                                         WHERE backend_type = 'client backend'));
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'VERIFY | Require psql To Have Read Praefect''s Connections'
+          ansible.builtin.assert:
+            fail_msg: >-
+              psql exited {{ __proof_praefect_db__.rc | default('nothing') }}:
+              {{ __proof_praefect_db__.stderr_lines | default([])
+                 | map('regex_replace', 'SCRAM-SHA-256[$][A-Za-z0-9+/=:$]*', '<verifier>')
+                 | list }}
+            quiet: true
+            that: __proof_praefect_db__.rc | default(1) == 0
+
+        - name: 'VERIFY | Require Praefect''s Own Role Over TLS 1.3, Listening From Every Node'
+          vars:
+            __read__: "{{ __proof_praefect_db__.stdout | from_json }}"
+
+          ansible.builtin.assert:
+            fail_msg: >-
+              Praefect's database connections are not as declared: {{ __read__ }}. Expected
+              every backend of its role on TLSv1.3, and a LISTEN connection from each of
+              {{ __addresses__ }}.
+            quiet: true
+            that:
+              - __read__.backends | rejectattr('ssl') | list | length == 0
+              - >-
+                __read__.backends | rejectattr('version', 'equalto', 'TLSv1.3')
+                | list | length == 0
+              - __addresses__ | difference(__read__.listeners) | length == 0
+
+        # Counts only, against the 400 connections the parameter group allows; none is asserted.
+        # The database logs grow with Praefect's connections, so their size and read time too.
+        - name: 'INFO | Report Praefect''s Connections And The Database Logs'
+          vars:
+            __read__: "{{ __proof_praefect_db__.stdout | from_json }}"
+
+          ansible.builtin.debug:
+            msg: >-
+              Praefect's role holds {{ __read__.connections }} connection(s) of the instance's
+              {{ __read__.instance_connections }}; LISTEN connections from
+              {{ __read__.listeners }}. The {{ __proof_logs__.results | length }} database log
+              file(s) held {{ __proof_logs__.results | map(attribute='stdout') | map('length')
+              | sum }} characters, read in {{ __proof_logs__.results | map(attribute='delta')
+              | list }}.
+            verbosity: 0
+
+        #endregion --- [ Proof: Praefect's Database Is Its Own, Over TLS ] -------------------- #
+
+        #region ------ [ Proof: Three Replicas Survive Losing The Primary ] ------------------- #
+
+        # rc-contract: uri reports the HTTP status GitLab answered; the assert below reads it.
+        - name: 'BEGIN | Read The Proof Project Through The Load Balancer'
+          changed_when: false
+          failed_when: false
+          no_log: true
+          register: '__proof_project__'
+
+          ansible.builtin.uri:
+            body_format: 'raw'
+            decompress: true
+            follow_redirects: 'none'
+            force: false
+            force_basic_auth: false
+            headers:
+              PRIVATE-TOKEN: "{{ __proof_token__ }}"
+            http_agent: 'ansible-httpget'
+            method: 'GET'
+            remote_src: false
+            return_content: true
+            status_code: [ 200 ]
+            timeout: 30
+            unredirected_headers: []
+            unsafe_writes: false
+            url: "{{ __project_api__ }}"
+            use_gssapi: false
+            use_netrc: false
+            use_proxy: false
+            validate_certs: true
+
+        - name: 'VERIFY | Require The Proof Project'
+          ansible.builtin.assert:
+            fail_msg: >-
+              Reading the proof project answered
+              {{ __proof_project__.status | default('nothing') }}:
+              {{ (__proof_project__.json | default({})).message | default(__proof_project__.msg
+              | default('')) }}
+            quiet: true
+            that:
+              - __proof_project__.status | default(0) == 200
+              - >-
+                (__proof_project__.json | default({})).id | default('') | string
+                is match('^[0-9]+$')
+
+        # Praefect's view of the repository (subcmd_metadata.go): a '- Storage:' block per
+        # replica, which must be assigned, at the current generation, healthy and a valid primary
+        # on all three. This is the replication factor of three, seen. UNMEASURED: 30 tries 5
+        # seconds apart.
+        - name: 'END | Wait Until All Three Replicas Are Assigned, Current And Healthy'
+          become: true
+          become_user: 'git'
+          changed_when: false
+          check_mode: false
+          delay: 5
+          delegate_to: "{{ __praefect__ }}"
+          register: '__proof_replicas__'
+          retries: 30
+          until: >-
+            __proof_replicas__.rc == 0
+            and __proof_replicas__.stdout.split('- Storage: ')[1:]
+            | select('search', 'Assigned: true') | select('search', 'fully up to date')
+            | select('search', 'Healthy: true') | select('search', 'Valid Primary: true')
+            | list | length == 3
+
+          ansible.builtin.command:
+            argv: "{{ __metadata__ }}"
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        # Read once: dataloss reads the same Praefect tables the wait above has just found
+        # current.
+        # rc-contract: praefect exits 0 after its report and 1 when it fails.
+        - name: 'BEGIN | Read Whether Every Repository Is Fully Available'
+          become: true
+          become_user: 'git'
+          changed_when: false
+          check_mode: false
+          delegate_to: "{{ __praefect__ }}"
+          failed_when: false
+          register: '__proof_dataloss__'
+
+          ansible.builtin.command:
+            argv: >-
+              {{ __praefect_cli__ + ['dataloss', '-virtual-storage', 'default',
+                                   '-partially-unavailable'] }}
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        # Each line is indented, so the line is found in stdout, not among stdout_lines.
+        - name: 'VERIFY | Require Every Repository To Be Fully Available'
+          ansible.builtin.assert:
+            fail_msg: >-
+              praefect dataloss -partially-unavailable exited {{ __proof_dataloss__.rc }}:
+              {{ __proof_dataloss__.stdout_lines }} {{ __proof_dataloss__.stderr_lines }}
+            quiet: true
+            that:
+              - __proof_dataloss__.rc == 0
+              - >-
+                'All repositories are fully available on all assigned storages!'
+                in __proof_dataloss__.stdout
+
+        # The repository's primary is stopped; Gitaly is started again whatever happened.
+        - name: 'PROCESS | Prove The Cluster Survives Losing The Primary'
+          block:
+
+            # The storage is named for its host, so the primary names the node to stop.
+            - name: 'BEGIN | Record The Primary To Stop'
+              ansible.builtin.set_fact:
+                __stopped__: >-
+                  {{ (__proof_replicas__.stdout_lines | select('match', 'Primary: ')
+                      | first).split('"')[1] }}
+                cacheable: false
+
+            # It may be the node this proof runs on; the proof's git client does not use it.
+            - name: 'PROCESS | Stop Gitaly On The Primary'
+              changed_when: true
+              delegate_to: "{{ __stopped__ }}"
+
+              ansible.builtin.command:
+                argv: [ 'gitlab-ctl', 'stop', 'gitaly' ]
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            # A node is unhealthy once half of the Praefect nodes have failed to reach it within
+            # ten seconds. UNMEASURED: 12 tries 5 seconds apart.
+            - name: 'END | Wait Until Praefect Reports The Stopped Primary Unhealthy'
+              become: true
+              become_user: 'git'
+              changed_when: false
+              check_mode: false
+              delay: 5
+              delegate_to: "{{ __praefect__ }}"
+              register: '__proof_unhealthy__'
+              retries: 12
+              until: >-
+                __proof_unhealthy__.rc == 0
+                and __proof_unhealthy__.stdout.split('- Storage: ')[1:]
+                | select('match', '"' ~ __stopped__ ~ '"') | select('search', 'Healthy: false')
+                | list | length == 1
+
+              ansible.builtin.command:
+                argv: "{{ __metadata__ }}"
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            - name: 'PROCESS | Make One Commit To Push With The Primary Down'
+              changed_when: true
+
+              ansible.builtin.command:
+                argv:
+                  - "{{ __git__ }}"
+                  - '-C'
+                  - "{{ __proof_workspace__.path }}/ssh-clone"
+                  - '-c'
+                  - 'user.name=GitLab proof'
+                  - '-c'
+                  - 'user.email=proof@localhost'
+                  - 'commit'
+                  - '--allow-empty'
+                  - '--message'
+                  - 'Prove a push with the primary down'
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            # A write needs a primary, so the stopped one is replaced by a healthy replica, if an
+            # earlier read has not already elected one. A failure is named by the assert after
+            # it, which no_log would otherwise hide.
+            - name: 'PROCESS | Push Over HTTP With The Primary Down'
+              changed_when: __proof_failover_push__.rc == 0
+              ignore_errors: true
+              no_log: true
+              register: '__proof_failover_push__'
+
+              ansible.builtin.command:
+                argv:
+                  - '/bin/sh'
+                  - '-c'
+                  - "{{ __with_header__ }}"
+                  - 'sh'
+                  - "{{ __git__ }}"
+                  - '-C'
+                  - "{{ __proof_workspace__.path }}/ssh-clone"
+                  - 'push'
+                  - "{{ __http_url__ }}"
+                  - 'HEAD:refs/heads/main'
+                expand_argument_vars: false
+                stdin: "{{ __header__ }}"
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            - name: 'VERIFY | Require The Push With The Primary Down To Succeed'
+              ansible.builtin.assert:
+                fail_msg: >-
+                  The push over HTTP with {{ __stopped__ }}'s Gitaly stopped exited
+                  {{ __proof_failover_push__.rc | default('nothing') }}:
+                  {{ __proof_failover_push__.stderr_lines | default([]) }}
+                quiet: true
+                that: __proof_failover_push__.rc | default(1) == 0
+
+            - name: 'BEGIN | Read The Commit Pushed With The Primary Down'
+              changed_when: false
+              register: '__proof_failover_pushed__'
+
+              ansible.builtin.command:
+                argv:
+                  - "{{ __git__ }}"
+                  - '-C'
+                  - "{{ __proof_workspace__.path }}/ssh-clone"
+                  - 'rev-parse'
+                  - 'HEAD'
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            # rc-contract: git exits 0 when it read the refs and 128 on a fatal error.
+            - name: 'BEGIN | Read The Branch Over HTTP With The Primary Down'
+              changed_when: false
+              failed_when: false
+              no_log: true
+              register: '__proof_failover_branch__'
+
+              ansible.builtin.command:
+                argv:
+                  - '/bin/sh'
+                  - '-c'
+                  - "{{ __with_header__ }}"
+                  - 'sh'
+                  - "{{ __git__ }}"
+                  - 'ls-remote'
+                  - "{{ __http_url__ }}"
+                  - 'refs/heads/main'
+                expand_argument_vars: false
+                stdin: "{{ __header__ }}"
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            # rc-contract: praefect exits 0 after printing the metadata and 1 when it fails.
+            - name: 'BEGIN | Read The Replicas With The Primary Down'
+              become: true
+              become_user: 'git'
+              changed_when: false
+              check_mode: false
+              delegate_to: "{{ __praefect__ }}"
+              failed_when: false
+              register: '__proof_failover_replicas__'
+
+              ansible.builtin.command:
+                argv: "{{ __metadata__ }}"
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            - name: 'VERIFY | Require A New Primary, The Commit Over HTTP And Current Replicas'
+              vars:
+                __blocks__: "{{ __proof_failover_replicas__.stdout.split('- Storage: ')[1:] }}"
+                __stopped_block__: >-
+                  {{ __blocks__ | select('match', '"' ~ __stopped__ ~ '"') | list }}
+                __others__: >-
+                  {{ __blocks__ | reject('match', '"' ~ __stopped__ ~ '"') | list }}
+
+              ansible.builtin.assert:
+                fail_msg: >-
+                  With {{ __stopped__ }}'s Gitaly stopped, HTTP read main as
+                  '{{ __proof_failover_branch__.stdout | default('') }}' (git exited
+                  {{ __proof_failover_branch__.rc }}) after
+                  {{ __proof_failover_pushed__.stdout }} was pushed, and praefect metadata exited
+                  {{ __proof_failover_replicas__.rc }}:
+                  {{ __proof_failover_replicas__.stdout_lines }}
+                  {{ __proof_failover_replicas__.stderr_lines }}
+                quiet: true
+                that:
+                  - __proof_failover_branch__.rc == 0
+                  - >-
+                    __proof_failover_branch__.stdout.split() | first | default('')
+                    == __proof_failover_pushed__.stdout
+                  - __proof_failover_replicas__.rc == 0
+                  - >-
+                    (__proof_failover_replicas__.stdout_lines | select('match', 'Primary: ')
+                    | first).split('"')[1] != __stopped__
+                  - >-
+                    __stopped_block__ | select('search', 'Healthy: false')
+                    | select('search', 'behind by') | list | length == 1
+                  - __others__ | select('search', 'fully up to date') | list | length == 2
+
+            # rc-contract: praefect exits 0 after its report and 1 when it fails.
+            - name: 'BEGIN | Read Whether Every Repository Stays Available'
+              become: true
+              become_user: 'git'
+              changed_when: false
+              check_mode: false
+              delegate_to: "{{ __praefect__ }}"
+              failed_when: false
+              register: '__proof_failover_dataloss__'
+
+              ansible.builtin.command:
+                argv: >-
+                  {{ __praefect_cli__ + ['dataloss', '-virtual-storage', 'default'] }}
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            # Each line is indented, so the line is found in stdout, not among stdout_lines.
+            - name: 'VERIFY | Require Every Repository To Stay Available Without The Primary'
+              ansible.builtin.assert:
+                fail_msg: >-
+                  praefect dataloss exited {{ __proof_failover_dataloss__.rc }} with
+                  {{ __stopped__ }}'s Gitaly stopped:
+                  {{ __proof_failover_dataloss__.stdout_lines }}
+                  {{ __proof_failover_dataloss__.stderr_lines }}
+                quiet: true
+                that:
+                  - __proof_failover_dataloss__.rc == 0
+                  - "'All repositories are available!' in __proof_failover_dataloss__.stdout"
+
+          # Each cleanup is judged by the assert below, so one failing does not skip the next.
+          always:
+
+            - name: 'CLEANUP | Start Gitaly On The Stopped Primary Again'
+              changed_when: true
+              delegate_to: "{{ __stopped__ }}"
+              ignore_errors: true
+              register: '__proof_gitaly_started__'
+              when: __stopped__ is defined
+
+              ansible.builtin.command:
+                argv: [ 'gitlab-ctl', 'start', 'gitaly' ]
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            # UNMEASURED: a bound until a live run measures Gitaly's start.
+            - name: 'CLEANUP | Wait For Gitaly To Listen On The Stopped Primary Again'
+              delegate_to: "{{ __stopped__ }}"
+              ignore_errors: true
+              register: '__proof_gitaly_listening__'
+              when: __stopped__ is defined
+
+              ansible.builtin.wait_for:
+                active_connection_states:
+                  - 'ESTABLISHED'
+                  - 'FIN_WAIT1'
+                  - 'FIN_WAIT2'
+                  - 'SYN_RECV'
+                  - 'SYN_SENT'
+                  - 'TIME_WAIT'
+                connect_timeout: 5
+                delay: 0
+                host: '127.0.0.1'
+                msg: "Gitaly does not listen on {{ __stopped__ }} after 120 seconds."
+                port: "{{ gitlab_ports.gitaly }}"
+                sleep: 1
+                state: 'started'
+                timeout: 120
+
+            - name: 'CLEANUP | Require Gitaly To Run Again On The Stopped Primary'
+              when: __stopped__ is defined
+
+              ansible.builtin.assert:
+                fail_msg: >-
+                  Gitaly on {{ __stopped__ }} did not come back: gitlab-ctl start
+                  {{ 'failed' if __proof_gitaly_started__ is failed else 'ran' }}, and
+                  {{ __proof_gitaly_listening__.msg | default('the port answered') }}.
+                quiet: true
+                that:
+                  - __proof_gitaly_started__ is not failed
+                  - __proof_gitaly_listening__ is not failed
+
+        # The stopped node catches up once it is healthy again: Praefect replicates to it from a
+        # current replica. Every replica must be current before the proof ends, or the second
+        # converge's praefect check would warn of an unavailable repository.
+        # UNMEASURED: 30 tries 10 seconds apart.
+        - name: 'END | Wait Until The Rejoined Replica Is Reconciled'
+          become: true
+          become_user: 'git'
+          changed_when: false
+          check_mode: false
+          delay: 10
+          delegate_to: "{{ __praefect__ }}"
+          register: '__proof_reconciled__'
+          retries: 30
+          until: >-
+            __proof_reconciled__.rc == 0
+            and __proof_reconciled__.stdout.split('- Storage: ')[1:]
+            | select('search', 'Assigned: true') | select('search', 'fully up to date')
+            | select('search', 'Healthy: true') | select('search', 'Valid Primary: true')
+            | list | length == 3
+
+          ansible.builtin.command:
+            argv: "{{ __metadata__ }}"
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        # Read once: dataloss reads the same Praefect tables the wait above has just found
+        # current.
+        # rc-contract: praefect exits 0 after its report and 1 when it fails.
+        - name: 'BEGIN | Read Whether Every Repository Is Fully Available Again'
+          become: true
+          become_user: 'git'
+          changed_when: false
+          check_mode: false
+          delegate_to: "{{ __praefect__ }}"
+          failed_when: false
+          register: '__proof_dataloss_again__'
+
+          ansible.builtin.command:
+            argv: >-
+              {{ __praefect_cli__ + ['dataloss', '-virtual-storage', 'default',
+                                   '-partially-unavailable'] }}
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        # Each line is indented, so the line is found in stdout, not among stdout_lines.
+        - name: 'VERIFY | Require Every Repository To Be Fully Available Again'
+          ansible.builtin.assert:
+            fail_msg: >-
+              praefect dataloss -partially-unavailable exited
+              {{ __proof_dataloss_again__.rc }} after the rejoin:
+              {{ __proof_dataloss_again__.stdout_lines }}
+              {{ __proof_dataloss_again__.stderr_lines }}
+            quiet: true
+            that:
+              - __proof_dataloss_again__.rc == 0
+              - >-
+                'All repositories are fully available on all assigned storages!'
+                in __proof_dataloss_again__.stdout
+
+        # Praefect's own records only say the replicas should match; GitLab's rake asks each
+        # Gitaly node for its copy's checksum. It prints 'Something went wrong' and still exits 0
+        # when it cannot (praefect.rake), so the table itself is judged.
+        # rc-contract: gitlab-rake exits 0 when the task ran and 1 when it raised.
+        - name: 'BEGIN | Read Each Replica''s Checksum'
+          changed_when: false
+          check_mode: false
+          delegate_to: "{{ __deploy__ }}"
+          failed_when: false
+          register: '__proof_checksums__'
+
+          ansible.builtin.command:
+            argv:
+              - 'gitlab-rake'
+              - "gitlab:praefect:replicas[{{ __proof_project__.json.id }}]"
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        # The table is a header naming the primary's storage, marked '(primary)', then the other
+        # two, and a row of the project's name and the three checksums.
+        - name: 'VERIFY | Require Three Equal Checksums, One On Each Gitaly Node'
+          vars:
+            __table__: >-
+              {{ __proof_checksums__.stdout_lines | select('search', ' [|] ') | list }}
+            __columns__: >-
+              {{ (__table__ | first | default('')).split(' | ') | map('trim') | list }}
+            __sums__: "{{ (__table__ | last | default('')).split(' | ') | map('trim') | list }}"
+
+          ansible.builtin.assert:
+            fail_msg: >-
+              gitlab-rake exited {{ __proof_checksums__.rc }}:
+              {{ __proof_checksums__.stdout_lines }} {{ __proof_checksums__.stderr_lines[-5:] }}
+            quiet: true
+            that:
+              - __proof_checksums__.rc == 0
+              - __proof_checksums__.stdout is not search('Something went wrong')
+              - __table__ | length == 2
+              - __sums__[1:] | length == 3
+              - __sums__[1:] | reject('equalto', '') | list | length == 3
+              - __sums__[1:] | unique | length == 1
+              - __columns__[1:] | select('search', '[(]primary[)]$') | list | length == 1
+              - >-
+                __columns__[1:] | map('regex_replace', ' [(]primary[)]$', '') | sort
+                == groups['gitlab_gitaly'] | sort
+
+        #endregion --- [ Proof: Three Replicas Survive Losing The Primary ] ------------------- #
 
       # Every cleanup runs whatever the others did, and the last task names each that failed. A
       # cleanup that reads a registered result is still guarded on it, because a failed template

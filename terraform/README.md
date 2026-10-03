@@ -106,6 +106,6 @@ Reachability is **direct SSH over a launch-time public IPv4**: the shared subnet
 MapPublicIpOnLaunch assigns the address (no Elastic IP, no NAT), and at runtime the framework
 attaches the only administrative ingress: one security group scoped to the runner's validated
 public IPv4. SSM (via each instance profile's `AmazonSSMManagedInstanceCore`) is the
-administrator's backup connection, not the primary path. Whether `subnet-0dbb7770d19f253ad` in
-us-east-1a assigns a public address at launch is unproven until the first run that places a node
-there.
+administrator's backup connection, not the primary path. Both subnets assign the address at
+launch: every run since the first to place a node in us-east-1a, in `subnet-0dbb7770d19f253ad`,
+has reached it this way.

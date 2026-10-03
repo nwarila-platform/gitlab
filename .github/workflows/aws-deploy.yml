@@ -436,9 +436,13 @@ jobs:
 
       # The opt-in proof play (nessus precedent): sign-in, git over HTTP and SSH, an upload in
       # object storage and the database's settings, all through the load balancer, then losing
-      # a Rails node and its rejoin. It adds a project and stops a node, so it runs once, here,
-      # and the second converge after it still judges only what the role manages. The budget is
-      # unmeasured until the first live run.
+      # a Rails node and its rejoin, then Praefect's database and losing a repository's primary
+      # Gitaly node, a push without it and its reconciliation. It adds a project and stops a
+      # Rails node and a Gitaly node, so it runs once, here, and the second converge after it
+      # still judges only what the role manages; the proof ends with every replica current, so
+      # that converge's praefect check finds nothing outdated. The 30 minutes hold the 11 the
+      # proof took on the first Praefect stack (run 37119822220), and the 3 to 5 the cluster
+      # checks are estimated to add.
       - name: Prove the distributed shape serves through the load balancer
         timeout-minutes: 30
         working-directory: .frameworks/ansible-framework
