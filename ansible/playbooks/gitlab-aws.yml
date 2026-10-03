@@ -545,6 +545,10 @@
             sha256: '339d4a04b89e67d6108642642a68ed31c3eaae46b8c50a09a4667c4610e3520b'
             cache_dir: "{{ hostvars['localhost'].__gitlab_package_cache__.path }}"
 
+          # The 1.26 GB package is staged here, on the root volume, not in /tmp: the CIS image's
+          # /tmp did not hold it on the 2 GiB t3.small, and the copy failed with ENOSPC.
+          temp_dir_path: &gitlab_temp_dir_path '/root/gitlab-staging'
+
           node_role: 'redis'
           redis:
             port: "{{ gitlab_ports.redis }}"
@@ -598,6 +602,7 @@
       vars:
         gitlab:
           installer: *gitlab_installer
+          temp_dir_path: *gitlab_temp_dir_path
           node_role: 'gitaly'
           secrets_json: "{{ hostvars[__origin__].gitlab_shared_secrets_json }}"
           gitaly:
@@ -638,6 +643,7 @@
         gitlab:
           <<: &gitlab_rails
             installer: *gitlab_installer
+            temp_dir_path: *gitlab_temp_dir_path
             node_role: 'rails'
             # The load balancer is internal and TLS-less: every client is inside the VPC. TLS
             # arrives with a certificate.
