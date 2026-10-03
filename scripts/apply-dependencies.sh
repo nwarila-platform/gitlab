@@ -830,7 +830,8 @@ bucket_expect() { # expected-decision description principal-arn secure-transport
     local got
     local -a entries
     mapfile -t entries
-    jq -n --arg a "$5" --arg r "$6" '{Version: "2012-10-17", Statement: [{Effect: "Allow", Action: $a, Resource: $r}]}' \
+    # --policy-input-list takes a JSON list: the CLI splits a bare document on its commas.
+    jq -n --arg a "$5" --arg r "$6" '[{Version: "2012-10-17", Statement: [{Effect: "Allow", Action: $a, Resource: $r}]} | tojson]' \
         > "${WORK}/may.json"
     got="$(aws_ iam simulate-custom-policy --policy-input-list "file://${WORK}/may.json" \
            --resource-policy "file://${BUCKET_POLICY}" --caller-arn "$3" --action-names "$5" --resource-arns "$6" \

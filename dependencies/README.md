@@ -516,15 +516,12 @@ The documents use `<account-id>`, `<owner-id>`, `<repository-id>` and `<region>`
     not seen shows as an UPDATE on every plan, and an `--apply` then fails its re-plan;
   - S3's default `BlockedEncryptionTypes` on a new bucket. The encryption comparison cannot see it,
     so whether the encryption write clears it is unproven.
-- **Two simulation unknowns.** The bucket policy is simulated with the role under test as the
-  caller and as the `aws:PrincipalArn` the policy's condition reads. Sources disagree on whether
-  the simulator accepts a role as the caller: AWS's current `SimulateCustomPolicy` reference allows
-  a user, group or role, while the IAM model in the pinned AWS CLI allows only a user. Whether it
-  honours `aws:PrincipalArn` given as context is also unproven. Both check themselves, at the
-  verification that follows the writes: a rejected caller fails with `InvalidInput` naming
-  `CallerArn`, and an ignored `aws:PrincipalArn` fails the "allowed over TLS" simulations. If the
-  caller is rejected, switch `bucket_expect`'s `--caller-arn` to a placeholder IAM user in this
-  account and re-run `--apply`, which, with nothing pending, only simulates again.
+- **The bucket-policy simulation, settled live (2026-10-02).** The bucket policy is simulated
+  with the role under test as the caller and as the `aws:PrincipalArn` its condition reads. The
+  simulator accepts a role as the caller and honours `aws:PrincipalArn` given as context: the
+  instance role writing over TLS is allowed, and the same write without TLS, or from the deploy
+  role, is explicitly denied. `--policy-input-list` must be a JSON list of documents: the CLI
+  splits a bare document on its commas, and IAM rejects the pieces as invalid content.
 - **The subnet group is blocked.** `terraform/aws.tfvars` places its one system in one
   availability zone. Every plan therefore exits 1 on the `gitlab` subnet group, naming how many
   other changes are pending, and every `--apply` exits 1 on it after applying everything else,
