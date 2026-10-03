@@ -2,15 +2,16 @@
 # File: '{{ role_path }}/tasks/present_redhat.yml'
 # --- [ Description ] ------------------------------------------------------------------------- #
 #
-# Installs GitLab at the pinned version on a CIS-hardened RHEL 8 host, with every bundled service
-# (PostgreSQL, Redis, Gitaly, Puma, Sidekiq, Workhorse, NGINX) on this one node, and reconfigures
-# it.
+# Installs GitLab at the pinned version on a CIS-hardened RHEL 8 host and reconfigures it as the
+# node role it is given: every bundled service on one node (all-in-one), or one role of the
+# distributed layout (rails, gitaly, redis).
 #
-# BEGIN reads the host. PROCESS trusts the vendor key, installs the verified package, writes
-# gitlab.rb, lets Gitaly execute under fapolicyd and reconfigures, each writing only on
+# BEGIN reads the host. PROCESS trusts the vendor key, installs the verified package, writes the
+# shared secrets, the database's certificate bundle and gitlab.rb, lets Gitaly execute under
+# fapolicyd, reconfigures and installs the shared gitlab-sshd host keys, each writing only on
 # difference. END reads the version, readiness, the services and FIPS mode back from GitLab
-# itself, and the gitlab rule back from fapolicyd. It is ungated, so a converged host proves what
-# a fresh one does.
+# itself, the gitlab rule back from fapolicyd and the host keys back from gitlab-sshd. It is
+# ungated, so a converged host proves what a fresh one does.
 #
 # ============================================================================================= #
 ---
@@ -72,6 +73,99 @@
 
 #endregion --- [ Begin: Read The Host ] ------------------------------------------------------- #
 
+#region ------ [ Process: Stage The Package On The Controller ] ------------------------------- #
+
+# With a cache directory, the package is fetched once per play, not once per host: run_once, and
+# gated on every play host's own package facts rather than on the one run_once picks, so a play
+# whose first host is installed still fetches for the others. A cache already at the pin is kept.
+- name: 'PROCESS | Stage The Pinned Package In The Controller Cache'
+  become: false
+  delegate_to: 'localhost'
+  run_once: true
+  vars:
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+    __cached__: >-
+      {{ gitlab_running.installer.cache_dir }}/{{ gitlab_running.installer.key
+         | replace('<version>', gitlab_running.installer.version) | basename }}
+    __play_installs__: >-
+      {{ ansible_play_hosts | map('extract', hostvars, ['ansible_facts', 'packages'])
+         | map(attribute=gitlab_running.package, default=[]) | map('map', attribute='version')
+         | map('list') | reject('equalto', [gitlab_running.installer.version])
+         | list | length > 0 }}
+  when:
+    - gitlab_running.installer.cache_dir | length > 0
+    - __play_installs__ | bool
+  block:
+
+    - name: 'PROCESS | Read The Cached Package Digest'
+      register: '__gitlab_cached__'
+
+      ansible.builtin.stat:
+        checksum_algorithm: 'sha256'
+        follow: false
+        get_attributes: false
+        get_checksum: true
+        get_mime: false
+        get_selinux_context: false
+        path: "{{ __cached__ }}"
+
+    # The module probes the BUCKET before the object, on a bucket-level grant this deployment
+    # does not hold; skipping that probe is the documented answer. A missing object still fails
+    # loudly: the key check uses head_object, which the object grant authorizes.
+    - name: 'PROCESS | Fetch The Package Into The Controller Cache'
+      changed_when: false
+      register: '__gitlab_cache_fetch__'
+      when: __gitlab_cached__.stat.checksum | default('') != gitlab_running.installer.sha256
+
+      amazon.aws.s3_object:
+        bucket: "{{ gitlab_running.installer.bucket }}"
+        ceph: false
+        debug_botocore_endpoint_logs: false
+        dest: "{{ __cached__ }}"
+        dualstack: false
+        encrypt: true
+        encryption_mode: 'AES256'
+        expiry: 600
+        ignore_nonexistent_bucket: true
+        mode: 'get'
+        object: >-
+          {{ gitlab_running.installer.key
+             | replace('<version>', gitlab_running.installer.version) }}
+        overwrite: 'always'
+        permission: [ 'private' ]
+        prefix: ''
+        purge_tags: true
+        retries: 0
+        sig_v4: true
+        validate_bucket_name: true
+        validate_certs: true
+
+    - name: 'PROCESS | Read The Cached Package Digest Again'
+      register: '__gitlab_cache_copy__'
+      when: __gitlab_cache_fetch__ is not skipped
+
+      ansible.builtin.stat:
+        checksum_algorithm: 'sha256'
+        follow: false
+        get_attributes: false
+        get_checksum: true
+        get_mime: false
+        get_selinux_context: false
+        path: "{{ __cached__ }}"
+
+    - name: 'PROCESS | Require The Cached Package To Match Its Pin'
+      when: __gitlab_cache_fetch__ is not skipped
+
+      ansible.builtin.assert:
+        fail_msg: >-
+          The fetched package has sha256 {{ __gitlab_cache_copy__.stat.checksum }}, but the
+          playbook pins {{ gitlab_running.installer.sha256 }}. The object changed under an
+          unchanged pin; refusing to ship it.
+        quiet: true
+        that: __gitlab_cache_copy__.stat.checksum == gitlab_running.installer.sha256
+
+#endregion --- [ Process: Stage The Package On The Controller ] ------------------------------- #
+
 #region ------ [ Process: Install And Configure GitLab ] -------------------------------------- #
 
 - name: 'PROCESS | Install And Configure GitLab At The Pinned Version'
@@ -79,17 +173,25 @@
     __object__: >-
       {{ gitlab_running.installer.key | replace('<version>', gitlab_running.installer.version) }}
     __package_file__: "{{ __object__ | basename }}"
-    __fapolicyd_active__: >-
-      {{ (__gitlab_fapolicyd__.stdout | trim) == 'active' }}
     __install_required__: >-
       {{ (ansible_facts.packages[gitlab_running.package] | default([])
           | map(attribute='version') | list) != [gitlab_running.installer.version] }}
+    # The controller copy the guest receives: the shared cache, or this host's own staging.
+    __package_source__: >-
+      {{ gitlab_running.installer.cache_dir
+         if gitlab_running.installer.cache_dir | length > 0
+         else __gitlab_stage__.path | default('') }}/{{ __package_file__ }}
+    __fapolicyd_active__: >-
+      {{ (__gitlab_fapolicyd__.stdout | trim) == 'active' }}
+    # Gitaly executes the binaries it writes at run time; no other node role runs Gitaly.
+    __runs_gitaly__: "{{ gitlab_running.node_role in ['all-in-one', 'gitaly'] }}"
+    __rails__: "{{ gitlab_running.node_role == 'rails' }}"
     # What GitLab was reconfigured from: the version and the gitlab.rb written below. A
     # difference from the record on disk reconfigures.
     __record__: "{{ gitlab_running.installer.version }} {{ __gitlab_config__.stat.checksum }}"
     __recorded__: "{{ __gitlab_recorded__.content | default('') | b64decode }}"
     # Seconds gitlab-ctl reconfigure may run. UNMEASURED: a bound inside the converge step's
-    # 60-minute budget until a live run measures reconfigure.
+    # budget until a live run measures reconfigure.
     __reconfigure_bound__: 1800
     # Seconds timeout(1) waits after its SIGTERM at the bound before it sends SIGKILL.
     __reconfigure_grace__: 60
@@ -139,76 +241,74 @@
       when: __install_required__ | bool
       block:
 
-        - name: 'PROCESS | Create The Controller Staging Directory'
+        # Without a cache directory, each host stages its own controller copy.
+        - name: 'PROCESS | Stage The Package For This Host Alone'
           become: false
-          changed_when: false
-          check_mode: false
-          delegate_to: 'localhost'
-          register: '__gitlab_stage__'
-          vars:
-            ansible_python_interpreter: "{{ ansible_playbook_python }}"
-
-          ansible.builtin.tempfile:
-            path: '/tmp'
-            prefix: 'gitlab-'
-            state: 'directory'
-            suffix: ''
-
-        # The module probes the BUCKET before the object, on a bucket-level grant this deployment
-        # does not hold; skipping that probe is the documented answer. A missing object still
-        # fails loudly: the key check uses head_object, which the object grant authorizes.
-        - name: 'PROCESS | Fetch The Package To The Controller'
-          become: false
-          changed_when: false
           delegate_to: 'localhost'
           vars:
             ansible_python_interpreter: "{{ ansible_playbook_python }}"
+          when: gitlab_running.installer.cache_dir | length == 0
+          block:
 
-          amazon.aws.s3_object:
-            bucket: "{{ gitlab_running.installer.bucket }}"
-            ceph: false
-            debug_botocore_endpoint_logs: false
-            dest: "{{ __gitlab_stage__.path }}/{{ __package_file__ }}"
-            dualstack: false
-            encrypt: true
-            encryption_mode: 'AES256'
-            expiry: 600
-            ignore_nonexistent_bucket: true
-            mode: 'get'
-            object: "{{ __object__ }}"
-            overwrite: 'always'
-            permission: [ 'private' ]
-            prefix: ''
-            purge_tags: true
-            retries: 0
-            sig_v4: true
-            validate_bucket_name: true
-            validate_certs: true
+            - name: 'PROCESS | Create The Controller Staging Directory'
+              changed_when: false
+              check_mode: false
+              register: '__gitlab_stage__'
 
-        - name: 'PROCESS | Read The Controller Copy Digest'
-          become: false
-          delegate_to: 'localhost'
-          register: '__gitlab_controller_copy__'
-          vars:
-            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+              ansible.builtin.tempfile:
+                path: '/tmp'
+                prefix: 'gitlab-'
+                state: 'directory'
+                suffix: ''
 
-          ansible.builtin.stat:
-            checksum_algorithm: 'sha256'
-            follow: false
-            get_attributes: false
-            get_checksum: true
-            get_mime: false
-            get_selinux_context: false
-            path: "{{ __gitlab_stage__.path }}/{{ __package_file__ }}"
+            # The module probes the BUCKET before the object, on a bucket-level grant this
+            # deployment does not hold; skipping that probe is the documented answer. A missing
+            # object still fails loudly: the key check uses head_object, which the object grant
+            # authorizes.
+            - name: 'PROCESS | Fetch The Package To The Controller'
+              changed_when: false
 
-        - name: 'PROCESS | Require The Controller Copy To Match Its Pin'
-          ansible.builtin.assert:
-            fail_msg: >-
-              The stored package has sha256 {{ __gitlab_controller_copy__.stat.checksum }},
-              but the playbook pins {{ gitlab_running.installer.sha256 }}. The object changed
-              under an unchanged pin; refusing to ship it.
-            quiet: true
-            that: __gitlab_controller_copy__.stat.checksum == gitlab_running.installer.sha256
+              amazon.aws.s3_object:
+                bucket: "{{ gitlab_running.installer.bucket }}"
+                ceph: false
+                debug_botocore_endpoint_logs: false
+                dest: "{{ __gitlab_stage__.path }}/{{ __package_file__ }}"
+                dualstack: false
+                encrypt: true
+                encryption_mode: 'AES256'
+                expiry: 600
+                ignore_nonexistent_bucket: true
+                mode: 'get'
+                object: "{{ __object__ }}"
+                overwrite: 'always'
+                permission: [ 'private' ]
+                prefix: ''
+                purge_tags: true
+                retries: 0
+                sig_v4: true
+                validate_bucket_name: true
+                validate_certs: true
+
+            - name: 'PROCESS | Read The Controller Copy Digest'
+              register: '__gitlab_controller_copy__'
+
+              ansible.builtin.stat:
+                checksum_algorithm: 'sha256'
+                follow: false
+                get_attributes: false
+                get_checksum: true
+                get_mime: false
+                get_selinux_context: false
+                path: "{{ __gitlab_stage__.path }}/{{ __package_file__ }}"
+
+            - name: 'PROCESS | Require The Controller Copy To Match Its Pin'
+              ansible.builtin.assert:
+                fail_msg: >-
+                  The stored package has sha256 {{ __gitlab_controller_copy__.stat.checksum }},
+                  but the playbook pins {{ gitlab_running.installer.sha256 }}. The object
+                  changed under an unchanged pin; refusing to ship it.
+                quiet: true
+                that: __gitlab_controller_copy__.stat.checksum == gitlab_running.installer.sha256
 
         # Into the loader's temporary directory: root-owned, 0700, removed when the role ends.
         - name: 'PROCESS | Copy The Package To The Guest'
@@ -224,7 +324,7 @@
             mode: '0600'
             owner: 'root'
             remote_src: false
-            src: "{{ __gitlab_stage__.path }}/{{ __package_file__ }}"
+            src: "{{ __package_source__ }}"
             unsafe_writes: false
 
         - name: 'PROCESS | Read The Guest Copy Digest'
@@ -304,9 +404,74 @@
 
     #region ------ [ Process: Write The GitLab Configuration ] -------------------------------- #
 
+    # Before the first reconfigure, which would otherwise generate this node's own secrets.
+    # Written only when absent: reconfigure writes back the secrets this node's gitlab.rb sets,
+    # so the file never stays byte-equal to the copy, and replacing it would rewrite it on every
+    # converge. Root 0600, as reconfigure itself leaves it.
+    - name: 'PROCESS | Write The Shared Secrets Before The First Reconfigure'
+      no_log: true
+      register: '__gitlab_secrets_file__'
+      when: gitlab_running.secrets_json | length > 0
+
+      ansible.builtin.copy:
+        backup: false
+        content: "{{ gitlab_running.secrets_json }}"
+        decrypt: true
+        dest: '/etc/gitlab/gitlab-secrets.json'
+        follow: false
+        force: false
+        group: 'root'
+        mode: '0600'
+        owner: 'root'
+        remote_src: false
+        unsafe_writes: false
+
+    # libpq verifies the database's certificate against this bundle (sslmode verify-full).
+    - name: 'PROCESS | Write The Database Certificate Bundle'
+      register: '__gitlab_ca__'
+      when: __rails__ | bool
+
+      ansible.builtin.copy:
+        backup: false
+        decrypt: true
+        dest: '/etc/gitlab/rds-ca-bundle.pem'
+        follow: false
+        force: true
+        group: 'root'
+        mode: '0644'
+        owner: 'root'
+        remote_src: false
+        src: "{{ gitlab_running.database.ca_file }}"
+        unsafe_writes: false
+
+    - name: 'PROCESS | Read The Database Certificate Bundle Digest'
+      register: '__gitlab_ca_file__'
+      when: __rails__ | bool
+
+      ansible.builtin.stat:
+        checksum_algorithm: 'sha256'
+        follow: false
+        get_attributes: false
+        get_checksum: true
+        get_mime: false
+        get_selinux_context: false
+        path: '/etc/gitlab/rds-ca-bundle.pem'
+
+    - name: 'PROCESS | Require The Pinned Database Certificate Bundle'
+      when: __rails__ | bool
+
+      ansible.builtin.assert:
+        fail_msg: >-
+          /etc/gitlab/rds-ca-bundle.pem has sha256 {{ __gitlab_ca_file__.stat.checksum }}, but
+          the role pins {{ gitlab_running.database.ca_sha256 }}: the bundle in files/ changed
+          without its digest.
+        quiet: true
+        that: __gitlab_ca_file__.stat.checksum == gitlab_running.database.ca_sha256
+
     # 0600 as the package's own post-install step leaves it: reconfigure, as root, is its only
-    # reader.
+    # reader. It holds credentials, so no diff of it is ever shown.
     - name: 'PROCESS | Write gitlab.rb'
+      diff: false
       register: '__gitlab_rb__'
 
       ansible.builtin.template:
@@ -358,11 +523,14 @@
     # GitLab's documented rule: Gitaly unpacks its runtime binaries under its own directory and
     # executes them, and no RPM digest can vouch for a file written at run time. dir= matches the
     # whole subtree, which belongs to the git account that Puma and Workhorse, the services
-    # behind GitLab's network listener, also run as: code running as git can write an ELF there
-    # and execute it, so fapolicyd no longer limits native execution for that account under that
-    # subtree. Numbered before the default rules' deny of untrusted execution, so it applies.
+    # behind GitLab's network listener, also run as on a single node: code running as git can
+    # write an ELF there and execute it, so fapolicyd no longer limits native execution for that
+    # account under that subtree. Numbered before the default rules' deny of untrusted execution,
+    # so it applies. Only a node that runs Gitaly gets it.
     - name: 'PROCESS | Allow Gitaly To Execute Its Runtime Binaries'
-      when: __fapolicyd_active__ | bool
+      when:
+        - __fapolicyd_active__ | bool
+        - __runs_gitaly__ | bool
 
       ansible.builtin.copy:
         backup: false
@@ -383,7 +551,9 @@
       changed_when: false
       check_mode: false
       register: '__gitlab_rules__'
-      when: __fapolicyd_active__ | bool
+      when:
+        - __fapolicyd_active__ | bool
+        - __runs_gitaly__ | bool
 
       ansible.builtin.command:
         argv: [ 'fapolicyd-cli', '--list' ]
@@ -397,6 +567,7 @@
       changed_when: true
       when:
         - __fapolicyd_active__ | bool
+        - __runs_gitaly__ | bool
         - gitlab_running.fapolicyd_rule not in __gitlab_rules__.stdout
 
       ansible.builtin.command:
@@ -407,16 +578,308 @@
 
     #endregion --- [ Process: Let Gitaly Execute Under fapolicyd ] ---------------------------- #
 
+    #region ------ [ Process: Create GitLab's Database Role And Database ] -------------------- #
+
+    # Before the first reconfigure, which migrates as GitLab's own role into its own database.
+    # The master user creates both, makes itself a member of the role so that it may create the
+    # role's database and, through the role's ownership of the database's public schema, the
+    # extensions in it. Read first, and only what is absent is created: there is no CREATE ... IF
+    # NOT EXISTS for a role or a database, and the role's password verifier is salted at random,
+    # so it is never set twice.
+    #
+    # The master password reaches psql only on its standard input, as the first line, read into
+    # PGPASSWORD by the shell that execs psql; the SQL follows on the same input. Never argv, a
+    # file or Ansible's environment keyword, which lands on the command line sudo logs. psql runs
+    # without a psqlrc (-X) and stops at the first error. no_log would also hide why psql failed,
+    # so each call is judged by the assert after it, which shows psql's own messages with any
+    # verifier redacted: they never carry the password.
+    - name: 'PROCESS | Create GitLab''s Database Role And Database'
+      vars:
+        __bootstrap__: "{{ gitlab_running.database_bootstrap }}"
+        __role__: "{{ gitlab_running.database.username }}"
+        __psql__:
+          - '/bin/sh'
+          - '-c'
+          - 'IFS= read -r PGPASSWORD && export PGPASSWORD && exec "$@"'
+          - 'psql'
+          - '/opt/gitlab/embedded/bin/psql'
+          - '-X'
+          - '-w'
+          - '-q'
+          - '-A'
+          - '-t'
+          - '-v'
+          - 'ON_ERROR_STOP=1'
+          - '-f'
+          - '-'
+          - '-d'
+        __conninfo__: >-
+          host={{ gitlab_running.database.host }} port={{ gitlab_running.database.port }}
+          user={{ __bootstrap__.master_username }} sslmode=verify-full
+          sslrootcert=/etc/gitlab/rds-ca-bundle.pem
+        # Whether the master user may act as the role: a membership with INHERIT and SET.
+        __membership__: >-
+          EXISTS (SELECT FROM pg_auth_members m
+                  JOIN pg_roles granted ON granted.oid = m.roleid
+                  JOIN pg_roles holder ON holder.oid = m.member
+                  WHERE granted.rolname = '{{ __role__ }}' AND holder.rolname = current_user
+                    AND m.inherit_option AND m.set_option)
+        __extensions__: >-
+          (SELECT coalesce(json_agg(extname ORDER BY extname), '[]') FROM pg_extension)
+        # Matches a SCRAM verifier; the asserts redact it from psql's stderr.
+        __verifier__: 'SCRAM-SHA-256[$][A-Za-z0-9+/=:$]*'
+      when:
+        - __rails__ | bool
+        - gitlab_running.database_bootstrap.enabled | bool
+      block:
+
+        # rc-contract: psql(1) exits 0 on success, 1 on its own fatal error, 2 when the
+        # connection fails, and 3 when a statement fails under ON_ERROR_STOP.
+        - name: 'PROCESS | Read Whether GitLab''s Role And Database Exist'
+          changed_when: false
+          check_mode: false
+          failed_when: false
+          no_log: true
+          register: '__gitlab_db_cluster__'
+
+          ansible.builtin.command:
+            argv: "{{ __psql__ + [__conninfo__ ~ ' dbname=' ~ __bootstrap__.master_database] }}"
+            expand_argument_vars: false
+            stdin: |-
+              {{ __bootstrap__.master_password }}
+              SELECT json_build_object(
+                'role', EXISTS (SELECT FROM pg_roles WHERE rolname = '{{ __role__ }}'),
+                'membership', {{ __membership__ }},
+                'database', EXISTS (SELECT FROM pg_database
+                                    WHERE datname = '{{ gitlab_running.database.name }}'));
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'PROCESS | Require psql To Have Read The Role And The Database'
+          ansible.builtin.assert:
+            fail_msg: >-
+              psql exited {{ __gitlab_db_cluster__.rc }} reading the role and the database:
+              {{ __gitlab_db_cluster__.stderr_lines | map('regex_replace', __verifier__,
+              '<verifier>') | list }}
+            quiet: true
+            that: __gitlab_db_cluster__.rc == 0
+
+        # PostgreSQL's SCRAM-SHA-256 verifier (RFC 7677; PostgreSQL's scram-common.c): 4096
+        # PBKDF2-HMAC-SHA-256 iterations over a random 16-byte salt, then the HMAC-derived stored
+        # and server keys. Computed on the host from the password on stdin, so the password is
+        # never sent to the database at all, and a logged statement can only ever show the
+        # verifier. validate.yml holds the password to letters and digits, so SASLprep, which
+        # PostgreSQL applies first, leaves it unchanged.
+        # rc-contract: python3(1) exits 0 after printing, and 1 on an uncaught exception.
+        - name: 'PROCESS | Compute The Role''s Password Verifier'
+          changed_when: false
+          failed_when: false
+          no_log: true
+          register: '__gitlab_db_verifier__'
+          when: not (__gitlab_db_cluster__.stdout | from_json).role
+
+          ansible.builtin.command:
+            argv:
+              - "{{ ansible_python_interpreter }}"
+              - '-c'
+              - |
+                import base64, hashlib, hmac, os, sys
+                password = sys.stdin.readline().rstrip('\n').encode()
+                salt = os.urandom(16)
+                salted = hashlib.pbkdf2_hmac('sha256', password, salt, 4096)
+                client = hmac.new(salted, b'Client Key', 'sha256').digest()
+                server = hmac.new(salted, b'Server Key', 'sha256').digest()
+                stored = hashlib.sha256(client).digest()
+                b64 = lambda raw: base64.b64encode(raw).decode()
+                print(f'SCRAM-SHA-256$4096:{b64(salt)}${b64(stored)}:{b64(server)}')
+            expand_argument_vars: false
+            stdin: "{{ gitlab_running.database.password }}"
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'PROCESS | Require The Password Verifier'
+          when: __gitlab_db_verifier__ is not skipped
+
+          ansible.builtin.assert:
+            fail_msg: >-
+              Computing the password verifier exited {{ __gitlab_db_verifier__.rc }}:
+              {{ __gitlab_db_verifier__.stderr_lines }}
+            quiet: true
+            that: __gitlab_db_verifier__.stdout is match('SCRAM-SHA-256[$]4096:')
+
+        # CREATE DATABASE ... OWNER needs the master user to be able to act as the owner, so the
+        # membership comes first; each statement commits on its own. A failure is named by the
+        # assert that follows, which no_log would otherwise hide.
+        - name: 'PROCESS | Create What Is Absent Of The Role, Its Membership And Its Database'
+          changed_when: true
+          ignore_errors: true
+          no_log: true
+          register: '__gitlab_db_created__'
+          vars:
+            __state__: "{{ __gitlab_db_cluster__.stdout | from_json }}"
+          when: not (__state__.role and __state__.membership and __state__.database)
+
+          ansible.builtin.command:
+            argv: "{{ __psql__ + [__conninfo__ ~ ' dbname=' ~ __bootstrap__.master_database] }}"
+            expand_argument_vars: false
+            stdin: |-
+              {{ __bootstrap__.master_password }}
+              {% if not __state__.role %}
+              CREATE ROLE {{ __role__ }} LOGIN NOSUPERUSER NOCREATEROLE NOCREATEDB
+                PASSWORD '{{ __gitlab_db_verifier__.stdout }}';
+              {% endif %}
+              {% if not __state__.membership %}
+              GRANT {{ __role__ }} TO CURRENT_USER WITH INHERIT TRUE, SET TRUE;
+              {% endif %}
+              {% if not __state__.database %}
+              CREATE DATABASE {{ gitlab_running.database.name }} OWNER {{ __role__ }};
+              {% endif %}
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'PROCESS | Require psql To Have Created What Was Absent'
+          when: __gitlab_db_created__ is not skipped
+
+          ansible.builtin.assert:
+            fail_msg: >-
+              psql exited {{ __gitlab_db_created__.rc }} creating the role, its membership or
+              its database: {{ __gitlab_db_created__.stderr_lines | map('regex_replace',
+              __verifier__, '<verifier>') | list }}
+            quiet: true
+            that: __gitlab_db_created__.rc == 0
+
+        # rc-contract: psql(1) exits 0 on success, 1 on its own fatal error, 2 when the
+        # connection fails, and 3 when a statement fails under ON_ERROR_STOP.
+        - name: 'PROCESS | Read GitLab''s Database And Its Extensions'
+          changed_when: false
+          check_mode: false
+          failed_when: false
+          no_log: true
+          register: '__gitlab_db_database__'
+
+          ansible.builtin.command:
+            argv: "{{ __psql__ + [__conninfo__ ~ ' dbname=' ~ gitlab_running.database.name] }}"
+            expand_argument_vars: false
+            stdin: |-
+              {{ __bootstrap__.master_password }}
+              SELECT json_build_object(
+                'membership', {{ __membership__ }},
+                'owner', (SELECT pg_get_userbyid(datdba) FROM pg_database
+                          WHERE datname = current_database()),
+                'extensions', {{ __extensions__ }});
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'PROCESS | Require psql To Have Read The Database And Its Extensions'
+          ansible.builtin.assert:
+            fail_msg: >-
+              psql exited {{ __gitlab_db_database__.rc }} reading the database:
+              {{ __gitlab_db_database__.stderr_lines | map('regex_replace', __verifier__,
+              '<verifier>') | list }}
+            quiet: true
+            that: __gitlab_db_database__.rc == 0
+
+        # In the database's public schema, which its owner, the role, owns through
+        # pg_database_owner; the master user acts through its membership in the role. A failure
+        # is named by the assert that follows, which no_log would otherwise hide.
+        - name: 'PROCESS | Create The Absent Extensions As The Master User'
+          changed_when: true
+          ignore_errors: true
+          no_log: true
+          register: '__gitlab_db_extensions_created__'
+          vars:
+            __missing__: >-
+              {{ __bootstrap__.extensions
+                 | difference((__gitlab_db_database__.stdout | from_json).extensions) }}
+          when: __missing__ | length > 0
+
+          ansible.builtin.command:
+            argv: "{{ __psql__ + [__conninfo__ ~ ' dbname=' ~ gitlab_running.database.name] }}"
+            expand_argument_vars: false
+            stdin: |-
+              {{ __bootstrap__.master_password }}
+              {% for extension in __missing__ %}
+              CREATE EXTENSION IF NOT EXISTS {{ extension }};
+              {% endfor %}
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'PROCESS | Require psql To Have Created The Extensions'
+          when: __gitlab_db_extensions_created__ is not skipped
+
+          ansible.builtin.assert:
+            fail_msg: >-
+              psql exited {{ __gitlab_db_extensions_created__.rc }} creating the extensions:
+              {{ __gitlab_db_extensions_created__.stderr_lines | map('regex_replace',
+              __verifier__, '<verifier>') | list }}
+            quiet: true
+            that: __gitlab_db_extensions_created__.rc == 0
+
+        # rc-contract: psql(1) exits 0 on success, 1 on its own fatal error, 2 when the
+        # connection fails, and 3 when a statement fails under ON_ERROR_STOP.
+        - name: 'PROCESS | Read The Extensions Again'
+          changed_when: false
+          check_mode: false
+          failed_when: false
+          no_log: true
+          register: '__gitlab_db_extensions__'
+          when: __gitlab_db_extensions_created__ is changed
+
+          ansible.builtin.command:
+            argv: "{{ __psql__ + [__conninfo__ ~ ' dbname=' ~ gitlab_running.database.name] }}"
+            expand_argument_vars: false
+            stdin: |-
+              {{ __bootstrap__.master_password }}
+              SELECT {{ __extensions__ }};
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'PROCESS | Require psql To Have Read The Extensions Again'
+          when: __gitlab_db_extensions__ is not skipped
+
+          ansible.builtin.assert:
+            fail_msg: >-
+              psql exited {{ __gitlab_db_extensions__.rc }} reading the extensions again:
+              {{ __gitlab_db_extensions__.stderr_lines | map('regex_replace', __verifier__,
+              '<verifier>') | list }}
+            quiet: true
+            that: __gitlab_db_extensions__.rc == 0
+
+        - name: 'PROCESS | Require GitLab''s Role To Own Its Database With Every Extension'
+          vars:
+            __database__: "{{ __gitlab_db_database__.stdout | from_json }}"
+            __extensions_now__: >-
+              {{ (__gitlab_db_extensions__.stdout | from_json)
+                 if __gitlab_db_extensions_created__ is changed
+                 else __database__.extensions }}
+
+          ansible.builtin.assert:
+            fail_msg: >-
+              {{ gitlab_running.database.name }} is owned by '{{ __database__.owner }}' (declared
+              '{{ __role__ }}'); the master user's membership in {{ __role__ }} with INHERIT and
+              SET is {{ __database__.membership }}; the extensions
+              {{ __bootstrap__.extensions | difference(__extensions_now__) }} are missing.
+            quiet: true
+            that:
+              - __database__.owner == __role__
+              - __database__.membership | bool
+              - __bootstrap__.extensions | difference(__extensions_now__) | length == 0
+
+    #endregion --- [ Process: Create GitLab's Database Role And Database ] -------------------- #
+
     #region ------ [ Process: Reconfigure GitLab ] -------------------------------------------- #
 
     # Bounded by timeout(1) in argv, not with async: async stages its wrapper as a file and turns
     # pipelining off, and fapolicyd denies the staged file. The bound is __reconfigure_bound__.
-    # Also run when this converge rewrote gitlab.rb: the conventional apply-on-change trigger.
+    # Also run when this converge rewrote gitlab.rb, wrote the shared secrets or changed the
+    # certificate bundle: the conventional apply-on-change trigger.
     - name: 'PROCESS | Reconfigure GitLab'
       changed_when: true
       failed_when: false
       register: '__gitlab_reconfigure__'
-      when: (__recorded__ != __record__) or (__gitlab_rb__ is changed)
+      when: >-
+        (__recorded__ != __record__) or (__gitlab_rb__ is changed)
+        or (__gitlab_secrets_file__ is changed) or (__gitlab_ca__ is changed)
 
       ansible.builtin.command:
         argv:
@@ -468,6 +931,66 @@
 
     #endregion --- [ Process: Reconfigure GitLab ] -------------------------------------------- #
 
+    #region ------ [ Process: Serve The Shared gitlab-sshd Host Keys ] ------------------------ #
+
+    # Every Rails node must present the same host keys, or a client that reached one node through
+    # the load balancer would refuse the other. The first reconfigure generates the node's own
+    # and creates the git account they belong to, so the shared ones replace them after it,
+    # compared by content. No decrypt: with remote_src the action passes every option to the
+    # module, which refuses it.
+    - name: 'PROCESS | Install The Shared gitlab-sshd Private Host Keys'
+      loop: [ 'ecdsa', 'rsa' ]
+      loop_control: { label: "{{ item }}" }
+      no_log: true
+      register: '__gitlab_sshd_private__'
+      when: __rails__ | bool
+
+      ansible.builtin.copy:
+        backup: false
+        dest: "/var/opt/gitlab/gitlab-sshd/ssh_host_{{ item }}_key"
+        follow: false
+        force: true
+        group: 'git'
+        mode: '0600'
+        owner: 'git'
+        remote_src: true
+        src: "{{ gitlab_running.sshd.host_key_source_dir }}/ssh_host_{{ item }}_key"
+        unsafe_writes: false
+
+    # No decrypt: with remote_src the action passes every option to the module, which refuses it.
+    - name: 'PROCESS | Install The Shared gitlab-sshd Public Host Keys'
+      loop: [ 'ecdsa', 'rsa' ]
+      loop_control: { label: "{{ item }}" }
+      register: '__gitlab_sshd_public__'
+      when: __rails__ | bool
+
+      ansible.builtin.copy:
+        backup: false
+        dest: "/var/opt/gitlab/gitlab-sshd/ssh_host_{{ item }}_key.pub"
+        follow: false
+        force: true
+        group: 'git'
+        mode: '0644'
+        owner: 'git'
+        remote_src: true
+        src: "{{ gitlab_running.sshd.host_key_source_dir }}/ssh_host_{{ item }}_key.pub"
+        unsafe_writes: false
+
+    # gitlab-sshd reads its host keys only when it starts.
+    - name: 'PROCESS | Restart gitlab-sshd On The Shared Host Keys'
+      changed_when: true
+      when:
+        - __rails__ | bool
+        - (__gitlab_sshd_private__ is changed) or (__gitlab_sshd_public__ is changed)
+
+      ansible.builtin.command:
+        argv: [ 'gitlab-ctl', 'restart', 'gitlab-sshd' ]
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    #endregion --- [ Process: Serve The Shared gitlab-sshd Host Keys ] ------------------------ #
+
   always:
 
     - name: 'PROCESS | Remove The Controller Staging Directory'
@@ -498,6 +1021,8 @@
     __release__: "{{ gitlab_running.package }} {{ gitlab_running.installer.version }}"
     __fapolicyd_active__: >-
       {{ (__gitlab_fapolicyd__.stdout | trim) == 'active' }}
+    __runs_gitaly__: "{{ gitlab_running.node_role in ['all-in-one', 'gitaly'] }}"
+    __rails__: "{{ gitlab_running.node_role == 'rails' }}"
   block:
 
     - name: 'END | Read The Version GitLab Installed'
@@ -511,14 +1036,15 @@
         stdin_add_newline: true
         strip_empty_ends: true
 
-    # all=1 adds the database, Redis and Gitaly checks to the controller's own. Puma boots for
-    # minutes after a reconfigure. 60 tries 10 seconds apart are UNMEASURED: a bound until a live
-    # run measures the boot.
+    # all=1 adds the database, Redis and Gitaly checks to the controller's own, so on a Rails
+    # node it proves that node reaches all three. Puma boots for minutes after a reconfigure.
+    # 60 tries 10 seconds apart are UNMEASURED: a bound until a live run measures the boot.
     - name: 'END | Wait For GitLab To Report Ready'
       delay: 10
       register: '__gitlab_ready__'
       retries: 60
       until: ((__gitlab_ready__.json | default({})).status | default('')) == 'ok'
+      when: gitlab_running.node_role in ['all-in-one', 'rails']
 
       ansible.builtin.uri:
         body_format: 'raw'
@@ -540,6 +1066,34 @@
         use_netrc: true
         use_proxy: true
         validate_certs: true
+
+    # The port each other role serves its peers on: gitlab-sshd on a Rails node, Gitaly and
+    # Redis on theirs. UNMEASURED: a bound until a live run measures the start.
+    - name: 'END | Wait For The Node Role To Listen'
+      when: gitlab_running.node_role in ['rails', 'gitaly', 'redis']
+      vars:
+        __port__: >-
+          {{ {'rails': gitlab_running.sshd.port, 'gitaly': 8075,
+              'redis': gitlab_running.redis.port}[gitlab_running.node_role] }}
+
+      ansible.builtin.wait_for:
+        active_connection_states:
+          - 'ESTABLISHED'
+          - 'FIN_WAIT1'
+          - 'FIN_WAIT2'
+          - 'SYN_RECV'
+          - 'SYN_SENT'
+          - 'TIME_WAIT'
+        connect_timeout: 5
+        delay: 0
+        host: '127.0.0.1'
+        msg: >-
+          Nothing listens on 127.0.0.1:{{ __port__ }} after 120 seconds, where the
+          {{ gitlab_running.node_role }} node serves its peers.
+        port: "{{ __port__ | int }}"
+        sleep: 1
+        state: 'started'
+        timeout: 120
 
     # Read once GitLab reports ready, so it samples a settled node. runit reports one line per
     # service, 'run:' for a service that is up; the exit status alone is not trusted to say every
@@ -598,7 +1152,9 @@
       changed_when: false
       check_mode: false
       register: '__gitlab_rules_loaded__'
-      when: __fapolicyd_active__ | bool
+      when:
+        - __fapolicyd_active__ | bool
+        - __runs_gitaly__ | bool
 
       ansible.builtin.command:
         argv: [ 'fapolicyd-cli', '--list' ]
@@ -607,7 +1163,9 @@
         strip_empty_ends: true
 
     - name: 'END | Require The Gitaly Rule In The Compiled Rules'
-      when: __fapolicyd_active__ | bool
+      when:
+        - __fapolicyd_active__ | bool
+        - __runs_gitaly__ | bool
 
       ansible.builtin.assert:
         fail_msg: >-
@@ -615,5 +1173,52 @@
           {{ __gitlab_rules_loaded__.stdout_lines }}
         quiet: true
         that: gitlab_running.fapolicyd_rule in __gitlab_rules_loaded__.stdout
+
+    # The fingerprints of the key files gitlab-sshd loads and of their shared source, which the
+    # playbook proved equal on every Rails node.
+    - name: 'END | Read The Fingerprints Of The gitlab-sshd Host Key Files'
+      changed_when: false
+      check_mode: false
+      loop: >-
+        {{ ['ecdsa', 'rsa']
+           | product(['/var/opt/gitlab/gitlab-sshd', gitlab_running.sshd.host_key_source_dir])
+           | list }}
+      loop_control: { label: "{{ item[1] }}/ssh_host_{{ item[0] }}_key.pub" }
+      register: '__gitlab_sshd_fingerprints__'
+      when: __rails__ | bool
+
+      ansible.builtin.command:
+        argv: [ 'ssh-keygen', '-l', '-f', "{{ item[1] }}/ssh_host_{{ item[0] }}_key.pub" ]
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    # ssh-keygen -l prints '<bits> <fingerprint> <comment> (<type>)'. Only the fingerprint is
+    # compared: what stands in for a missing comment differs between OpenSSH releases.
+    - name: 'END | Require gitlab-sshd''s Host Key Files To Be The Shared Ones'
+      vars:
+        __installed__: >-
+          {{ __gitlab_sshd_fingerprints__.results
+             | selectattr('item.1', 'equalto', '/var/opt/gitlab/gitlab-sshd')
+             | map(attribute='stdout') | map('split', ' ') | map(attribute=1) | list }}
+        __source__: >-
+          {{ __gitlab_sshd_fingerprints__.results
+             | rejectattr('item.1', 'equalto', '/var/opt/gitlab/gitlab-sshd')
+             | map(attribute='stdout') | map('split', ' ') | map(attribute=1) | list }}
+        __rsa__: >-
+          {{ __gitlab_sshd_fingerprints__.results
+             | selectattr('item.0', 'equalto', 'rsa')
+             | map(attribute='stdout') | map('split', ' ') | map('first') | map('int') | list }}
+      when: __rails__ | bool
+
+      ansible.builtin.assert:
+        fail_msg: >-
+          gitlab-sshd's host key files hold {{ __installed__ }}, but the shared keys in
+          {{ gitlab_running.sshd.host_key_source_dir }} are {{ __source__ }}; an RSA host key
+          must be at least 3072 bits (read {{ __rsa__ }}).
+        quiet: true
+        that:
+          - __installed__ == __source__
+          - __rsa__ | reject('ge', 3072) | list | length == 0
 
 #endregion --- [ End: Prove GitLab Runs As Declared ] ----------------------------------------- #

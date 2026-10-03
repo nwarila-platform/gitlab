@@ -5,9 +5,10 @@
 # Lowest-precedence configuration for the gitlab role. The v3 loader merges the OS overlay in
 # vars/ over this map and publishes the result as 'gitlab_running'; tasks read only that.
 #
-# Universally safe values live here: the package, its object key, the vendor signing key and the
-# fapolicyd rule. The bucket carries the account id, the version and its digest are the pin a
-# reader should find in the playbook, and the external URL is the node's own address, so all four
+# Universally safe values live here: the package, its object key, the vendor signing key, the
+# fapolicyd rule, the RDS certificate bundle and the node role a bare node takes. The bucket
+# carries the account id, the version and its digest are the pin a reader should find in the
+# playbook, and the addresses, credentials and tokens belong to one deployment, so all of them
 # are declared empty and the PLAYBOOK supplies them (meta/main.yml, tasks/validate.yml).
 #
 # ============================================================================================= #
@@ -20,11 +21,16 @@ gitlab_defaults:
   # The token <version> is replaced with installer.version, so a bump is one version and one
   # digest; the controller fetches it and the guest verifies the digest and the vendor signature
   # before dnf installs it.
+  #
+  # cache_dir is a controller directory the playbook owns: the package is fetched into it once
+  # for every play that installs, and the role never removes it. Empty fetches into a staging
+  # directory of the host's own, removed once the package is copied.
   installer:
     bucket: ''
     key: 'GitLab Inc/GitLab FIPS/<version>/GitLab-Inc_GitLab-FIPS_<version>-el8_x64.rpm'
     version: ''
     sha256: ''
+    cache_dir: ''
 
   # The package that object delivers: GitLab's FIPS build, which uses the system OpenSSL a host
   # in FIPS mode requires. It is an EE build, and without a licence it runs as the Free tier.
@@ -42,17 +48,122 @@ gitlab_defaults:
 
   #endregion --- [ Package Signing Key ] ------------------------------------------------------ #
 
+  #region ------ [ Node Role ] ---------------------------------------------------------------- #
+
+  # What this node runs. 'all-in-one' is every bundled service on one node, and renders exactly
+  # the configuration a single node was proven with. The distributed layout's roles are 'rails'
+  # (Puma, Sidekiq, Workhorse, NGINX and gitlab-sshd), 'gitaly' and 'redis'.
+  node_role: 'all-in-one'
+
+  #endregion --- [ Node Role ] ---------------------------------------------------------------- #
+
   #region ------ [ Configuration ] ------------------------------------------------------------ #
 
   # The URL GitLab serves itself at, written into gitlab.rb inside a Ruby single-quoted string.
+  # all-in-one and rails only.
   external_url: ''
 
+  # Whether this node's reconfigure migrates the database. Exactly one Rails node does, so a
+  # node migrates only when it is told to.
+  auto_migrate: false
+
+  # The content of the first configured node's /etc/gitlab/gitlab-secrets.json, written to this
+  # node only when it has none, before its first reconfigure, so every node signs and encrypts
+  # with the same keys. Empty writes nothing and the node generates its own.
+  secrets_json: ''
+
+  # rails: the networks allowed to read the health endpoints, the load balancer's among them.
+  monitoring_whitelist: []
+
   #endregion --- [ Configuration ] ------------------------------------------------------------ #
+
+  #region ------ [ Rails: Database ] ---------------------------------------------------------- #
+
+  # The external PostgreSQL GitLab connects to as its own unprivileged role. The connection
+  # requires TLS and verifies the server against the RDS certificate bundle in files/, pinned by
+  # its SHA-256: the us-east-1 bundle, which holds rds-ca-rsa2048-g1, the authority a new
+  # instance is issued from. The server's own statement_timeout bounds every statement.
+  database:
+    host: ''
+    port: 5432
+    name: ''
+    username: ''
+    password: ''
+    ca_file: 'rds-ca-bundle.pem'
+    ca_sha256: 'b1711d12bae51838581281e23b6cb97b1074016873b4dafc80ed14002462dd77'
+
+  # One Rails node creates GitLab's role and database before its first reconfigure, as the
+  # database's master user, whose credentials only that node is given. master_database is the
+  # database the master user connects to first: RDS's initial one. GitLab connects only as its
+  # own role, which owns its database and holds no superuser, role or database creation right.
+  # The extensions are created by the master user, so GitLab needs no rds_superuser for them:
+  # GitLab's required set, and pgaudit, which the parameter group loads for DDL and role
+  # auditing.
+  database_bootstrap:
+    enabled: false
+    master_database: ''
+    master_username: ''
+    master_password: ''
+    extensions: [ 'amcheck', 'btree_gist', 'pg_trgm', 'pgaudit', 'plpgsql' ]
+
+  #endregion --- [ Rails: Database ] ---------------------------------------------------------- #
+
+  #region ------ [ Rails: Redis And Gitaly ] -------------------------------------------------- #
+
+  # The Redis node the Rails nodes share. The password is a run secret.
+  redis:
+    host: ''
+    port: 6379
+    password: ''
+
+  # rails: address is where Gitaly listens, tcp://<address>:8075. gitaly: internal_api_url is
+  # where it reaches GitLab's internal API. Both share the token.
+  gitaly:
+    address: ''
+    token: ''
+    internal_api_url: ''
+
+  #endregion --- [ Rails: Redis And Gitaly ] -------------------------------------------------- #
+
+  #region ------ [ Rails: Object Storage ] ---------------------------------------------------- #
+
+  # One bucket, each object type under '<prefix>/<type>', reached with the instance profile.
+  # Pages is switched off: it is not deployed. The container registry and backups cannot use
+  # this consolidated form, and neither is configured.
+  object_store:
+    bucket: ''
+    prefix: ''
+    region: ''
+    types:
+      - 'artifacts'
+      - 'external_diffs'
+      - 'lfs'
+      - 'uploads'
+      - 'packages'
+      - 'dependency_proxy'
+      - 'terraform_state'
+      - 'ci_secure_files'
+      - 'agent_plan_content'
+      - 'ci_catalog_bundles'
+
+  #endregion --- [ Rails: Object Storage ] ---------------------------------------------------- #
+
+  #region ------ [ Rails: gitlab-sshd ] ------------------------------------------------------- #
+
+  # Git over SSH is served by gitlab-sshd on this port, never by the host's own sshd. Its host
+  # keys are the shared ECDSA and RSA pair in host_key_source_dir, a root-only directory the
+  # playbook fills on every Rails node, so each node presents the same keys.
+  sshd:
+    port: 2222
+    host_key_source_dir: ''
+
+  #endregion --- [ Rails: gitlab-sshd ] ------------------------------------------------------- #
 
   #region ------ [ fapolicyd ] ---------------------------------------------------------------- #
 
   # GitLab's documented rule letting Gitaly execute the binaries it writes at run time. The role
   # writes it into rules.d and finds it again, by this text, in the rules fapolicyd lists.
+  # all-in-one and gitaly only: no other node runs Gitaly.
   fapolicyd_rule: >-
     allow perm=any all : ftype=application/x-executable dir=/var/opt/gitlab/gitaly/
 

@@ -9,11 +9,16 @@
 # =========================================================================================== #
 ---
 #region ------ [ This Repository ] ------------------------------------------------------------ #
-# The play addresses a group, not a run. Terraform stamps each system with a Function tag, so the
-# group is the set of functions whose hosts this playbook configures -- add a function to the list
-# to have its hosts join, and give a second group its own list to split a deployment by role.
+# The plays address groups, not a run. Terraform stamps each system with a Function tag: each node
+# role is the group of its one function, and gitlab_servers is every function this playbook
+# configures -- add a function to that list to have its hosts join.
 groups:
-  gitlab_servers: "((aws_ec2_tags | default(aws_tags)).Function | default('', true)) in ['gitlab']"
+  gitlab_servers: >-
+    ((aws_ec2_tags | default(aws_tags)).Function | default('', true))
+    in ['gitlab-rails', 'gitlab-gitaly', 'gitlab-redis']
+  gitlab_rails: "((aws_ec2_tags | default(aws_tags)).Function | default('', true)) == 'gitlab-rails'"
+  gitlab_gitaly: "((aws_ec2_tags | default(aws_tags)).Function | default('', true)) == 'gitlab-gitaly'"
+  gitlab_redis: "((aws_ec2_tags | default(aws_tags)).Function | default('', true)) == 'gitlab-redis'"
 
 #endregion --- [ This Repository ] ------------------------------------------------------------ #
 

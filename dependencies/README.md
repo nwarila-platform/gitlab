@@ -471,28 +471,21 @@ The documents use `<account-id>`, `<owner-id>`, `<repository-id>` and `<region>`
     denied. If it is not, such a create runs on the default values, so this guard too would fail
     open. Once the framework pin passes `parameter_group_name`, every run names `gitlab`, so only
     a create that skips it would show this;
-  - whether a Multi-AZ create carries `rds:MultiAz`. If it does not, this pin admits Multi-AZ: it
-    is the other guard here that fails open. A pair of requests settles it without creating
-    anything. They run as a one-off step in an AWS Deploy run dispatched on `main`, the only place
-    the runner role can be assumed, before Multi-AZ is enabled and while the `gitlab` subnet group
-    does not exist, that is, before the first apply that creates it, which happens once
-    `terraform/aws.tfvars` places systems in two zones; afterwards the pair cannot run without
-    removing the group, because the control below would create a database.
-    - Both are `CreateDBInstance` with the declared shape and every identity request tag, naming
-      that subnet group. Only the second adds `--multi-az`.
-    - The first is the control. It must fail with `DBSubnetGroupNotFoundFault`, which proves the
-      request otherwise passes IAM: the create statement answers AccessDenied for any unmet
-      condition, so AccessDenied on the control means the request is wrong and proves nothing.
-    - Given that control, AccessDenied on the second means the pin holds, and
-      `DBSubnetGroupNotFoundFault` on both means it fails open;
   - `CreateListener` scoped to the network load balancer's ARN;
   - `SetSecurityGroups` inside the network load balancer's create;
-  - the provider's `tf-` target group names;
-  - the instance role passed through the framework's own launch path.
+  - the provider's `tf-` target group names.
 
-  Apart from the Multi-AZ pin and the parameter-group fallback, each is a narrowing, so a wrong
-  one fails closed as an AccessDenied naming the action. The fix is a reviewed edit here, never a
-  wildcard.
+  Apart from the parameter-group fallback, each is a narrowing, so a wrong one fails closed as an
+  AccessDenied naming the action. The fix is a reviewed edit here, never a wildcard.
+- **Settled live.**
+  - **The Multi-AZ pin holds.** A one-off probe step ran in AWS Deploy run 37088011024
+    (2026-10-03, on `main`), while the `gitlab` subnet group did not exist. The control
+    `CreateDBInstance`, in the declared shape, failed with `DBSubnetGroupNotFoundFault`, so it
+    passed IAM; the same request with `--multi-az` was `AccessDenied`. A Multi-AZ create
+    therefore carries `rds:MultiAz`, and the `BoolIfExists` pin denies it. CloudTrail recorded
+    both answers, and no database was created.
+  - **The instance role passes through the framework's launch path.** AWS Deploy run
+    37085763487 (2026-10-03) launched the node on `nwarila-ec2-gitlab-profile`.
 - **Measured.** keycloak's first live apply (2026-10-01) found that IAM's policy simulator does not
   evaluate service-prefixed tag keys such as `secretsmanager:ResourceTag/<key>`, even for a plain
   tag, while it does evaluate the global `aws:ResourceTag/<key>`, including for the `aws:`-prefixed
@@ -522,11 +515,11 @@ The documents use `<account-id>`, `<owner-id>`, `<repository-id>` and `<region>`
   instance role writing over TLS is allowed, and the same write without TLS, or from the deploy
   role, is explicitly denied. `--policy-input-list` must be a JSON list of documents: the CLI
   splits a bare document on its commas, and IAM rejects the pieces as invalid content.
-- **The subnet group is blocked.** `terraform/aws.tfvars` places its one system in one
-  availability zone. Every plan therefore exits 1 on the `gitlab` subnet group, naming how many
-  other changes are pending, and every `--apply` exits 1 on it after applying everything else,
-  naming how many it applied; 0 is the in-sync reading. Nothing consumes the group until a
-  database is declared, and the tfvars that declares one places systems in two zones.
+- **The subnet group follows the systems.** `terraform/aws.tfvars` places systems in two
+  availability zones, so the plan creates the `gitlab` subnet group over their two subnets. A
+  tfvars that placed every system in one zone would leave it blocked again: RDS refuses a subnet
+  group in one zone, so every plan would exit 1 on it, naming how many other changes are pending,
+  and every `--apply` would exit 1 on it after applying everything else.
 - **Network load balancer specifics.** The balancer forwards SSH to gitlab-sshd on port 2222 of
   the nodes, and its SSH target group health-checks HTTP on port 80, so a node whose GitLab is
   stopped leaves both target groups together. The HTTP target group checks its traffic port, and
@@ -534,7 +527,10 @@ The documents use `<account-id>`, `<owner-id>`, `<repository-id>` and `<region>`
   therefore carry both the traffic and the health checks, and it reaches the nodes on nothing
   else. With client IP preservation, which instance targets have by default, a node sees the
   client's address rather than the balancer's, and a node that reaches itself through the
-  balancer is dropped. The balancer's declaration settles both, with the nodes' own rules.
+  balancer is dropped. So no node is both a client and a target of a listener: the Rails nodes,
+  the targets, never call the balancer (KAS is off on them, and gitlab-shell and gitlab-sshd reach
+  GitLab's internal API locally), and the Gitaly node, its only client, is never a target. The
+  balancer's declaration and the nodes' own rules settle both.
 - **The parameter group's read shape is unproven.** The local test double reads back exactly the
   parameters this tree set, as strings, and ignores `--source`. If real RDS reads a value back in
   another form, or lists a parameter this tree did not set, every plan shows a MODIFY or a RESET,

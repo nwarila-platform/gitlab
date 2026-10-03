@@ -1,9 +1,105 @@
 # Managed by the gitlab role; a local edit is overwritten on the next converge.
 # Every setting not named below keeps the package default.
+{% set __config__ = gitlab_running %}
+{% if __config__.node_role == 'all-in-one' %}
 
-external_url '{{ gitlab_running.external_url }}'
+external_url '{{ __config__.external_url }}'
 
 # Every bundled service shares this one node. Two of the settings GitLab documents for running in
 # a memory-constrained environment.
 prometheus_monitoring['enable'] = false
 sidekiq['concurrency'] = 10
+{% elif __config__.node_role == 'rails' %}
+
+external_url '{{ __config__.external_url }}'
+
+# Puma, Sidekiq, Workhorse and NGINX. Naming a role stops the bundled PostgreSQL and Redis from
+# loading; the role's Gitaly is switched off because Gitaly has its own node. KAS is off because
+# it would call external_url, the load balancer, and no Rails node is the balancer's client.
+roles(['application_role'])
+gitaly['enable'] = false
+gitlab_kas['enable'] = false
+prometheus_monitoring['enable'] = false
+sidekiq['concurrency'] = 10
+gitlab_rails['auto_migrate'] = {{ __config__.auto_migrate | ternary('true', 'false') }}
+gitlab_rails['monitoring_whitelist'] = [
+{% for cidr in __config__.monitoring_whitelist %}
+  '{{ cidr }}',
+{% endfor %}
+]
+
+# GitLab's own unprivileged database role, over TLS verified against the RDS certificate bundle.
+gitlab_rails['db_host'] = '{{ __config__.database.host }}'
+gitlab_rails['db_port'] = {{ __config__.database.port | int }}
+gitlab_rails['db_database'] = '{{ __config__.database.name }}'
+gitlab_rails['db_username'] = '{{ __config__.database.username }}'
+gitlab_rails['db_password'] = '{{ __config__.database.password }}'
+gitlab_rails['db_sslmode'] = 'verify-full'
+gitlab_rails['db_sslrootcert'] = '/etc/gitlab/rds-ca-bundle.pem'
+
+gitlab_rails['redis_host'] = '{{ __config__.redis.host }}'
+gitlab_rails['redis_port'] = {{ __config__.redis.port | int }}
+gitlab_rails['redis_password'] = '{{ __config__.redis.password }}'
+
+gitlab_rails['gitaly_token'] = '{{ __config__.gitaly.token }}'
+gitlab_rails['repositories_storages'] = {
+  'default' => { 'gitaly_address' => '{{ __config__.gitaly.address }}' },
+}
+
+# One bucket, each object type under this deployment's prefix, through the instance profile.
+gitlab_rails['object_store']['enabled'] = true
+gitlab_rails['object_store']['proxy_download'] = true
+gitlab_rails['object_store']['connection'] = {
+  'provider' => 'AWS',
+  'region' => '{{ __config__.object_store.region }}',
+  'use_iam_profile' => true,
+}
+{% set __objects__ = __config__.object_store.bucket ~ '/' ~ __config__.object_store.prefix %}
+{% for type in __config__.object_store.types %}
+gitlab_rails['object_store']['objects']['{{ type }}']['bucket'] = '{{ __objects__ }}/{{ type }}'
+{% endfor %}
+gitlab_rails['object_store']['objects']['pages']['enabled'] = false
+
+# Git over SSH: gitlab-sshd on every address, behind the load balancer's port 22, with the shared
+# host keys the role installs after reconfigure; the host's own sshd stays the administrators'.
+# FIPS-approved algorithms only.
+gitlab_sshd['enable'] = true
+gitlab_sshd['listen_address'] = '0.0.0.0:{{ __config__.sshd.port | int }}'
+gitlab_sshd['host_keys_glob'] = 'ssh_host_{ecdsa,rsa}_key'
+gitlab_sshd['kex_algorithms'] = [
+  'ecdh-sha2-nistp256', 'ecdh-sha2-nistp384', 'ecdh-sha2-nistp521',
+  'diffie-hellman-group16-sha512',
+]
+gitlab_sshd['ciphers'] = [
+  'aes256-gcm@openssh.com', 'aes128-gcm@openssh.com', 'aes256-ctr', 'aes192-ctr', 'aes128-ctr',
+]
+gitlab_sshd['macs'] = [
+  'hmac-sha2-512-etm@openssh.com', 'hmac-sha2-256-etm@openssh.com',
+  'hmac-sha2-512', 'hmac-sha2-256',
+]
+gitlab_sshd['public_key_algorithms'] = [
+  'ecdsa-sha2-nistp256', 'ecdsa-sha2-nistp384', 'ecdsa-sha2-nistp521',
+  'rsa-sha2-256', 'rsa-sha2-512',
+]
+{% elif __config__.node_role == 'gitaly' %}
+
+# Gitaly alone. GitLab's internal API is reached through the load balancer.
+roles(['gitaly_role'])
+prometheus_monitoring['enable'] = false
+gitlab_rails['auto_migrate'] = false
+gitlab_rails['internal_api_url'] = '{{ __config__.gitaly.internal_api_url }}'
+gitaly['configuration'] = {
+  listen_addr: '0.0.0.0:8075',
+  auth: { token: '{{ __config__.gitaly.token }}' },
+  storage: [{ name: 'default', path: '/var/opt/gitlab/git-data/repositories' }],
+}
+{% elif __config__.node_role == 'redis' %}
+
+# Redis alone, for the Rails nodes, which authenticate with its password.
+roles(['redis_master_role'])
+prometheus_monitoring['enable'] = false
+gitlab_rails['auto_migrate'] = false
+redis['bind'] = '0.0.0.0'
+redis['port'] = {{ __config__.redis.port | int }}
+redis['password'] = '{{ __config__.redis.password }}'
+{% endif %}
