@@ -337,7 +337,7 @@ def allows(statement: dict[str, Any], action: str) -> bool:
 def reaches_objects_bucket(statement: dict[str, Any]) -> bool:
     """Whether an Allow grants an S3 action on the objects bucket, by its name or by a wildcard IAM would match."""
     s3 = any(fnmatch.fnmatchcase("s3", pattern.lower().split(":", 1)[0]) for pattern in as_list(statement["Action"]))
-    probes = (OBJECTS_ARN, f"{OBJECTS_ARN}/runs/probe")
+    probes = (OBJECTS_ARN, f"{OBJECTS_ARN}/runs/probe", f"{OBJECTS_ARN}/tmp/uploads/probe")
     return (
         statement["Effect"] == "Allow"
         and s3
@@ -799,7 +799,7 @@ def check_objects_reach() -> None:
             require(actions <= RUN_ACTIONS, f"{label}: actions beyond the run-object set: {sorted(actions - RUN_ACTIONS)}")
             resources = set(as_list(statement["Resource"]))
             allowed = INSTANCE_RESOURCES if path.stem == INSTANCE_POLICY else RUN_RESOURCES
-            require(resources <= allowed, f"{label}: reaches beyond the bucket's runs/ prefix: {sorted(resources - allowed)}")
+            require(resources <= allowed, f"{label}: reaches beyond runs/ (and, for the instance role, tmp/uploads/): {sorted(resources - allowed)}")
             conditions = statement.get("Condition", {})
             require(conditions.get("StringEquals") == RESOURCE_ACCOUNT, f"{label}: must carry exactly StringEquals {RESOURCE_ACCOUNT}")
             if "s3:listbucket" in actions:

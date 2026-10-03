@@ -158,10 +158,11 @@ the fleet's SSM baseline, neither the application repository nor an S3 secret.
 
 **`nwarila-platform_gitlab_instance_s3`** gets, puts and deletes objects, and aborts and lists
 multipart uploads, under `runs/` in the objects bucket, and lists the bucket only under `runs/`.
-It holds the same object actions under `tmp/uploads/`: GitLab writes a direct upload's temporary
-object there, at the bucket root whatever the bucket prefix, then copies it under the prefix and
-deletes it (`app/uploaders/object_storage.rb`; found live on 2026-10-03, when an upload answered
-500 with `AccessDenied` on `tmp/uploads/<id>`).
+It also gets, puts and deletes objects, and aborts multipart uploads, under `tmp/uploads/`, with
+no listing there: GitLab writes a direct upload's temporary object at the bucket root whatever
+the bucket prefix, then copies it under the prefix and deletes it
+(`app/uploaders/object_storage.rb`; found live on 2026-10-03, when an upload answered 500 with
+`AccessDenied` on `tmp/uploads/<id>`).
 Every statement requires `aws:ResourceAccount` to be this account, so a bucket of the same name in
 another account receives nothing. It grants no `GetBucketLocation` and no
 `ListBucketMultipartUploads`. If GitLab needs either, the AccessDenied names it, and the fix is a
@@ -173,7 +174,8 @@ adds reading the profile, which the destroy's data source needs, and passes no r
 
 **`nwarila-platform_gitlab_admin_s3`** adds the same object access and listing under `runs/`, so an
 operator can read or clear a held run's objects. It reaches nothing else in the bucket: no object
-outside `runs/`, and none of the bucket's configuration or policy.
+outside `runs/` (GitLab's temporaries under `tmp/uploads/` included), and none of the bucket's
+configuration or policy.
 
 ## The database parameter group
 
@@ -435,16 +437,22 @@ The documents use `<account-id>`, `<owner-id>`, `<repository-id>` and `<region>`
   comparison once it holds, and its date marks it.
 - **A changed invariant.** No host identity in this account could write to S3. Now one host role,
   `nwarila-ec2-gitlab-role`, and one operator role, `nwarila-platform_gitlab_admin`, write one
-  bucket, under `runs/`. Every other principal, the account's administrators included, is denied
+  bucket, under `runs/`, and the host role also under `tmp/uploads/`. Every other principal, the
+  account's administrators included, is denied
   that bucket's object data and its key names. The admin role's real audience is the IAM Identity
   Center permission set (`AWSReservedSSO_github_nwarila-platform_*`), the same set that can assume
   every other repository's admin role.
 - **Per-run isolation is a convention.** Each run writes below its own prefix under `runs/`, but
-  IAM grants the whole of `runs/`, so one run could read or delete another's objects; GitLab's
-  direct-upload temporaries under `tmp/uploads/` are shared the same way. The deploy's
-  concurrency group lets one run at a time hold the bed.
-- **Objects outlive the destroy.** Lifecycle cleans `runs/`, not the destroy: an object expires a
-  day after it is written, which outlasts the run's summed job budgets. The account-administrator
+  IAM grants the whole of `runs/`, so one run could read or delete another's objects. GitLab's
+  direct-upload temporaries under `tmp/uploads/` are shared too, but nothing may list them and
+  their ids are random, so one run cannot enumerate another's; the instance role already reaches
+  every run's objects under `runs/`, so they add no new kind of reach. The deploy's concurrency
+  group lets one run at a time hold the bed; a stack a failed destroy orphaned is the exception,
+  and it already reaches all of `runs/`.
+- **Objects outlive the destroy.** Lifecycle cleans the whole bucket, not the destroy: an object
+  expires a day after it is written, which outlasts the run's summed job budgets. A stranded
+  temporary under `tmp/uploads/` is outside the admin role's reach, so only the lifecycle rule
+  clears it. The account-administrator
   profile that applies this tree can configure and inspect the bucket, but cannot list its keys or
   read or write its objects. Emptying the bucket by hand means removing its policy first, or acting
   as the admin role, which reaches `runs/`.

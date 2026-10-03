@@ -796,8 +796,15 @@ done
 # tmp/uploads/ in this account's bucket, and SSM; nothing else.
 for action in s3:GetObject s3:PutObject s3:DeleteObject s3:AbortMultipartUpload s3:ListMultipartUploadParts; do
     expect instance allowed "${action#s3:} a run object" "${action}" "${RUN_OBJECT}" <<< "${OWN}"
+done
+# Workhorse puts the temporary (multipart under s3:PutObject, aborted on failure); Rails reads,
+# copies and deletes it. Nothing lists its parts.
+for action in s3:GetObject s3:PutObject s3:DeleteObject s3:AbortMultipartUpload; do
     expect instance allowed "${action#s3:} a direct-upload temporary" "${action}" "${OBJECTS}/tmp/uploads/x" <<< "${OWN}"
 done
+expect instance implicitDeny "list a temporary's multipart parts" s3:ListMultipartUploadParts "${OBJECTS}/tmp/uploads/x" <<< "${OWN}"
+expect instance implicitDeny 'list the temporaries'            s3:ListBucket "${OBJECTS}" < <(echo "${OWN}"; ctx s3:prefix tmp/uploads/)
+expect instance implicitDeny "write another account's temporaries" s3:PutObject "${OBJECTS}/tmp/uploads/x" < <(ctx aws:ResourceAccount 999999999999)
 expect instance allowed      'list under runs/'                s3:ListBucket "${OBJECTS}" < <(echo "${OWN}"; ctx s3:prefix runs/0/)
 expect instance allowed      'register with SSM'               ssm:UpdateInstanceInformation '*' <<< "${NONE}"
 expect instance implicitDeny 'list the whole bucket'           s3:ListBucket "${OBJECTS}" <<< "${OWN}"
