@@ -1413,6 +1413,9 @@
             msg: "{{ __proof_master_read__.stdout | from_json }}"
             verbosity: 0
 
+        # RDS enforces its rds.* parameters outside PostgreSQL, where pg_settings and SHOW cannot
+        # see them. The dependencies apply reads them back from the RDS API, and the plaintext
+        # refusal below proves rds.force_ssl.
         - name: 'VERIFY | Require The Parameter Group In Force And Only SCRAM Verifiers'
           vars:
             __read__: "{{ __proof_master_read__.stdout | from_json }}"
@@ -1422,7 +1425,8 @@
           ansible.builtin.assert:
             fail_msg: >-
               The database does not run as declared. Settings not read:
-              {{ __parameters__.keys() | difference(__settings__ | map(attribute='name')) }};
+              {{ __parameters__.keys() | reject('match', 'rds[.]')
+                 | difference(__settings__ | map(attribute='name')) }};
               not from the parameter group's configuration file, or waiting for a restart:
               {{ __settings__ | rejectattr('source', 'equalto', 'configuration file') | list
                  + __settings__ | selectattr('pending_restart') | list }}; login roles with a
@@ -1434,8 +1438,8 @@
             quiet: true
             that:
               - >-
-                __parameters__.keys() | difference(__settings__ | map(attribute='name'))
-                | length == 0
+                __parameters__.keys() | reject('match', 'rds[.]')
+                | difference(__settings__ | map(attribute='name')) | length == 0
               - >-
                 __settings__ | rejectattr('source', 'equalto', 'configuration file')
                 | list | length == 0
@@ -1607,7 +1611,8 @@
             get_selinux_context: false
             path: "{{ __proof_workspace__.path }}/upload-proof.bin"
 
-        # A failure is named by the assert after it, which no_log would otherwise hide.
+        # The file is on this node, so remote_src. A failure is named by the assert after it,
+        # which no_log would otherwise hide.
         - name: 'PROCESS | Upload The File Through The Load Balancer'
           changed_when: true
           ignore_errors: true
@@ -1628,7 +1633,7 @@
               PRIVATE-TOKEN: "{{ __proof_token__ }}"
             http_agent: 'ansible-httpget'
             method: 'POST'
-            remote_src: false
+            remote_src: true
             return_content: true
             status_code: [ 201 ]
             timeout: 60
