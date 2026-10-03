@@ -31,6 +31,8 @@
 !/ansible/playbooks/
 !/dependencies/
 !/dependencies/aws/
+!/dependencies/aws/buckets/
+!/dependencies/aws/instance-profiles/
 !/dependencies/aws/policies/
 !/dependencies/aws/roles/
 !/scripts/
@@ -78,10 +80,13 @@
 !/dependencies/README.md
 !/dependencies/registry-values.yml
 !/dependencies/aws/artifacts.yml
+!/dependencies/aws/buckets/gitlab-objects.policy.json
 !/dependencies/aws/estate.yml
+!/dependencies/aws/instance-profiles/nwarila-ec2-gitlab-profile.json
 !/dependencies/aws/manifest.json
 !/dependencies/aws/policies/nwarila-platform_gitlab_admin_s3.json
 !/dependencies/aws/policies/nwarila-platform_gitlab_admin_secretsmanager.json
+!/dependencies/aws/policies/nwarila-platform_gitlab_instance_s3.json
 !/dependencies/aws/policies/nwarila-platform_gitlab_reaper_ebs.json
 !/dependencies/aws/policies/nwarila-platform_gitlab_reaper_ec2.json
 !/dependencies/aws/policies/nwarila-platform_gitlab_reaper_elb.json
@@ -100,6 +105,8 @@
 !/dependencies/aws/policies/nwarila-platform_gitlab_runner_s3.json
 !/dependencies/aws/policies/nwarila-platform_gitlab_runner_sg.json
 !/dependencies/aws/policies/nwarila-platform_gitlab_runner_ssm.json
+!/dependencies/aws/roles/nwarila-ec2-gitlab-role.trust.json
+!/dependencies/aws/roles/nwarila-ec2-gitlab-role.yml
 !/dependencies/aws/roles/nwarila-platform_gitlab_admin.trust.json
 !/dependencies/aws/roles/nwarila-platform_gitlab_admin.yml
 !/dependencies/aws/roles/nwarila-platform_gitlab_reaper.trust.json

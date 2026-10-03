@@ -5,11 +5,13 @@ Adapted from nwarila-platform/keycloak's validator, itself adapted from nessus's
 secure-wazuh's, which introduced the dependencies/ layout. Keycloak's added two closures: the
 standing estate the framework consumes but never creates (aws/estate.yml), and the default IAM quota
 of ten managed policies per role. Like nessus's, this one closes the playbook against the declared
-artifacts, and it adds more: no IAM statement negates an element; a host may be launched only with
-an org EC2 role; the database's parameter group holds GitLab's required settings and the STIG and
-CIS hardening that does not conflict with them, and is the only one the runner may create a
-database with; and the runner reads only its own database's logs. Its live IAM has never been
-exported, so every recorded version is null.
+artifacts, and it adds more: no IAM statement negates an element; the database's parameter group
+holds GitLab's required settings and the STIG and CIS hardening that does not conflict with them,
+and is the only one the runner may create a database with; the runner reads only its own
+database's logs; a host may be launched only with an org EC2 role or GitLab's own instance role;
+and the objects bucket is reachable only by that role and the admin role, only under runs/, behind
+a bucket policy that only denies. The manifest is checked by shape, so an export rewrites it
+without editing this file.
 """
 
 from __future__ import annotations
@@ -31,6 +33,7 @@ ROOT = REPO_ROOT / "dependencies"
 AWS = ROOT / "aws"
 PLAYBOOK = REPO_ROOT / "ansible" / "playbooks" / "gitlab-aws.yml"
 ROLE_DEFAULTS = REPO_ROOT / "ansible" / "applications" / "gitlab" / "defaults" / "main.yml"
+DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "aws-deploy.yml"
 
 TOKENS = (
     "<account-id>",
@@ -76,21 +79,39 @@ REAPER_POLICIES = [f"{PREFIX}_reaper_{s}" for s in ("ebs", "ec2", "elb", "eni", 
 # The admin role converges a held bed by hand and never builds the stack: it carries neither elb
 # nor rds, only the read of the database's master secret.
 ADMIN_POLICIES = [f"{PREFIX}_admin_s3", f"{PREFIX}_admin_secretsmanager"]
-POLICY_NAMES = tuple(sorted([*ADMIN_POLICIES, *RUNNER_POLICIES, *REAPER_POLICIES]))
+# GitLab's own host identity, for the nodes that use object storage.
+INSTANCE_ROLE = "nwarila-ec2-gitlab-role"
+INSTANCE_POLICY = f"{PREFIX}_instance_s3"
+INSTANCE_PROFILES = {"nwarila-ec2-gitlab-profile": [INSTANCE_ROLE]}
+POLICY_NAMES = tuple(sorted([*ADMIN_POLICIES, INSTANCE_POLICY, *RUNNER_POLICIES, *REAPER_POLICIES]))
 ROLE_ATTACH = {
+    INSTANCE_ROLE: [INSTANCE_POLICY],
     f"{PREFIX}_admin": sorted([*ADMIN_POLICIES, *(p for p in RUNNER_POLICIES if not p.endswith(("_elb", "_rds")))]),
     f"{PREFIX}_reaper": REAPER_POLICIES,
     f"{PREFIX}_runner": RUNNER_POLICIES,
 }
-ROLE_SESSION_SECONDS = {f"{PREFIX}_admin": 3600, f"{PREFIX}_reaper": 3600, f"{PREFIX}_runner": 7800}
+MANAGED_ATTACH = {INSTANCE_ROLE: ["AmazonSSMManagedInstanceCore"]}
+# The one host role that writes S3 reads nothing beyond the fleet's SSM baseline: not the application
+# repository, not an S3 secret.
+INSTANCE_ATTACHMENTS = {"AmazonSSMManagedInstanceCore", INSTANCE_POLICY}
+ROLE_SESSION_SECONDS = {INSTANCE_ROLE: 3600, f"{PREFIX}_admin": 3600, f"{PREFIX}_reaper": 3600, f"{PREFIX}_runner": 7800}
+# The organization's EC2 trust, as pdq-deploy-inventory exports nwarila-ec2-apprepo-role's.
+EC2_TRUST = {
+    "Statement": [
+        {
+            "Action": "sts:AssumeRole",
+            "Condition": {"StringEquals": {"aws:SourceAccount": "<account-id>"}},
+            "Effect": "Allow",
+            "Principal": {"Service": "ec2.amazonaws.com"},
+            "Sid": "Ec2AssumeForInstanceProfile",
+        }
+    ],
+    "Version": "2012-10-17",
+}
 # IAM's default "managed policies per role" quota; the account has not been measured above it.
 MANAGED_POLICY_QUOTA = 10
-# Never exported: no live version is known, so none is claimed.
-EXPORTED = None
-POLICY_VERSIONS: dict[str, str | None] = {name: None for name in POLICY_NAMES}
-NOT_YET_APPLIED = sorted(
-    f"{PREFIX}_{s}" for s in ("admin_secretsmanager", "reaper_elb", "reaper_rds", "runner_ec2", "runner_elb", "runner_rds")
-)
+EXPORT_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+POLICY_VERSION = re.compile(r"^v[1-9][0-9]*$")
 
 BUCKETS = {
     "registry://aws/s3/apprepo": "<account-id>-apprepo",
@@ -106,13 +127,90 @@ APPREPO_WILDCARD = "arn:aws:s3:::<account-id>-apprepo/*"
 # EC2 is the reach of every process on the host.
 PASSABLE_ROLES = {
     "arn:aws:iam::<account-id>:role/nwarila-ec2-apprepo-role",
+    f"arn:aws:iam::<account-id>:role/{INSTANCE_ROLE}",
     "arn:aws:iam::<account-id>:role/nwarila-ec2-role",
 }
 READABLE_PROFILES = {
     "arn:aws:iam::<account-id>:instance-profile/nwarila-ec2-apprepo-profile",
+    *(f"arn:aws:iam::<account-id>:instance-profile/{profile}" for profile in INSTANCE_PROFILES),
     "arn:aws:iam::<account-id>:instance-profile/nwarila-ec2-profile",
 }
 PASS_ROLE_CONDITION = {"StringEquals": {"iam:PassedToService": "ec2.amazonaws.com"}}
+
+# GitLab's object storage. Only the instance role and the admin role reach it, only under runs/,
+# and only in this account: a same-named bucket elsewhere receives nothing.
+OBJECTS_BUCKET = "<account-id>-gitlab-objects"
+OBJECTS_ARN = f"arn:aws:s3:::{OBJECTS_BUCKET}"
+OBJECTS_POLICY = "gitlab-objects.policy.json"
+RUN_OBJECT_ACTIONS = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:AbortMultipartUpload", "s3:ListMultipartUploadParts"]
+RUN_ACTIONS = {action.lower() for action in [*RUN_OBJECT_ACTIONS, "s3:ListBucket"]}
+RUN_RESOURCES = {OBJECTS_ARN, f"{OBJECTS_ARN}/runs/*"}
+RESOURCE_ACCOUNT = {"aws:ResourceAccount": "<account-id>"}
+ADMIN_RUN_SIDS = ["ListGitLabRunPrefix", "ManageGitLabRunObjects"]
+OBJECT_PRINCIPALS = [f"arn:aws:iam::<account-id>:role/{INSTANCE_ROLE}", f"arn:aws:iam::<account-id>:role/{PREFIX}_admin"]
+# What the bucket policy denies every other principal: object data, versioned or not, and key names.
+# It is broader than the grant: S3 authorizes a read or delete that names a version, even the null
+# version of an unversioned bucket, as s3:GetObjectVersion or s3:DeleteObjectVersion.
+OBJECT_DENY_SID = "DenyObjectDataAndKeyNamesToAllButTheGitLabInstanceAndAdminRoles"
+OBJECT_DENY_ACTIONS = {
+    "s3:GetObject*",
+    "s3:PutObject*",
+    "s3:DeleteObject*",
+    "s3:AbortMultipartUpload",
+    "s3:ListMultipartUploadParts",
+    "s3:ListBucket",
+    "s3:ListBucketVersions",
+    "s3:ListBucketMultipartUploads",
+}
+# Requests the deny must reach, named so that a narrowed deny says which one it leaves open.
+OBJECT_REQUESTS = (
+    "s3:GetObject",
+    "s3:GetObjectVersion",
+    "s3:PutObject",
+    "s3:DeleteObject",
+    "s3:DeleteObjectVersion",
+    "s3:AbortMultipartUpload",
+    "s3:ListMultipartUploadParts",
+    "s3:ListBucket",
+    "s3:ListBucketVersions",
+    "s3:ListBucketMultipartUploads",
+)
+# The bucket policy only denies; the identity policies are what grant.
+OBJECTS_POLICY_STATEMENTS = {
+    "DenyRequestsWithoutTls": {
+        "Action": ["s3:*"],
+        "Condition": {"Bool": {"aws:SecureTransport": "false"}},
+        "Resource": [OBJECTS_ARN, f"{OBJECTS_ARN}/*"],
+    },
+    OBJECT_DENY_SID: {
+        "Action": sorted(OBJECT_DENY_ACTIONS),
+        "Condition": {"ArnNotEquals": {"aws:PrincipalArn": OBJECT_PRINCIPALS}},
+        "Resource": [OBJECTS_ARN, f"{OBJECTS_ARN}/*"],
+    },
+}
+PUBLIC_ACCESS_BLOCK = ("block_public_acls", "ignore_public_acls", "block_public_policy", "restrict_public_buckets")
+APPLY_SCRIPT = REPO_ROOT / "scripts" / "apply-dependencies.sh"
+# The IAM actions each S3 operation is authorized as (the Service Authorization Reference), for every
+# operation scripts/apply-dependencies.sh calls. head-bucket is recorded because it is the obvious
+# existence probe and is authorized as s3:ListBucket, which the bucket policy denies.
+S3API_ACTIONS = {
+    "create-bucket": ["s3:CreateBucket", "s3:PutBucketOwnershipControls", "s3:TagResource"],
+    "get-bucket-encryption": ["s3:GetEncryptionConfiguration"],
+    "get-bucket-lifecycle-configuration": ["s3:GetLifecycleConfiguration"],
+    "get-bucket-location": ["s3:GetBucketLocation"],
+    "get-bucket-ownership-controls": ["s3:GetBucketOwnershipControls"],
+    "get-bucket-policy": ["s3:GetBucketPolicy"],
+    "get-bucket-tagging": ["s3:GetBucketTagging"],
+    "get-bucket-versioning": ["s3:GetBucketVersioning"],
+    "get-public-access-block": ["s3:GetBucketPublicAccessBlock"],
+    "head-bucket": ["s3:ListBucket"],
+    "put-bucket-encryption": ["s3:PutEncryptionConfiguration"],
+    "put-bucket-lifecycle-configuration": ["s3:PutLifecycleConfiguration"],
+    "put-bucket-ownership-controls": ["s3:PutBucketOwnershipControls"],
+    "put-bucket-policy": ["s3:PutBucketPolicy"],
+    "put-bucket-tagging": ["s3:PutBucketTagging"],
+    "put-public-access-block": ["s3:PutBucketPublicAccessBlock"],
+}
 
 ESTATE_TAGS = {"ManagedBy": "apply-dependencies", "Repository": "nwarila-platform/gitlab"}
 # The services the runner creates through, each needing its service-linked role first.
@@ -231,6 +329,34 @@ def allows(statement: dict[str, Any], action: str) -> bool:
     )
 
 
+def reaches_objects_bucket(statement: dict[str, Any]) -> bool:
+    """Whether an Allow grants an S3 action on the objects bucket, by its name or by a wildcard IAM would match."""
+    s3 = any(fnmatch.fnmatchcase("s3", pattern.lower().split(":", 1)[0]) for pattern in as_list(statement["Action"]))
+    probes = (OBJECTS_ARN, f"{OBJECTS_ARN}/runs/probe")
+    return (
+        statement["Effect"] == "Allow"
+        and s3
+        and any(
+            resource.startswith(OBJECTS_ARN) or any(fnmatch.fnmatchcase(probe, resource) for probe in probes)
+            for resource in as_list(statement["Resource"])
+        )
+    )
+
+
+def policy_paths() -> list[Path]:
+    return sorted((AWS / "policies").glob("*.json"))
+
+
+def statement_paths() -> list[Path]:
+    """Every document made of IAM statements: identity policies, trusts and bucket policies."""
+    return [*policy_paths(), *sorted((AWS / "roles").glob("*.trust.json")), *sorted((AWS / "buckets").glob("*.json"))]
+
+
+def json_paths() -> list[Path]:
+    """Every JSON document sent to AWS."""
+    return [*statement_paths(), *sorted((AWS / "instance-profiles").glob("*.json"))]
+
+
 def manifest_bytes() -> bytes:
     rows = []
     paths = sorted(
@@ -275,35 +401,33 @@ def check_literals_and_tokens() -> None:
             require(match is None, f"forbidden concrete identifier {match.group() if match else ''!r} in {rel(path)}")
         match = BARE_ACCOUNT.search(text)
         require(match is None, f"bare 12-digit run {match.group() if match else ''!r} in {rel(path)}")
-    iam_paths = [*sorted((AWS / "policies").glob("*.json")), *sorted((AWS / "roles").glob("*.trust.json"))]
-    corpus = "".join(path.read_text(encoding="utf-8") for path in iam_paths)
+    corpus = "".join(path.read_text(encoding="utf-8") for path in json_paths())
     observed = set(TOKEN.findall(corpus))
     unknown = observed - set(TOKENS)
-    require(not unknown, f"IAM documents contain tokens outside the closed vocabulary: {sorted(unknown)}")
+    require(not unknown, f"AWS documents contain tokens outside the closed vocabulary: {sorted(unknown)}")
     expected = set(TOKENS) - set(ABSENT_TOKENS)
     require(
         observed == expected,
-        "IAM token set differs from the baseline presence record: "
+        "AWS token set differs from the baseline presence record: "
         f"missing={sorted(expected - observed)} unexpectedly_present={sorted(observed - expected)}",
     )
 
 
 def check_canonical_json() -> None:
-    for path in [*sorted((AWS / "policies").glob("*.json")), *sorted((AWS / "roles").glob("*.trust.json"))]:
+    for path in json_paths():
         document = load_json(path)
         expected = (json.dumps(document, indent=2, sort_keys=True) + "\n").encode()
         require(path.read_bytes() == expected, f"canonical JSON serializer mismatch: {rel(path)}")
 
 
 def check_iam_closures() -> None:
-    """No IAM statement negates an element, and only runner_iam passes a role: an org EC2 role, to EC2."""
-    policies = sorted((AWS / "policies").glob("*.json"))
-    for path in [*policies, *sorted((AWS / "roles").glob("*.trust.json"))]:
+    """No IAM statement negates an element, and only runner_iam passes a role: one a host may launch with, to EC2."""
+    for path in statement_paths():
         for statement in load_json(path)["Statement"]:
             label = f"{path.stem} {statement.get('Sid')}"
             negated = sorted({"NotAction", "NotPrincipal", "NotResource"} & set(statement))
             require(not negated, f"{label}: {negated} refused; a negated element covers everything it does not name")
-    for path in policies:
+    for path in policy_paths():
         for statement in load_json(path)["Statement"]:
             label = f"{path.stem} {statement.get('Sid')}"
             resources = set(as_list(statement["Resource"]))
@@ -311,7 +435,7 @@ def check_iam_closures() -> None:
                 require(path.stem == f"{PREFIX}_runner_iam", f"{label}: only {PREFIX}_runner_iam may allow iam:PassRole")
                 require(
                     resources <= PASSABLE_ROLES,
-                    f"{label}: iam:PassRole reaches beyond the org EC2 roles: {sorted(resources - PASSABLE_ROLES)}",
+                    f"{label}: iam:PassRole reaches beyond the EC2 roles a host may launch with: {sorted(resources - PASSABLE_ROLES)}",
                 )
                 require(
                     statement.get("Condition") == PASS_ROLE_CONDITION,
@@ -320,13 +444,23 @@ def check_iam_closures() -> None:
             if allows(statement, "iam:GetInstanceProfile"):
                 require(
                     resources <= READABLE_PROFILES,
-                    f"{label}: iam:GetInstanceProfile reaches beyond the org EC2 profiles: {sorted(resources - READABLE_PROFILES)}",
+                    f"{label}: iam:GetInstanceProfile reaches beyond the EC2 profiles: {sorted(resources - READABLE_PROFILES)}",
                 )
 
 
 def check_declarations() -> dict[str, dict[str, Any]]:
     require(not (AWS / "proposed").exists(), "aws/proposed/ must not exist in the desired-state tree")
-    require(not (AWS / "profiles").exists(), "aws/profiles/ must not exist; shared profiles are external dependencies")
+    require(
+        not (AWS / "profiles").exists(),
+        "aws/profiles/ must not exist; this repository's instance profiles live in aws/instance-profiles/",
+    )
+    profiles = {path.stem: path for path in (AWS / "instance-profiles").glob("*.json")}
+    require(set(profiles) == set(INSTANCE_PROFILES), f"aws/instance-profiles/ must hold exactly {sorted(INSTANCE_PROFILES)}")
+    for name, path in profiles.items():
+        require(
+            load_json(path) == {"InstanceProfileName": name, "Roles": INSTANCE_PROFILES[name]},
+            f"{rel(path)}: must name itself and hold exactly the role {INSTANCE_PROFILES[name]}",
+        )
     policy_json = {path.stem: path for path in (AWS / "policies").glob("*.json")}
     require(not list((AWS / "policies").glob("*.yml")), "policy YAML sidecars are forbidden; metadata belongs in aws/manifest.json")
     require(set(policy_json) == set(POLICY_NAMES), "desired policy JSON set differs from the closed expected set")
@@ -347,9 +481,16 @@ def check_declarations() -> dict[str, dict[str, Any]]:
         require(sidecar["path"] == "/" and sidecar["description"] is None, f"{name}: path/description differ from the declared table")
         require(sidecar["managed_by"] == "consumer", f"{name}: managed_by must be consumer")
         attach = require_string_list(sidecar["attach"], f"{name}.attach")
-        require(attach == ROLE_ATTACH[name], f"{name}: customer-managed attachments differ from the declared table")
         managed = require_string_list(sidecar["managed_attach"], f"{name}.managed_attach")
-        require(managed == [], f"{name}: AWS-managed attachments differ from the declared table")
+        if name == INSTANCE_ROLE:
+            require(
+                set(attach) | set(managed) == INSTANCE_ATTACHMENTS,
+                f"{name}: the host role that writes the objects bucket attaches exactly {sorted(INSTANCE_ATTACHMENTS)}, "
+                f"not {sorted(set(attach) | set(managed))}",
+            )
+            require(load_json(trust_json[name]) == EC2_TRUST, f"{name}: trust differs from the organization's EC2 trust")
+        require(attach == ROLE_ATTACH[name], f"{name}: customer-managed attachments differ from the declared table")
+        require(managed == MANAGED_ATTACH.get(name, []), f"{name}: AWS-managed attachments differ from the declared table")
         require(
             len(attach) + len(managed) <= MANAGED_POLICY_QUOTA,
             f"{name}: {len(attach) + len(managed)} managed policies exceed the default quota of {MANAGED_POLICY_QUOTA}",
@@ -357,28 +498,58 @@ def check_declarations() -> dict[str, dict[str, Any]]:
         roles[name] = sidecar
     attached = {policy for attachments in ROLE_ATTACH.values() for policy in attachments}
     require(attached == set(policy_json), "orphan policy file: desired policy attachment closure is incomplete")
+    holders = sorted(name for name, sidecar in roles.items() if INSTANCE_POLICY in sidecar["attach"])
+    require(holders == [INSTANCE_ROLE], f"only {INSTANCE_ROLE} may attach {INSTANCE_POLICY}; attached by {holders}")
     return roles
 
 
 def check_manifest(roles: dict[str, dict[str, Any]]) -> None:
+    """The manifest is checked by shape, so an export rewrites it without editing this file.
+
+    Before the first export every version is null. After one, every customer-managed version is a
+    live version id, except a document added since, which stays null while not_yet_applied lists it.
+    """
     manifest = require_mapping(load_json(AWS / "manifest.json"), "aws/manifest.json")
-    require(list(manifest) == ["exported", "roles", "policies", "divergence"], "manifest top-level key order/schema is invalid")
-    require(manifest["exported"] == EXPORTED, "manifest exported date differs from the recorded export")
-    require(list(manifest["roles"]) == sorted(roles), "manifest roles must equal sidecars in lexical order")
-    for name, sidecar in roles.items():
-        expected = [{"name": policy, "version": POLICY_VERSIONS[policy]} for policy in sidecar["attach"]]
-        require(manifest["roles"][name] == {"attached": expected, "inline": []}, f"manifest role mismatch: {name}")
-    policies = require_mapping(manifest["policies"], "manifest.policies")
-    require(list(policies) == sorted(POLICY_NAMES), "manifest policies must equal the policy files in lexical order")
-    for name, metadata in policies.items():
-        expected = {"path": "/", "description": None, "tags": {}, "managed_by": "consumer"}
-        require(metadata == expected, f"manifest policy metadata differs from the closed expected table: {name}")
+    require(
+        list(manifest) == ["exported", "instance_profiles", "roles", "policies", "divergence"],
+        "manifest top-level key order/schema is invalid",
+    )
+    exported = manifest["exported"]
+    require(exported is None or EXPORT_DATE.fullmatch(str(exported)) is not None, "manifest exported must be null or a YYYY-MM-DD date")
+    require(manifest["instance_profiles"] == INSTANCE_PROFILES, "manifest instance_profiles differ from aws/instance-profiles/")
     divergence = require_mapping(manifest["divergence"], "manifest.divergence")
     require(set(divergence) == {"note", "not_yet_applied"}, "manifest.divergence exact schema violation")
     require(isinstance(divergence["note"], str) and divergence["note"], "manifest.divergence.note must be non-empty")
     pending = require_string_list(divergence["not_yet_applied"], "manifest.divergence.not_yet_applied")
     require(set(pending) <= set(POLICY_NAMES), "manifest.divergence.not_yet_applied names a policy without a real policy JSON")
-    require(pending == NOT_YET_APPLIED, "manifest.divergence.not_yet_applied differs from the recorded pending set")
+    require(list(manifest["roles"]) == sorted(roles), "manifest roles must equal sidecars in lexical order")
+    for name, sidecar in roles.items():
+        role = require_mapping(manifest["roles"][name], f"manifest role {name}")
+        require(set(role) == {"attached", "inline"} and role["inline"] == [], f"manifest role {name}: schema or inline policies differ")
+        attached = role["attached"]
+        require(
+            [entry.get("name") for entry in attached] == sorted([*sidecar["attach"], *sidecar["managed_attach"]]),
+            f"manifest role {name}: attachments differ from its sidecar",
+        )
+        for entry in attached:
+            policy = entry["name"]
+            if policy in sidecar["managed_attach"]:
+                require(entry == {"managed_by": "aws", "name": policy}, f"manifest role {name}: AWS-managed {policy} carries no version")
+                continue
+            require(set(entry) == {"name", "version"}, f"manifest role {name}: {policy} must carry exactly name and version")
+            version = entry["version"]
+            if exported is None:
+                require(version is None, f"manifest role {name}: {policy} records a version, but nothing was exported")
+            else:
+                require(
+                    POLICY_VERSION.fullmatch(str(version)) is not None or (version is None and policy in pending),
+                    f"manifest role {name}: {policy} needs its exported version, or null while not_yet_applied lists it",
+                )
+    policies = require_mapping(manifest["policies"], "manifest.policies")
+    require(list(policies) == sorted(POLICY_NAMES), "manifest policies must equal the policy files in lexical order")
+    for name, metadata in policies.items():
+        expected = {"path": "/", "description": None, "tags": {}, "managed_by": "consumer"}
+        require(metadata == expected, f"manifest policy metadata differs from the closed expected table: {name}")
 
 
 def check_artifacts() -> list[dict[str, Any]]:
@@ -460,7 +631,7 @@ def check_estate() -> None:
     document = require_mapping(load_yaml(AWS / "estate.yml"), "aws/estate.yml")
     require_keys(
         document,
-        {"schema", "tags", "service_linked_roles", "db_subnet_groups", "db_parameter_groups", "security_groups"},
+        {"schema", "tags", "service_linked_roles", "db_subnet_groups", "db_parameter_groups", "security_groups", "buckets"},
         set(),
         "aws/estate.yml",
     )
@@ -497,6 +668,7 @@ def check_estate() -> None:
         duplicates = sorted({rule for rule in rules if rules.count(rule) > 1})
         require(not duplicates, f"security_group {sg['name']}: rules declared twice, which AWS refuses: {duplicates}")
     check_db_parameter_groups(document["db_parameter_groups"])
+    check_bucket(document["buckets"])
 
 
 def check_db_parameter_groups(groups: Any) -> None:
@@ -565,6 +737,138 @@ def check_database_log_reads() -> None:
         )
 
 
+def check_bucket(buckets: Any) -> None:
+    """The objects bucket is private, keyed by S3, owner-enforced, unversioned, and empties itself.
+
+    Expiry must outlast a whole deploy run, every job's timeout summed, or a held run would lose its
+    objects.
+    """
+    require(isinstance(buckets, list) and len(buckets) == 1, "aws/estate.yml: exactly one bucket is declared")
+    bucket = require_mapping(buckets[0], "aws/estate.yml bucket")
+    label = f"bucket {bucket.get('name')}"
+    keys = {"name", "encryption", "public_access_block", "object_ownership", "versioning", "lifecycle", "policy"}
+    require_keys(bucket, keys, set(), label)
+    require(bucket["name"] == OBJECTS_BUCKET, f"{label}: the objects bucket is {OBJECTS_BUCKET!r}, the name its policies grant on")
+    require(bucket["encryption"] == "AES256", f"{label}: encryption must be AES256")
+    flags = require_mapping(bucket["public_access_block"], f"{label} public_access_block")
+    unset = sorted(flag for flag in PUBLIC_ACCESS_BLOCK if flags.get(flag) is not True)
+    require(
+        set(flags) == set(PUBLIC_ACCESS_BLOCK) and not unset, f"{label}: public_access_block must set exactly the four flags, all true; unset: {unset}"
+    )
+    require(bucket["object_ownership"] == "BucketOwnerEnforced", f"{label}: object_ownership must be BucketOwnerEnforced")
+    require(bucket["versioning"] is False, f"{label}: versioning must be false, so an expired object is gone")
+    lifecycle = require_mapping(bucket["lifecycle"], f"{label} lifecycle")
+    require_keys(lifecycle, {"expire_days", "abort_incomplete_multipart_days"}, set(), f"{label} lifecycle")
+    expire, abort = lifecycle["expire_days"], lifecycle["abort_incomplete_multipart_days"]
+    jobs = load_yaml(DEPLOY_WORKFLOW)["jobs"]
+    untimed = sorted(name for name, job in jobs.items() if "timeout-minutes" not in job)
+    require(not untimed, f"{label}: {rel(DEPLOY_WORKFLOW)} jobs {untimed} set no timeout-minutes, so no expiry can be shown to outlast the run")
+    budget = sum(job["timeout-minutes"] for job in jobs.values())
+    require(
+        isinstance(expire, int) and expire * 1440 > budget,
+        f"{label}: expire_days {expire} must outlast the deploy run's {budget}-minute summed job budget",
+    )
+    require(isinstance(abort, int) and 1 <= abort <= expire, f"{label}: abort_incomplete_multipart_days must be from 1 to expire_days")
+    require(bucket["policy"] == OBJECTS_POLICY, f"{label}: policy must be {OBJECTS_POLICY}")
+    present = sorted(path.name for path in (AWS / "buckets").iterdir())
+    require(present == [OBJECTS_POLICY], f"aws/buckets/ must hold exactly {OBJECTS_POLICY}, not {present}")
+
+
+def check_objects_reach() -> None:
+    """Only the instance role and the admin role reach the objects bucket, and only under runs/."""
+    for path in policy_paths():
+        statements = load_json(path)["Statement"]
+        reaching = [statement for statement in statements if reaches_objects_bucket(statement)]
+        sids = sorted(statement.get("Sid") for statement in reaching)
+        if path.stem == INSTANCE_POLICY:
+            scoped = statements
+        elif path.stem == f"{PREFIX}_admin_s3":
+            require(sids == ADMIN_RUN_SIDS, f"{path.stem}: only {ADMIN_RUN_SIDS} may reach the objects bucket, not {sids}")
+            scoped = reaching
+        else:
+            require(not reaching, f"{path.stem} {sids}: reaches the objects bucket, which only the instance and admin roles use")
+            scoped = []
+        for statement in scoped:
+            label = f"{path.stem} {statement.get('Sid')}"
+            actions = {action.lower() for action in as_list(statement["Action"])}
+            require(actions <= RUN_ACTIONS, f"{label}: actions beyond the run-object set: {sorted(actions - RUN_ACTIONS)}")
+            resources = set(as_list(statement["Resource"]))
+            require(resources <= RUN_RESOURCES, f"{label}: reaches beyond the bucket's runs/ prefix: {sorted(resources - RUN_RESOURCES)}")
+            conditions = statement.get("Condition", {})
+            require(conditions.get("StringEquals") == RESOURCE_ACCOUNT, f"{label}: must carry exactly StringEquals {RESOURCE_ACCOUNT}")
+            if "s3:listbucket" in actions:
+                require(
+                    conditions.get("StringLike") == {"s3:prefix": ["runs/*"]}, f"{label}: s3:ListBucket must be limited to s3:prefix runs/*"
+                )
+
+
+def check_objects_policy() -> None:
+    """The bucket policy only denies: plain HTTP to anyone, and object data and key names to all but the two roles."""
+    path = AWS / "buckets" / OBJECTS_POLICY
+    statements = load_json(path)["Statement"]
+    for statement in statements:
+        label = f"{path.name} {statement.get('Sid')}"
+        require(statement["Effect"] == "Deny", f"{label}: an Allow is refused; only the identity policies grant on this bucket")
+        require(statement.get("Principal") == "*", f"{label}: must apply to Principal '*' and except by condition")
+        named = {
+            arn
+            for operator in statement.get("Condition", {}).values()
+            for key, value in operator.items()
+            if key.lower() == "aws:principalarn"
+            for arn in as_list(value)
+        }
+        require(
+            named <= set(OBJECT_PRINCIPALS),
+            f"{label}: names principals other than the instance and admin roles: {sorted(named - set(OBJECT_PRINCIPALS))}",
+        )
+    deny = next((statement for statement in statements if statement.get("Sid") == OBJECT_DENY_SID), {})
+    label = f"{path.name} {OBJECT_DENY_SID}"
+    actions = as_list(deny.get("Action", []))
+    open_requests = [request for request in OBJECT_REQUESTS if not any(fnmatch.fnmatchcase(request.lower(), a.lower()) for a in actions)]
+    require(not open_requests, f"{label}: leaves {open_requests} open to every other principal")
+    require(
+        set(actions) == OBJECT_DENY_ACTIONS,
+        f"{label}: actions differ from the declared deny set: missing {sorted(OBJECT_DENY_ACTIONS - set(actions))}, "
+        f"extra {sorted(set(actions) - OBJECT_DENY_ACTIONS)}",
+    )
+    shape = {
+        statement.get("Sid"): {
+            "Action": sorted(as_list(statement.get("Action", []))),
+            "Condition": statement.get("Condition"),
+            "Resource": sorted(as_list(statement.get("Resource", []))),
+        }
+        for statement in statements
+    }
+    require(
+        len(statements) == len(OBJECTS_POLICY_STATEMENTS) and shape == OBJECTS_POLICY_STATEMENTS,
+        f"{path.name}: must be exactly the two Deny statements, {sorted(OBJECTS_POLICY_STATEMENTS)}",
+    )
+
+
+def check_operator_reach() -> None:
+    """Every `s3api` call scripts/apply-dependencies.sh makes stays outside the bucket policy's deny.
+
+    The script runs as an account administrator, whom the deny does not except, so an operation the
+    deny covers would fail against this tree's own bucket once its policy exists.
+    """
+    lines = APPLY_SCRIPT.read_text(encoding="utf-8").splitlines()
+    code = "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+    verbs = re.findall(r"\bs3api ([a-z][a-z0-9-]*)", code)
+    require(len(verbs) == code.count("s3api"), f"{rel(APPLY_SCRIPT)}: every s3api call must name its operation literally")
+    for verb in sorted(set(verbs)):
+        require(verb in S3API_ACTIONS, f"{rel(APPLY_SCRIPT)}: s3api {verb} has no IAM action recorded in S3API_ACTIONS")
+        denied = [
+            action
+            for action in S3API_ACTIONS[verb]
+            if any(fnmatch.fnmatchcase(action.lower(), pattern.lower()) for pattern in OBJECT_DENY_ACTIONS)
+        ]
+        require(
+            not denied,
+            f"{rel(APPLY_SCRIPT)}: s3api {verb} is authorized as {denied}, which the bucket policy denies the account "
+            "administrator this script runs as",
+        )
+
+
 def check_registry_closure() -> None:
     resolver = require_mapping(load_yaml(ROOT / "registry-values.yml"), "registry-values.yml")
     require(resolver == RESOLVER, "registry-values.yml must contain exactly the evidenced resolver entries")
@@ -592,11 +896,17 @@ def main() -> int:
         check_authorization(objects)
         check_estate()
         check_database_log_reads()
+        check_objects_reach()
+        check_objects_policy()
+        check_operator_reach()
         check_registry_closure()
     except ContractError as error:
         print(f"dependency check failed: {error}", file=sys.stderr)
         return 1
-    print("dependency check passed: declarations, metadata, closure, quota, estate, pins, authorization, literals and integrity are valid")
+    print(
+        "dependency check passed: declarations, metadata, closure, quota, estate, objects bucket, pins, authorization, "
+        "literals and integrity are valid"
+    )
     return 0
 
 

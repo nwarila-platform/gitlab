@@ -1,47 +1,65 @@
 {
-  "exported": null,
+  "exported": "2026-10-03",
+  "instance_profiles": {
+    "nwarila-ec2-gitlab-profile": [
+      "nwarila-ec2-gitlab-role"
+    ]
+  },
   "roles": {
+    "nwarila-ec2-gitlab-role": {
+      "attached": [
+        {
+          "managed_by": "aws",
+          "name": "AmazonSSMManagedInstanceCore"
+        },
+        {
+          "name": "nwarila-platform_gitlab_instance_s3",
+          "version": "v1"
+        }
+      ],
+      "inline": []
+    },
     "nwarila-platform_gitlab_admin": {
       "attached": [
         {
           "name": "nwarila-platform_gitlab_admin_s3",
-          "version": null
+          "version": "v2"
         },
         {
           "name": "nwarila-platform_gitlab_admin_secretsmanager",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_runner_ebs",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_runner_ec2",
-          "version": null
+          "version": "v3"
         },
         {
           "name": "nwarila-platform_gitlab_runner_eni",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_runner_iam",
-          "version": null
+          "version": "v2"
         },
         {
           "name": "nwarila-platform_gitlab_runner_kms",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_runner_s3",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_runner_sg",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_runner_ssm",
-          "version": null
+          "version": "v1"
         }
       ],
       "inline": []
@@ -50,35 +68,35 @@
       "attached": [
         {
           "name": "nwarila-platform_gitlab_reaper_ebs",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_reaper_ec2",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_reaper_elb",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_reaper_eni",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_reaper_iam",
-          "version": null
+          "version": "v2"
         },
         {
           "name": "nwarila-platform_gitlab_reaper_rds",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_reaper_s3",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_reaper_sg",
-          "version": null
+          "version": "v1"
         }
       ],
       "inline": []
@@ -87,43 +105,43 @@
       "attached": [
         {
           "name": "nwarila-platform_gitlab_runner_ebs",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_runner_ec2",
-          "version": null
+          "version": "v3"
         },
         {
           "name": "nwarila-platform_gitlab_runner_elb",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_runner_eni",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_runner_iam",
-          "version": null
+          "version": "v2"
         },
         {
           "name": "nwarila-platform_gitlab_runner_kms",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_runner_rds",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_runner_s3",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_runner_sg",
-          "version": null
+          "version": "v1"
         },
         {
           "name": "nwarila-platform_gitlab_runner_ssm",
-          "version": null
+          "version": "v1"
         }
       ],
       "inline": []
@@ -137,6 +155,12 @@
       "managed_by": "consumer"
     },
     "nwarila-platform_gitlab_admin_secretsmanager": {
+      "path": "/",
+      "description": null,
+      "tags": {},
+      "managed_by": "consumer"
+    },
+    "nwarila-platform_gitlab_instance_s3": {
       "path": "/",
       "description": null,
       "tags": {},
@@ -252,14 +276,7 @@
     }
   },
   "divergence": {
-    "note": "This repository's live IAM has never been exported into this tree, so the export date and every attached version are null rather than claimed. Every document outside not_yet_applied is the fleet skeleton baseline this repository was created from, as nwarila-platform/nessus exported it on 2026-09-30, renamed to this repository. not_yet_applied names each document this tree adds to or changes from that baseline. scripts/apply-dependencies.sh reports every live difference before it writes anything; after the first apply, a re-export records the date and versions and empties this list.",
-    "not_yet_applied": [
-      "nwarila-platform_gitlab_admin_secretsmanager",
-      "nwarila-platform_gitlab_reaper_elb",
-      "nwarila-platform_gitlab_reaper_rds",
-      "nwarila-platform_gitlab_runner_ec2",
-      "nwarila-platform_gitlab_runner_elb",
-      "nwarila-platform_gitlab_runner_rds"
-    ]
+    "note": "Exported from live IAM by scripts/apply-dependencies.sh --export on the date in exported, once nothing was pending: every attached version is the live default version of a document this tree matched. A document changed since is listed in not_yet_applied, with a null version while it does not exist yet, until the next export.",
+    "not_yet_applied": []
   }
 }

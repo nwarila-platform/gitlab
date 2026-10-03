@@ -2,9 +2,10 @@
 # subnet group by name and pre-created security groups by id (its docs/reference/invariants.md),
 # and RDS and Elastic Load Balancing each need their service-linked role before a first create.
 # The database's parameter group stands here too, so its values are reviewed rather than set per
-# run. All of them are free while unused, so they stand between runs and the ephemeral deploy only
-# references them. scripts/apply-dependencies.sh creates and reconciles them; the runner can
-# neither modify nor delete them, because none carries the deploy identity.
+# run, and GitLab itself consumes the objects bucket. All of them are free while unused, so they
+# stand between runs and the ephemeral deploy only references them. scripts/apply-dependencies.sh
+# creates and reconciles them; the runner can neither modify nor delete them, because none
+# carries the deploy identity.
 #
 # Reachability is by membership, not by address: the nodes carry gitlab-node, which the load
 # balancer admits, and the nodes that use the database also carry gitlab-db-client, the only
@@ -82,3 +83,22 @@ security_groups:
     description: "GitLab nodes: membership the NLB admits"
     ingress: []
     egress: []
+# GitLab's object storage. Each run writes below its own prefix under runs/, and one lifecycle
+# rule over the whole bucket expires every object a day after it is written, which outlasts the
+# deploy run's summed job budgets. Versioning stays off, so an expired object is gone. The bucket
+# policy only denies: plain HTTP to everyone, and object data and key names to every principal
+# except the GitLab instance and admin roles.
+buckets:
+  - name: "<account-id>-gitlab-objects"
+    encryption: "AES256"
+    public_access_block:
+      block_public_acls: true
+      ignore_public_acls: true
+      block_public_policy: true
+      restrict_public_buckets: true
+    object_ownership: "BucketOwnerEnforced"
+    versioning: false
+    lifecycle:
+      expire_days: 1
+      abort_incomplete_multipart_days: 1
+    policy: "gitlab-objects.policy.json"

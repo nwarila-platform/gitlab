@@ -41,10 +41,11 @@ all_systems = [
     # lives only in the AWS_EC2_SSH_PRIVATE_KEY organization secret and the runner's
     # temporary directory.
     key_name = "nwarila-ec2-key"
-    # The org EC2 baseline plus read-only access to the application repository bucket, which is
-    # what lets this host pull its own repository contents down rather than receiving them from
-    # the controller. The runner role only reads and passes whichever profile is named here.
-    iam_instance_profile = "nwarila-ec2-apprepo-profile"
+    # GitLab's own profile for its Rails nodes (dependencies/aws/): SSM, plus object data under
+    # runs/ in the GitLab objects bucket, which nothing uses until object storage is configured.
+    # The controller fetches the package, so the host reads no application repository. The runner
+    # role only reads and passes whichever profile is named here.
+    iam_instance_profile = "nwarila-ec2-gitlab-profile"
     aws_kms_alias        = "aws/ebs"
     # CIS Red Hat Enterprise Linux 8 — the same hardened base the secure-wazuh Linux legs use.
     ami = "ami-0ca8a2e788e4c5869"
