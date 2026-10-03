@@ -1,0 +1,57 @@
+{
+  "Statement": [
+    {
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject",
+        "s3:DeleteObject"
+      ],
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:s3:::<account-id>-terraform/nwarila-platform/gitlab/aws-poc.tfstate",
+        "arn:aws:s3:::<account-id>-terraform/nwarila-platform/gitlab/aws-poc.tfstate.tflock"
+      ],
+      "Sid": "ReadWriteOnlyTheStateFileAndItsLock"
+    },
+    {
+      "Action": "s3:ListBucket",
+      "Condition": {
+        "StringEquals": {
+          "s3:prefix": [
+            "nwarila-platform/gitlab/aws-poc.tfstate",
+            "nwarila-platform/gitlab/aws-poc.tfstate.tflock"
+          ]
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:s3:::<account-id>-terraform",
+      "Sid": "ListOnlyThoseTwoKeys"
+    },
+    {
+      "Action": "s3:GetObject",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceAccount": "<account-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:s3:::<account-id>-apprepo/*",
+      "Sid": "ReadAppRepoByExactPathOnlyNoListing"
+    },
+    {
+      "Action": "s3:GetObject",
+      "Condition": {
+        "StringEquals": {
+          "aws:ResourceAccount": "<account-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:s3:::<account-id>-ansible/host_roles/domain_member/svc-domainjoin-password.txt",
+        "arn:aws:s3:::<account-id>-ansible/host_roles/remote_client/aws-ec2-test.ovpn"
+      ],
+      "Sid": "ReadOnlyTheDomainJoinAndOpenVpnCredentials"
+    }
+  ],
+  "Version": "2012-10-17"
+}

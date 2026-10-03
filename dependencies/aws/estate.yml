@@ -1,0 +1,84 @@
+# Standing objects the pinned aws-terraform-framework consumes but never creates: it takes a DB
+# subnet group by name and pre-created security groups by id (its docs/reference/invariants.md),
+# and RDS and Elastic Load Balancing each need their service-linked role before a first create.
+# The database's parameter group stands here too, so its values are reviewed rather than set per
+# run. All of them are free while unused, so they stand between runs and the ephemeral deploy only
+# references them. scripts/apply-dependencies.sh creates and reconciles them; the runner can
+# neither modify nor delete them, because none carries the deploy identity.
+#
+# Reachability is by membership, not by address: the nodes carry gitlab-node, which the load
+# balancer admits, and the nodes that use the database also carry gitlab-db-client, the only
+# group the database admits, so nothing else in a shared subnet reaches either. 'system-subnets'
+# resolves at apply time to every subnet terraform/aws.tfvars places a system in: the subnets are
+# named in exactly one file.
+schema: aws-estate/v3
+tags:
+  ManagedBy: "apply-dependencies"
+  Repository: "nwarila-platform/gitlab"
+service_linked_roles:
+  - "elasticloadbalancing.amazonaws.com"
+  - "rds.amazonaws.com"
+db_subnet_groups:
+  - name: "gitlab"
+    description: "GitLab database placement across the GitLab node subnets"
+    subnets: "system-subnets"
+# GitLab's required settings for an external PostgreSQL (its PostgreSQL tuning guide), hardened to
+# the DISA Crunchy Data Postgres 16 STIG V1R3 and the CIS PostgreSQL 17 Benchmark v1.0.0 wherever
+# they do not conflict with GitLab; dependencies/README.md lists what is deliberately not set and
+# why. Values are the strings the RDS API takes. The runner may create the database only with this
+# group, so a create that names another is denied. Every write applies at the next reboot: the
+# group changes only between runs, and each database boots with its values.
+db_parameter_groups:
+  - name: "gitlab"
+    family: "postgres17"
+    description: "GitLab PostgreSQL 17 settings: the required values for external instances"
+    parameters:
+      max_connections: "400"                        # GitLab's minimum; STIG V-261857
+      shared_buffers: "262144"                      # 8 kB pages: 2 GiB, GitLab's minimum
+      work_mem: "8192"                              # kB: 8 MB, GitLab
+      maintenance_work_mem: "65536"                 # kB: 64 MB, GitLab
+      statement_timeout: "60000"                    # ms; GitLab requires 15000-60000; STIG V-261899
+      idle_in_transaction_session_timeout: "60000"  # ms; GitLab's bundled default; STIG V-261910
+      password_encryption: "scram-sha-256"          # also the default; STIG V-261891 (CAT I); CIS 5.4
+      rds.accepted_password_auth_method: "scram"    # refuses md5 logins; STIG V-261892 (CAT I); CIS 5.4
+      rds.force_ssl: "1"                            # also the family default; STIG V-261900/V-261932/V-261933; CIS 6.8
+      ssl_min_protocol_version: "TLSv1.3"           # CIS 6.9 (v1.0.0)
+      log_connections: "1"                          # STIG V-261866/V-261956/V-261960/V-261961; CIS 3.1.20
+      log_disconnections: "1"                       # STIG V-261866/V-261960/V-261961; CIS 3.1.21
+      log_error_verbosity: "verbose"                # CIS 3.1.22
+      # RDS accepts exactly two prefixes, its default and this one; the trailing colon is part of it.
+      log_line_prefix: "%m:%r:%u@%d:[%p]:%l:%e:%s:%v:%x:%c:%q%a:"  # CIS 3.1.24; STIG V-261860/V-261866/V-261871
+      log_replication_commands: "1"                 # CIS 7.2
+      client_min_messages: "error"                  # STIG V-261908/V-261909
+      # pgaudit, for DDL and role changes only: CIS 3.2; STIG V-261861/V-261865/V-261872/V-261942/
+      # V-261944/V-261946/V-261950/V-261952/V-261958. The library loads at boot, beside RDS's default.
+      shared_preload_libraries: "pg_stat_statements,pgaudit"
+      pgaudit.log: "ddl,role"
+security_groups:
+  - name: "gitlab-db"
+    description: "GitLab database: PostgreSQL from the GitLab database clients only"
+    ingress:
+      - { description: "PostgreSQL from the GitLab database clients", protocol: "tcp", port: 5432, source: "gitlab-db-client" }
+    egress: []
+  # Membership only: the nodes that use the database carry it beside gitlab-node.
+  - name: "gitlab-db-client"
+    description: "GitLab database clients: membership the database admits"
+    ingress: []
+    egress: []
+  # Egress 80 carries HTTP traffic and both target groups' health checks; 2222 carries SSH to
+  # gitlab-sshd; 2305 carries Praefect and its health check.
+  - name: "gitlab-lb"
+    description: "GitLab internal NLB: SSH, HTTP and Praefect from the nodes, to gitlab-sshd, HTTP and Praefect on the nodes"
+    ingress:
+      - { description: "SSH from the GitLab nodes", protocol: "tcp", port: 22, source: "gitlab-node" }
+      - { description: "HTTP from the GitLab nodes", protocol: "tcp", port: 80, source: "gitlab-node" }
+      - { description: "Praefect from the GitLab nodes", protocol: "tcp", port: 2305, source: "gitlab-node" }
+    egress:
+      - { description: "GitLab Rails HTTP and the health checks of both target groups", protocol: "tcp", port: 80, source: "gitlab-node" }
+      - { description: "GitLab Rails SSH, served by gitlab-sshd", protocol: "tcp", port: 2222, source: "gitlab-node" }
+      - { description: "Praefect and its health check", protocol: "tcp", port: 2305, source: "gitlab-node" }
+  # Membership only: the nodes' own run-scoped rules live in terraform/aws.tfvars.
+  - name: "gitlab-node"
+    description: "GitLab nodes: membership the NLB admits"
+    ingress: []
+    egress: []

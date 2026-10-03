@@ -1,0 +1,28 @@
+{
+  "Statement": [
+    {
+      "Action": "iam:GetInstanceProfile",
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:iam::<account-id>:instance-profile/nwarila-ec2-profile",
+        "arn:aws:iam::<account-id>:instance-profile/nwarila-ec2-apprepo-profile"
+      ],
+      "Sid": "ReadTheOrgInstanceProfile"
+    },
+    {
+      "Action": "iam:PassRole",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ec2.amazonaws.com"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:iam::<account-id>:role/nwarila-ec2-role",
+        "arn:aws:iam::<account-id>:role/nwarila-ec2-apprepo-role"
+      ],
+      "Sid": "PassOnlyTheOrgEc2RoleAndOnlyToEc2"
+    }
+  ],
+  "Version": "2012-10-17"
+}

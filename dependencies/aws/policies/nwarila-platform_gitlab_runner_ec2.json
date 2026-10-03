@@ -1,0 +1,144 @@
+{
+  "Statement": [
+    {
+      "Action": [
+        "ec2:DescribeSubnets",
+        "ec2:DescribeImages",
+        "ec2:DescribeInstances",
+        "ec2:DescribeInstanceAttribute",
+        "ec2:DescribeInstanceTypes",
+        "ec2:DescribeInstanceCreditSpecifications",
+        "ec2:DescribeInstanceStatus",
+        "ec2:DescribeTags",
+        "ec2:DescribeVpcs",
+        "ec2:DescribeAvailabilityZones",
+        "ec2:DescribeKeyPairs"
+      ],
+      "Effect": "Allow",
+      "Resource": "*",
+      "Sid": "DescribeForPlanning"
+    },
+    {
+      "Action": "ec2:RunInstances",
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/CommitSha": "false",
+          "aws:RequestTag/Environment": "false",
+          "aws:RequestTag/RunId": "false"
+        },
+        "StringEquals": {
+          "aws:RequestTag/ManagedBy": "Terraform",
+          "aws:RequestTag/Repository": "nwarila-platform/gitlab",
+          "aws:RequestTag/RepositoryId": "<repository-id>",
+          "ec2:InstanceType": [
+            "t3.large",
+            "t3.medium",
+            "t3.small"
+          ]
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:instance/*",
+      "Sid": "RunInstancesTaggedOfTheDeclaredSize"
+    },
+    {
+      "Action": "ec2:RunInstances",
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/CommitSha": "false",
+          "aws:RequestTag/Environment": "false",
+          "aws:RequestTag/RunId": "false"
+        },
+        "StringEquals": {
+          "aws:RequestTag/ManagedBy": "Terraform",
+          "aws:RequestTag/Repository": "nwarila-platform/gitlab",
+          "aws:RequestTag/RepositoryId": "<repository-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:volume/*",
+      "Sid": "RunInstancesTaggedVolumes"
+    },
+    {
+      "Action": "ec2:RunInstances",
+      "Effect": "Allow",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:network-interface/*",
+      "Sid": "RunInstancesUntaggableEni"
+    },
+    {
+      "Action": "ec2:RunInstances",
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:ec2:<region>::image/*",
+        "arn:aws:ec2:<region>:<account-id>:subnet/*",
+        "arn:aws:ec2:<region>:<account-id>:security-group/*",
+        "arn:aws:ec2:<region>:<account-id>:key-pair/*",
+        "arn:aws:ec2:<region>:<account-id>:placement-group/*"
+      ],
+      "Sid": "RunInstancesReferencedResources"
+    },
+    {
+      "Action": [
+        "ec2:TerminateInstances",
+        "ec2:StartInstances",
+        "ec2:StopInstances",
+        "ec2:ModifyInstanceAttribute"
+      ],
+      "Condition": {
+        "Null": {
+          "ec2:ResourceTag/CommitSha": "false",
+          "ec2:ResourceTag/Environment": "false",
+          "ec2:ResourceTag/RunId": "false"
+        },
+        "StringEquals": {
+          "ec2:ResourceTag/ManagedBy": "Terraform",
+          "ec2:ResourceTag/Repository": "nwarila-platform/gitlab",
+          "ec2:ResourceTag/RepositoryId": "<repository-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:instance/*",
+      "Sid": "ManageOwnedInstanceLifecycle"
+    },
+    {
+      "Action": "ec2:CreateTags",
+      "Condition": {
+        "Null": {
+          "ec2:ResourceTag/CommitSha": "false",
+          "ec2:ResourceTag/Environment": "false",
+          "ec2:ResourceTag/RunId": "false"
+        },
+        "StringEquals": {
+          "ec2:ResourceTag/ManagedBy": "Terraform",
+          "ec2:ResourceTag/Repository": "nwarila-platform/gitlab",
+          "ec2:ResourceTag/RepositoryId": "<repository-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:ec2:<region>:<account-id>:instance/*",
+        "arn:aws:ec2:<region>:<account-id>:volume/*"
+      ],
+      "Sid": "TagResourcesWeAlreadyOwn"
+    },
+    {
+      "Action": "ec2:GetPasswordData",
+      "Condition": {
+        "Null": {
+          "ec2:ResourceTag/CommitSha": "false",
+          "ec2:ResourceTag/Environment": "false",
+          "ec2:ResourceTag/RunId": "false"
+        },
+        "StringEquals": {
+          "ec2:ResourceTag/ManagedBy": "Terraform",
+          "ec2:ResourceTag/Repository": "nwarila-platform/gitlab",
+          "ec2:ResourceTag/RepositoryId": "<repository-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:instance/*",
+      "Sid": "GetLaunchPasswordFromOwnedInstancesOnly"
+    }
+  ],
+  "Version": "2012-10-17"
+}

@@ -1,0 +1,86 @@
+{
+  "Statement": [
+    {
+      "Action": [
+        "ec2:DescribeNetworkInterfaces",
+        "ec2:DescribeNetworkInterfaceAttribute",
+        "ec2:DescribeAddresses"
+      ],
+      "Effect": "Allow",
+      "Resource": "*",
+      "Sid": "DescribeNetworkInterfacesAndAddresses"
+    },
+    {
+      "Action": "ec2:CreateNetworkInterface",
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/CommitSha": "false",
+          "aws:RequestTag/Environment": "false",
+          "aws:RequestTag/RunId": "false"
+        },
+        "StringEquals": {
+          "aws:RequestTag/ManagedBy": "Terraform",
+          "aws:RequestTag/Repository": "nwarila-platform/gitlab",
+          "aws:RequestTag/RepositoryId": "<repository-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:network-interface/*",
+      "Sid": "CreateTaggedNetworkInterface"
+    },
+    {
+      "Action": "ec2:CreateNetworkInterface",
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:ec2:<region>:<account-id>:subnet/*",
+        "arn:aws:ec2:<region>:<account-id>:security-group/*"
+      ],
+      "Sid": "CreateNetworkInterfaceReferencedResources"
+    },
+    {
+      "Action": [
+        "ec2:DeleteNetworkInterface",
+        "ec2:ModifyNetworkInterfaceAttribute",
+        "ec2:AttachNetworkInterface",
+        "ec2:DetachNetworkInterface"
+      ],
+      "Condition": {
+        "Null": {
+          "ec2:ResourceTag/CommitSha": "false",
+          "ec2:ResourceTag/Environment": "false",
+          "ec2:ResourceTag/RunId": "false"
+        },
+        "StringEquals": {
+          "ec2:ResourceTag/ManagedBy": "Terraform",
+          "ec2:ResourceTag/Repository": "nwarila-platform/gitlab",
+          "ec2:ResourceTag/RepositoryId": "<repository-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:network-interface/*",
+      "Sid": "ManageOwnedNetworkInterface"
+    },
+    {
+      "Action": [
+        "ec2:AttachNetworkInterface",
+        "ec2:DetachNetworkInterface"
+      ],
+      "Condition": {
+        "Null": {
+          "ec2:ResourceTag/CommitSha": "false",
+          "ec2:ResourceTag/Environment": "false",
+          "ec2:ResourceTag/RunId": "false"
+        },
+        "StringEquals": {
+          "ec2:ResourceTag/ManagedBy": "Terraform",
+          "ec2:ResourceTag/Repository": "nwarila-platform/gitlab",
+          "ec2:ResourceTag/RepositoryId": "<repository-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:instance/*",
+      "Sid": "AttachNetworkInterfaceToOwnedInstance"
+    }
+  ],
+  "Version": "2012-10-17"
+}

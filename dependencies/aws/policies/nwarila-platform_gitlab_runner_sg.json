@@ -1,0 +1,99 @@
+{
+  "Statement": [
+    {
+      "Action": [
+        "ec2:DescribeSecurityGroups",
+        "ec2:DescribeSecurityGroupRules"
+      ],
+      "Effect": "Allow",
+      "Resource": "*",
+      "Sid": "DescribeSecurityGroups"
+    },
+    {
+      "Action": "ec2:CreateSecurityGroup",
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/CommitSha": "false",
+          "aws:RequestTag/Environment": "false",
+          "aws:RequestTag/RunId": "false"
+        },
+        "StringEquals": {
+          "aws:RequestTag/ManagedBy": "Terraform",
+          "aws:RequestTag/Repository": "nwarila-platform/gitlab",
+          "aws:RequestTag/RepositoryId": "<repository-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "*",
+      "Sid": "CreateTaggedSecurityGroup"
+    },
+    {
+      "Action": "ec2:CreateSecurityGroup",
+      "Effect": "Allow",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:vpc/*",
+      "Sid": "CreateSecurityGroupVpcResource"
+    },
+    {
+      "Action": [
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:RevokeSecurityGroupIngress",
+        "ec2:ModifySecurityGroupRules",
+        "ec2:DeleteSecurityGroup"
+      ],
+      "Condition": {
+        "Null": {
+          "ec2:ResourceTag/CommitSha": "false",
+          "ec2:ResourceTag/Environment": "false",
+          "ec2:ResourceTag/RunId": "false"
+        },
+        "StringEquals": {
+          "ec2:ResourceTag/ManagedBy": "Terraform",
+          "ec2:ResourceTag/Repository": "nwarila-platform/gitlab",
+          "ec2:ResourceTag/RepositoryId": "<repository-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:ec2:<region>:<account-id>:security-group/*"
+      ],
+      "Sid": "ManageOwnedGroupsOnly"
+    },
+    {
+      "Action": "ec2:CreateTags",
+      "Condition": {
+        "StringEquals": {
+          "ec2:CreateAction": [
+            "CreateSecurityGroup",
+            "CreateVolume",
+            "RunInstances",
+            "CreateNetworkInterface"
+          ]
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "*",
+      "Sid": "TagOnCreateOnly"
+    },
+    {
+      "Action": "ec2:CreateTags",
+      "Effect": "Allow",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:security-group-rule/*",
+      "Sid": "TagSecurityGroupRulesOnCreate"
+    },
+    {
+      "Action": [
+        "ec2:AuthorizeSecurityGroupEgress",
+        "ec2:RevokeSecurityGroupEgress",
+        "ec2:AuthorizeSecurityGroupIngress",
+        "ec2:RevokeSecurityGroupIngress",
+        "ec2:ModifySecurityGroupRules"
+      ],
+      "Effect": "Allow",
+      "Resource": "arn:aws:ec2:<region>:<account-id>:security-group-rule/*",
+      "Sid": "ManageRuleObjectsInOwnedGroups"
+    }
+  ],
+  "Version": "2012-10-17"
+}

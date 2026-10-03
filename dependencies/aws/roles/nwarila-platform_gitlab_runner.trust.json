@@ -1,0 +1,25 @@
+{
+  "Statement": [
+    {
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+          "token.actions.githubusercontent.com:job_workflow_ref": "nwarila-platform/gitlab/.github/workflows/aws-deploy.yml@refs/heads/main",
+          "token.actions.githubusercontent.com:ref": "refs/heads/main",
+          "token.actions.githubusercontent.com:repository_id": "<repository-id>",
+          "token.actions.githubusercontent.com:sub": [
+            "repo:nwarila-platform@<owner-id>/gitlab@<repository-id>:ref:refs/heads/main",
+            "repo:nwarila-platform/gitlab:ref:refs/heads/main"
+          ]
+        }
+      },
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::<account-id>:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Sid": "GitHubActionsForGitLabDeployWorkflows"
+    }
+  ],
+  "Version": "2012-10-17"
+}

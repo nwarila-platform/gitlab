@@ -1,0 +1,82 @@
+{
+  "Statement": [
+    {
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:GetParameters"
+      ],
+      "Effect": "Allow",
+      "Resource": "arn:aws:ssm:<region>:<account-id>:parameter/nwarila/ami/*",
+      "Sid": "ReadTheImageCatalogParametersOnly"
+    },
+    {
+      "Action": "ssm:DescribeInstanceInformation",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "<region>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "*",
+      "Sid": "DescribeSsmManagedInstances"
+    },
+    {
+      "Action": "ssm:StartSession",
+      "Condition": {
+        "StringEquals": {
+          "ssm:resourceTag/RepositoryId": "<repository-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:ec2:<region>:*:instance/*",
+      "Sid": "SsmSessionOnlyToOurTaggedInstances"
+    },
+    {
+      "Action": "ssm:StartSession",
+      "Effect": "Allow",
+      "Resource": "arn:aws:ssm:<region>::document/AWS-StartSSHSession",
+      "Sid": "SsmStartSshSessionDocument"
+    },
+    {
+      "Action": [
+        "ssm:TerminateSession",
+        "ssm:ResumeSession"
+      ],
+      "Effect": "Allow",
+      "Resource": "arn:aws:ssm:<region>:*:session/${aws:userid}-*",
+      "Sid": "SsmSessionTeardownInRegion"
+    },
+    {
+      "Action": "ssm:SendCommand",
+      "Condition": {
+        "StringEquals": {
+          "ssm:resourceTag/RepositoryId": "<repository-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:ec2:<region>:*:instance/*",
+      "Sid": "SendCommandOnlyToOurTaggedInstances"
+    },
+    {
+      "Action": "ssm:SendCommand",
+      "Effect": "Allow",
+      "Resource": "arn:aws:ssm:<region>::document/AWS-RunPowerShellScript",
+      "Sid": "SendCommandOnlyWithThePowerShellDocument"
+    },
+    {
+      "Action": [
+        "ssm:GetCommandInvocation",
+        "ssm:ListCommandInvocations"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestedRegion": "<region>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "*",
+      "Sid": "ReadOwnCommandResults"
+    }
+  ],
+  "Version": "2012-10-17"
+}

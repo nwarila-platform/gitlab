@@ -1,0 +1,130 @@
+{
+  "Statement": [
+    {
+      "Action": [
+        "elasticloadbalancing:DescribeCapacityReservation",
+        "elasticloadbalancing:DescribeListenerAttributes",
+        "elasticloadbalancing:DescribeListeners",
+        "elasticloadbalancing:DescribeLoadBalancerAttributes",
+        "elasticloadbalancing:DescribeLoadBalancers",
+        "elasticloadbalancing:DescribeRules",
+        "elasticloadbalancing:DescribeTags",
+        "elasticloadbalancing:DescribeTargetGroupAttributes",
+        "elasticloadbalancing:DescribeTargetGroups",
+        "elasticloadbalancing:DescribeTargetHealth"
+      ],
+      "Effect": "Allow",
+      "Resource": "*",
+      "Sid": "DescribeLoadBalancing"
+    },
+    {
+      "Action": "elasticloadbalancing:CreateLoadBalancer",
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/CommitSha": "false",
+          "aws:RequestTag/Environment": "false",
+          "aws:RequestTag/RunId": "false"
+        },
+        "StringEquals": {
+          "aws:RequestTag/ManagedBy": "Terraform",
+          "aws:RequestTag/Repository": "nwarila-platform/gitlab",
+          "aws:RequestTag/RepositoryId": "<repository-id>",
+          "elasticloadbalancing:Scheme": "internal"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:elasticloadbalancing:<region>:<account-id>:loadbalancer/net/gitlab/*",
+      "Sid": "CreateTaggedInternalLoadBalancerOnly"
+    },
+    {
+      "Action": "elasticloadbalancing:CreateListener",
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/CommitSha": "false",
+          "aws:RequestTag/Environment": "false",
+          "aws:RequestTag/RunId": "false"
+        },
+        "StringEquals": {
+          "aws:RequestTag/ManagedBy": "Terraform",
+          "aws:RequestTag/Repository": "nwarila-platform/gitlab",
+          "aws:RequestTag/RepositoryId": "<repository-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:elasticloadbalancing:<region>:<account-id>:loadbalancer/net/gitlab/*",
+      "Sid": "CreateTaggedListenerOnTheGitLabLoadBalancer"
+    },
+    {
+      "Action": "elasticloadbalancing:CreateTargetGroup",
+      "Condition": {
+        "Null": {
+          "aws:RequestTag/CommitSha": "false",
+          "aws:RequestTag/Environment": "false",
+          "aws:RequestTag/RunId": "false"
+        },
+        "StringEquals": {
+          "aws:RequestTag/ManagedBy": "Terraform",
+          "aws:RequestTag/Repository": "nwarila-platform/gitlab",
+          "aws:RequestTag/RepositoryId": "<repository-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": "arn:aws:elasticloadbalancing:<region>:<account-id>:targetgroup/tf-*/*",
+      "Sid": "CreateTaggedTargetGroup"
+    },
+    {
+      "Action": "elasticloadbalancing:AddTags",
+      "Condition": {
+        "StringEquals": {
+          "elasticloadbalancing:CreateAction": [
+            "CreateListener",
+            "CreateLoadBalancer",
+            "CreateTargetGroup"
+          ]
+        }
+      },
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:elasticloadbalancing:<region>:<account-id>:loadbalancer/net/gitlab/*",
+        "arn:aws:elasticloadbalancing:<region>:<account-id>:listener/net/gitlab/*/*",
+        "arn:aws:elasticloadbalancing:<region>:<account-id>:targetgroup/tf-*/*"
+      ],
+      "Sid": "TagOnCreateOnly"
+    },
+    {
+      "Action": [
+        "elasticloadbalancing:DeleteListener",
+        "elasticloadbalancing:DeleteLoadBalancer",
+        "elasticloadbalancing:DeleteTargetGroup",
+        "elasticloadbalancing:DeregisterTargets",
+        "elasticloadbalancing:ModifyListener",
+        "elasticloadbalancing:ModifyListenerAttributes",
+        "elasticloadbalancing:ModifyLoadBalancerAttributes",
+        "elasticloadbalancing:ModifyTargetGroup",
+        "elasticloadbalancing:ModifyTargetGroupAttributes",
+        "elasticloadbalancing:RegisterTargets",
+        "elasticloadbalancing:SetSecurityGroups"
+      ],
+      "Condition": {
+        "Null": {
+          "aws:ResourceTag/CommitSha": "false",
+          "aws:ResourceTag/Environment": "false",
+          "aws:ResourceTag/RunId": "false"
+        },
+        "StringEquals": {
+          "aws:ResourceTag/ManagedBy": "Terraform",
+          "aws:ResourceTag/Repository": "nwarila-platform/gitlab",
+          "aws:ResourceTag/RepositoryId": "<repository-id>"
+        }
+      },
+      "Effect": "Allow",
+      "Resource": [
+        "arn:aws:elasticloadbalancing:<region>:<account-id>:loadbalancer/net/gitlab/*",
+        "arn:aws:elasticloadbalancing:<region>:<account-id>:listener/net/gitlab/*/*",
+        "arn:aws:elasticloadbalancing:<region>:<account-id>:targetgroup/tf-*/*"
+      ],
+      "Sid": "ManageOwnedLoadBalancingOnly"
+    }
+  ],
+  "Version": "2012-10-17"
+}
