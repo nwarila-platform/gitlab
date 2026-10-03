@@ -14,8 +14,8 @@ sidekiq['concurrency'] = 10
 external_url '{{ __config__.external_url }}'
 
 # Puma, Sidekiq, Workhorse and NGINX. Naming a role stops the bundled PostgreSQL and Redis from
-# loading; the role's Gitaly is switched off because Gitaly has its own node. KAS is off because
-# it would call external_url, the load balancer, and no Rails node is the balancer's client.
+# loading; the role's Gitaly is switched off because Gitaly has its own nodes. KAS is off because
+# it would call external_url, the load balancer's HTTP listener, whose target a Rails node is.
 roles(['application_role'])
 gitaly['enable'] = false
 gitlab_kas['enable'] = false
@@ -41,9 +41,14 @@ gitlab_rails['redis_host'] = '{{ __config__.redis.host }}'
 gitlab_rails['redis_port'] = {{ __config__.redis.port | int }}
 gitlab_rails['redis_password'] = '{{ __config__.redis.password }}'
 
-gitlab_rails['gitaly_token'] = '{{ __config__.gitaly.token }}'
+# The one storage is Praefect's virtual storage, through the load balancer, and carries the token
+# Praefect takes. The global gitlab_rails['gitaly_token'] is deliberately unset: no storage falls
+# back to it (configure.md, "Configure GitLab").
 gitlab_rails['repositories_storages'] = {
-  'default' => { 'gitaly_address' => '{{ __config__.gitaly.address }}' },
+  'default' => {
+    'gitaly_address' => '{{ __config__.gitaly.address }}',
+    'gitaly_token' => '{{ __config__.gitaly.token }}',
+  },
 }
 
 # One bucket, each object type under this deployment's prefix, through the instance profile.
@@ -83,7 +88,8 @@ gitlab_sshd['public_key_algorithms'] = [
 ]
 {% elif __config__.node_role == 'gitaly' %}
 
-# Gitaly alone. GitLab's internal API is reached through the load balancer.
+# Gitaly alone, one storage of Praefect's virtual storage, named for this node; it accepts only
+# Praefect's internal token. GitLab's internal API is reached through the load balancer.
 roles(['gitaly_role'])
 prometheus_monitoring['enable'] = false
 gitlab_rails['auto_migrate'] = false
@@ -91,7 +97,63 @@ gitlab_rails['internal_api_url'] = '{{ __config__.gitaly.internal_api_url }}'
 gitaly['configuration'] = {
   listen_addr: '0.0.0.0:8075',
   auth: { token: '{{ __config__.gitaly.token }}' },
-  storage: [{ name: 'default', path: '/var/opt/gitlab/git-data/repositories' }],
+  storage: [
+    { name: '{{ __config__.gitaly.storage }}', path: '/var/opt/gitlab/git-data/repositories' },
+  ],
+}
+{% elif __config__.node_role == 'praefect' %}
+
+# Praefect alone. No role names it, so every service the default role would start is switched
+# off by name (configure.md, "Praefect"); prometheus_monitoring covers Prometheus, Alertmanager
+# and the exporters. Not set, each deliberately: prometheus_listen_addr keeps its localhost
+# default, since nothing scrapes it; no session_pooled connection, since Praefect connects to
+# RDS directly, with no PgBouncer between; praefect['env'] keeps omnibus's own; no TLS listener.
+gitaly['enable'] = false
+postgresql['enable'] = false
+redis['enable'] = false
+nginx['enable'] = false
+puma['enable'] = false
+sidekiq['enable'] = false
+gitlab_workhorse['enable'] = false
+gitlab_kas['enable'] = false
+prometheus_monitoring['enable'] = false
+praefect['enable'] = true
+# Only the first Praefect node migrates Praefect's database; the others start once it has.
+praefect['auto_migrate'] = {{ __config__.auto_migrate | ternary('true', 'false') }}
+gitlab_rails['auto_migrate'] = false
+praefect['configuration'] = {
+  listen_addr: '0.0.0.0:{{ __config__.praefect.port | int }}',
+  # The token every Gitaly client presents to Praefect.
+  auth: { token: '{{ __config__.praefect.token }}' },
+  # Praefect's own unprivileged role and database, over TLS verified against the RDS bundle,
+  # in place of the default opportunistic sslmode 'prefer'.
+  database: {
+    host: '{{ __config__.database.host }}',
+    port: {{ __config__.database.port | int }},
+    user: '{{ __config__.database.username }}',
+    password: '{{ __config__.database.password }}',
+    dbname: '{{ __config__.database.name }}',
+    sslmode: 'verify-full',
+    sslrootcert: '/etc/gitlab/rds-ca-bundle.pem',
+  },
+  # Every Gitaly node, each reached with the internal token. The replication factor is stated
+  # rather than left to its default, every node.
+  virtual_storage: [
+    {
+      # The storage Rails names 'default'; GitLab requires a storage of that name.
+      name: 'default',
+      default_replication_factor: {{ __config__.praefect.replication_factor | int }},
+      node: [
+{% for node in __config__.praefect.nodes %}
+        {
+          storage: '{{ node.storage }}',
+          address: '{{ node.address }}',
+          token: '{{ __config__.gitaly.token }}',
+        },
+{% endfor %}
+      ],
+    },
+  ],
 }
 {% elif __config__.node_role == 'redis' %}
 

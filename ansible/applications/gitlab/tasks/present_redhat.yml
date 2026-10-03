@@ -186,6 +186,8 @@
     # Gitaly executes the binaries it writes at run time; no other node role runs Gitaly.
     __runs_gitaly__: "{{ gitlab_running.node_role in ['all-in-one', 'gitaly'] }}"
     __rails__: "{{ gitlab_running.node_role == 'rails' }}"
+    # The node roles whose service connects to the external database.
+    __database_client__: "{{ gitlab_running.node_role in ['rails', 'praefect'] }}"
     # What GitLab was reconfigured from: the version and the gitlab.rb written below. A
     # difference from the record on disk reconfigures.
     __record__: "{{ gitlab_running.installer.version }} {{ __gitlab_config__.stat.checksum }}"
@@ -429,7 +431,7 @@
     # libpq verifies the database's certificate against this bundle (sslmode verify-full).
     - name: 'PROCESS | Write The Database Certificate Bundle'
       register: '__gitlab_ca__'
-      when: __rails__ | bool
+      when: __database_client__ | bool
 
       ansible.builtin.copy:
         backup: false
@@ -446,7 +448,7 @@
 
     - name: 'PROCESS | Read The Database Certificate Bundle Digest'
       register: '__gitlab_ca_file__'
-      when: __rails__ | bool
+      when: __database_client__ | bool
 
       ansible.builtin.stat:
         checksum_algorithm: 'sha256'
@@ -458,7 +460,7 @@
         path: '/etc/gitlab/rds-ca-bundle.pem'
 
     - name: 'PROCESS | Require The Pinned Database Certificate Bundle'
-      when: __rails__ | bool
+      when: __database_client__ | bool
 
       ansible.builtin.assert:
         fail_msg: >-
@@ -578,9 +580,10 @@
 
     #endregion --- [ Process: Let Gitaly Execute Under fapolicyd ] ---------------------------- #
 
-    #region ------ [ Process: Create GitLab's Database Role And Database ] -------------------- #
+    #region ------ [ Process: Create This Node's Database Role And Database ] ----------------- #
 
-    # Before the first reconfigure, which migrates as GitLab's own role into its own database.
+    # Before the first reconfigure, which migrates as the service's own role into its own
+    # database: GitLab's on a Rails node, Praefect's on a Praefect node.
     # The master user creates both, makes itself a member of the role so that it may create the
     # role's database and, through the role's ownership of the database's public schema, the
     # extensions in it. Read first, and only what is absent is created: there is no CREATE ... IF
@@ -593,7 +596,7 @@
     # without a psqlrc (-X) and stops at the first error. no_log would also hide why psql failed,
     # so each call is judged by the assert after it, which shows psql's own messages with any
     # verifier redacted: they never carry the password.
-    - name: 'PROCESS | Create GitLab''s Database Role And Database'
+    - name: 'PROCESS | Create This Node''s Database Role And Database'
       vars:
         __bootstrap__: "{{ gitlab_running.database_bootstrap }}"
         __role__: "{{ gitlab_running.database.username }}"
@@ -629,13 +632,13 @@
         # Matches a SCRAM verifier; the asserts redact it from psql's stderr.
         __verifier__: 'SCRAM-SHA-256[$][A-Za-z0-9+/=:$]*'
       when:
-        - __rails__ | bool
+        - __database_client__ | bool
         - gitlab_running.database_bootstrap.enabled | bool
       block:
 
         # rc-contract: psql(1) exits 0 on success, 1 on its own fatal error, 2 when the
         # connection fails, and 3 when a statement fails under ON_ERROR_STOP.
-        - name: 'PROCESS | Read Whether GitLab''s Role And Database Exist'
+        - name: 'PROCESS | Read Whether The Role And Its Database Exist'
           changed_when: false
           check_mode: false
           failed_when: false
@@ -750,7 +753,7 @@
 
         # rc-contract: psql(1) exits 0 on success, 1 on its own fatal error, 2 when the
         # connection fails, and 3 when a statement fails under ON_ERROR_STOP.
-        - name: 'PROCESS | Read GitLab''s Database And Its Extensions'
+        - name: 'PROCESS | Read The Database And Its Extensions'
           changed_when: false
           check_mode: false
           failed_when: false
@@ -845,7 +848,7 @@
             quiet: true
             that: __gitlab_db_extensions__.rc == 0
 
-        - name: 'PROCESS | Require GitLab''s Role To Own Its Database With Every Extension'
+        - name: 'PROCESS | Require The Role To Own Its Database With Every Extension'
           vars:
             __database__: "{{ __gitlab_db_database__.stdout | from_json }}"
             __extensions_now__: >-
@@ -865,7 +868,7 @@
               - __database__.membership | bool
               - __bootstrap__.extensions | difference(__extensions_now__) | length == 0
 
-    #endregion --- [ Process: Create GitLab's Database Role And Database ] -------------------- #
+    #endregion --- [ Process: Create This Node's Database Role And Database ] ----------------- #
 
     #region ------ [ Process: Reconfigure GitLab ] -------------------------------------------- #
 
@@ -1036,9 +1039,11 @@
         stdin_add_newline: true
         strip_empty_ends: true
 
-    # all=1 adds the database, Redis and Gitaly checks to the controller's own, so on a Rails
-    # node it proves that node reaches all three. Puma boots for minutes after a reconfigure.
-    # 60 tries 10 seconds apart are UNMEASURED: a bound until a live run measures the boot.
+    # all=1 adds the database, Redis and Gitaly checks to the controller's own. On a Rails node
+    # that proves its database and Redis, and that a Praefect answers through the load balancer:
+    # Praefect answers the Gitaly health check itself, without a token and without asking a
+    # Gitaly node. Puma boots for minutes after a reconfigure. 60 tries 10 seconds apart are
+    # UNMEASURED: a bound until a live run measures the boot.
     - name: 'END | Wait For GitLab To Report Ready'
       delay: 10
       register: '__gitlab_ready__'
@@ -1067,13 +1072,50 @@
         use_proxy: true
         validate_certs: true
 
-    # The port each other role serves its peers on: gitlab-sshd on a Rails node, Gitaly and
-    # Redis on theirs. UNMEASURED: a bound until a live run measures the start.
+    # Praefect opens its database before it registers a listener, so without the database nothing
+    # ever listens on its port, and the wait below could only say so. As git, which may read
+    # config.toml (root:git 0640). The OK line is sql-ping's own (subcmd_sql_ping.go), printed
+    # only after a verify-full connection, so over TLS.
+    # rc-contract: praefect exits 0 after printing it and 1 when the ping fails.
+    - name: 'END | Read Whether Praefect Reaches Its Database'
+      become: true
+      become_user: 'git'
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      register: '__gitlab_praefect_ping__'
+      when: gitlab_running.node_role == 'praefect'
+
+      ansible.builtin.command:
+        argv:
+          - '/opt/gitlab/embedded/bin/praefect'
+          - '-config'
+          - '/var/opt/gitlab/praefect/config.toml'
+          - 'sql-ping'
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    - name: 'END | Require Praefect To Reach Its Database Over TLS'
+      when: gitlab_running.node_role == 'praefect'
+
+      ansible.builtin.assert:
+        fail_msg: >-
+          praefect sql-ping exited {{ __gitlab_praefect_ping__.rc }}:
+          {{ __gitlab_praefect_ping__.stderr_lines[-5:] }}
+        quiet: true
+        that:
+          - __gitlab_praefect_ping__.rc == 0
+          - "'praefect sql-ping: OK' in __gitlab_praefect_ping__.stdout_lines"
+
+    # The port each other role serves its peers on: gitlab-sshd on a Rails node, Gitaly,
+    # Praefect and Redis on theirs. UNMEASURED: a bound until a live run measures the start.
     - name: 'END | Wait For The Node Role To Listen'
-      when: gitlab_running.node_role in ['rails', 'gitaly', 'redis']
+      when: gitlab_running.node_role in ['rails', 'gitaly', 'praefect', 'redis']
       vars:
         __port__: >-
           {{ {'rails': gitlab_running.sshd.port, 'gitaly': 8075,
+              'praefect': gitlab_running.praefect.port,
               'redis': gitlab_running.redis.port}[gitlab_running.node_role] }}
 
       ansible.builtin.wait_for:

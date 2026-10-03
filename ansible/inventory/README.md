@@ -19,14 +19,16 @@ Terraform stamps each system with a `Function` tag, and each group is built from
 | Group | Hosts |
 |---|---|
 | `gitlab_rails` | `Function` `gitlab-rails`: the two Rails nodes |
-| `gitlab_gitaly` | `Function` `gitlab-gitaly`: the Gitaly node |
+| `gitlab_gitaly` | `Function` `gitlab-gitaly`: the three Gitaly nodes |
+| `gitlab_praefect` | `Function` `gitlab-praefect`: the three Praefect nodes |
 | `gitlab_redis` | `Function` `gitlab-redis`: the Redis node |
-| `gitlab_servers` | all three functions: every node the playbook configures |
+| `gitlab_servers` | all four functions: every node the playbook configures |
 
-The playbook's first play requires exactly that topology: two Rails nodes in two zones, one Gitaly
-node and one Redis node. That they share one VPC is the Terraform framework's runner-ingress
-precondition. The playbook's node that migrates the database is the first Rails node by name,
-never by inventory order.
+The playbook's first play requires exactly that topology: two Rails nodes in two zones, three
+Gitaly nodes, three Praefect nodes and one Redis node. That they share one VPC is the Terraform
+framework's runner-ingress precondition. The nodes that migrate a database, GitLab's and
+Praefect's, are the first Rails node and the first Praefect node by name, never by inventory
+order.
 
 Hosts are named by their **Name tag**, which is the hostname Terraform declares, so
 `inventory_hostname` is the system's own name and nothing downstream has to be told it again. Every

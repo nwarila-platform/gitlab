@@ -52,7 +52,7 @@ gitlab_defaults:
 
   # What this node runs. 'all-in-one' is every bundled service on one node, and renders exactly
   # the configuration a single node was proven with. The distributed layout's roles are 'rails'
-  # (Puma, Sidekiq, Workhorse, NGINX and gitlab-sshd), 'gitaly' and 'redis'.
+  # (Puma, Sidekiq, Workhorse, NGINX and gitlab-sshd), 'gitaly', 'praefect' and 'redis'.
   node_role: 'all-in-one'
 
   #endregion --- [ Node Role ] ---------------------------------------------------------------- #
@@ -63,7 +63,8 @@ gitlab_defaults:
   # all-in-one and rails only.
   external_url: ''
 
-  # Whether this node's reconfigure migrates the database. Exactly one Rails node does, so a
+  # Whether this node's reconfigure migrates its service's database. Exactly one node per
+  # database does, the first Rails node GitLab's and the first Praefect node Praefect's, so a
   # node migrates only when it is told to.
   auto_migrate: false
 
@@ -77,12 +78,13 @@ gitlab_defaults:
 
   #endregion --- [ Configuration ] ------------------------------------------------------------ #
 
-  #region ------ [ Rails: Database ] ---------------------------------------------------------- #
+  #region ------ [ Rails And Praefect: Database ] --------------------------------------------- #
 
-  # The external PostgreSQL GitLab connects to as its own unprivileged role. The connection
-  # requires TLS and verifies the server against the RDS certificate bundle in files/, pinned by
-  # its SHA-256: the us-east-1 bundle, which holds rds-ca-rsa2048-g1, the authority a new
-  # instance is issued from. The server's own statement_timeout bounds every statement.
+  # The database this node's service connects to as its own unprivileged role: GitLab's on a
+  # Rails node, Praefect's on a Praefect node. The connection requires TLS and verifies the
+  # server against the RDS certificate bundle in files/, pinned by its SHA-256: the us-east-1
+  # bundle, which holds rds-ca-rsa2048-g1, the authority a new instance is issued from. The
+  # server's own statement_timeout bounds every statement.
   database:
     host: ''
     port: 5432
@@ -92,13 +94,13 @@ gitlab_defaults:
     ca_file: 'rds-ca-bundle.pem'
     ca_sha256: 'b1711d12bae51838581281e23b6cb97b1074016873b4dafc80ed14002462dd77'
 
-  # One Rails node creates GitLab's role and database before its first reconfigure, as the
-  # database's master user, whose credentials only that node is given. master_database is the
-  # database the master user connects to first: RDS's initial one. GitLab connects only as its
-  # own role, which owns its database and holds no superuser, role or database creation right.
-  # The extensions are created by the master user, so GitLab needs no rds_superuser for them:
-  # GitLab's required set, and pgaudit, which the parameter group loads for DDL and role
-  # auditing.
+  # The node whose reconfigure migrates a database creates that service's role and database
+  # before its first reconfigure, as the database's master user, whose credentials only that
+  # node is given. master_database is the database the master user connects to first: RDS's
+  # initial one. The service connects only as its own role, which owns its database and holds no
+  # superuser, role or database creation right. The extensions are created by the master user,
+  # so the service needs no rds_superuser for them; the default is GitLab's required set, and
+  # pgaudit, which the parameter group loads for DDL and role auditing.
   database_bootstrap:
     enabled: false
     master_database: ''
@@ -106,9 +108,9 @@ gitlab_defaults:
     master_password: ''
     extensions: [ 'amcheck', 'btree_gist', 'pg_trgm', 'pgaudit', 'plpgsql' ]
 
-  #endregion --- [ Rails: Database ] ---------------------------------------------------------- #
+  #endregion --- [ Rails And Praefect: Database ] --------------------------------------------- #
 
-  #region ------ [ Rails: Redis And Gitaly ] -------------------------------------------------- #
+  #region ------ [ Redis And Gitaly ] --------------------------------------------------------- #
 
   # The Redis node the Rails nodes share. The password is a run secret.
   redis:
@@ -116,14 +118,32 @@ gitlab_defaults:
     port: 6379
     password: ''
 
-  # rails: address is where Gitaly listens, tcp://<address>:8075. gitaly: internal_api_url is
-  # where it reaches GitLab's internal API. Both share the token.
+  # rails: address is where the virtual storage 'default' is served, tcp://<host>:<port>, and
+  # token the one that storage takes. gitaly: storage is this node's own storage name,
+  # internal_api_url where it reaches GitLab's internal API, and token the one it accepts.
+  # praefect: token is the one it presents to every Gitaly node.
   gitaly:
     address: ''
     token: ''
+    storage: ''
     internal_api_url: ''
 
-  #endregion --- [ Rails: Redis And Gitaly ] -------------------------------------------------- #
+  #endregion --- [ Redis And Gitaly ] --------------------------------------------------------- #
+
+  #region ------ [ Praefect ] ----------------------------------------------------------------- #
+
+  # Praefect serves the virtual storage 'default' on this port to every Gitaly client, which
+  # must present token; it replicates each repository to replication_factor of nodes, each a
+  # {storage, address} of one Gitaly node. That token and gitaly.token differ: a client that
+  # held the internal one could reach the Gitaly nodes past Praefect, which GitLab warns can
+  # lose data.
+  praefect:
+    port: 2305
+    token: ''
+    replication_factor: 3
+    nodes: []
+
+  #endregion --- [ Praefect ] ----------------------------------------------------------------- #
 
   #region ------ [ Rails: Object Storage ] ---------------------------------------------------- #
 

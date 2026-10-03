@@ -46,10 +46,12 @@
 
   ansible.builtin.assert:
     fail_msg: >-
-      Refusing to deploy: node_role must be one of all-in-one, rails, gitaly or redis. Got
-      '{{ gitlab_running.node_role | default('') }}'.
+      Refusing to deploy: node_role must be one of all-in-one, rails, gitaly, praefect or redis.
+      Got '{{ gitlab_running.node_role | default('') }}'.
     quiet: true
-    that: gitlab_running.node_role | default('') in ['all-in-one', 'rails', 'gitaly', 'redis']
+    that: >-
+      gitlab_running.node_role | default('')
+      in ['all-in-one', 'rails', 'gitaly', 'praefect', 'redis']
 
 #endregion --- [ Validate: The Node Role ] ---------------------------------------------------- #
 
@@ -73,68 +75,39 @@
 
 #endregion --- [ Validate: The External URL ] ------------------------------------------------- #
 
-#region ------ [ Validate: The Rails Inputs ] ------------------------------------------------- #
+#region ------ [ Validate: The Database Inputs ] ---------------------------------------------- #
 
-# check: safety-critical -- every value below is written into gitlab.rb. The passwords and tokens
-# are run secrets the playbook generates as letters and digits only, so the shape is also what
-# proves the generator ran.
-- name: 'VALIDATE | Require The Rails Node Inputs'
-  vars:
-    __ipv4__: '([0-9]{1,3}[.]){3}[0-9]{1,3}'
-    __secret__: '^[A-Za-z0-9]{48,}$'
-    __cidr__: '^(([0-9]{1,3}[.]){3}[0-9]{1,3}/[0-9]{1,2}|[0-9a-f:]+/[0-9]{1,3})$'
+# check: safety-critical -- every value below is written into gitlab.rb. The password is a run
+# secret the playbook generates as letters and digits only, so the shape is also what proves the
+# generator ran.
+- name: 'VALIDATE | Require The Database Inputs'
   when:
     - (state | default('present') | string | lower | trim) == 'present'
-    - gitlab_running.node_role == 'rails'
+    - gitlab_running.node_role in ['rails', 'praefect']
 
   ansible.builtin.assert:
     fail_msg: >-
-      Refusing to deploy a Rails node: database.host must be a DNS name, database.name and
-      database.username PostgreSQL identifiers, database.port, redis.port and sshd.port numbers;
-      database.password, redis.password and gitaly.token at least 48 letters and digits;
-      redis.host an IPv4 address and gitaly.address tcp://<IPv4>:8075; object_store.bucket an S3
-      bucket name, object_store.prefix runs/<run id> and object_store.region an AWS region;
-      object_store.types GitLab object types other than pages; each monitoring_whitelist entry a
-      CIDR; auto_migrate a boolean; sshd.host_key_source_dir a directory directly under /root.
-      Got database host
-      '{{ gitlab_running.database.host }}', name '{{ gitlab_running.database.name }}',
-      username '{{ gitlab_running.database.username }}', redis host
-      '{{ gitlab_running.redis.host }}', gitaly address '{{ gitlab_running.gitaly.address }}',
-      object store prefix '{{ gitlab_running.object_store.prefix }}', types
-      {{ gitlab_running.object_store.types }}, monitoring whitelist
-      {{ gitlab_running.monitoring_whitelist }}, auto_migrate
-      '{{ gitlab_running.auto_migrate }}', sshd {{ gitlab_running.sshd }}.
+      Refusing to deploy a {{ gitlab_running.node_role }} node: database.host must be a DNS
+      name, database.name and database.username PostgreSQL identifiers, database.port a number,
+      database.password at least 48 letters and digits, and auto_migrate a boolean. Got
+      database host '{{ gitlab_running.database.host }}', port
+      '{{ gitlab_running.database.port }}', name '{{ gitlab_running.database.name }}', username
+      '{{ gitlab_running.database.username }}', auto_migrate '{{ gitlab_running.auto_migrate }}'.
     quiet: true
     that:
       - gitlab_running.database.host is match('^[a-z0-9.-]+$')
       - gitlab_running.database.port | string is match('^[0-9]{1,5}$')
       - gitlab_running.database.name is match('^[a-z_][a-z0-9_]*$')
       - gitlab_running.database.username is match('^[a-z_][a-z0-9_]*$')
-      - gitlab_running.database.password is match(__secret__)
-      - gitlab_running.redis.host is match('^' ~ __ipv4__ ~ '$')
-      - gitlab_running.redis.port | string is match('^[0-9]{1,5}$')
-      - gitlab_running.redis.password is match(__secret__)
-      - gitlab_running.gitaly.address is match('^tcp://' ~ __ipv4__ ~ ':8075$')
-      - gitlab_running.gitaly.token is match(__secret__)
-      - gitlab_running.object_store.bucket is match('^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')
-      - gitlab_running.object_store.prefix is match('^runs/[0-9]+$')
-      - gitlab_running.object_store.region is match('^[a-z]{2}(-[a-z]+)+-[0-9]$')
-      - gitlab_running.object_store.types | length > 0
-      - >-
-        gitlab_running.object_store.types | difference(['artifacts', 'external_diffs', 'lfs',
-        'uploads', 'packages', 'dependency_proxy', 'terraform_state', 'ci_secure_files',
-        'agent_plan_content', 'ci_catalog_bundles']) | length == 0
-      - gitlab_running.monitoring_whitelist | reject('match', __cidr__) | list | length == 0
+      - gitlab_running.database.password is match('^[A-Za-z0-9]{48,}$')
       - gitlab_running.auto_migrate is boolean
-      - gitlab_running.sshd.port | string is match('^[0-9]{1,5}$')
-      - gitlab_running.sshd.host_key_source_dir is match('^/root/[a-z0-9-]+$')
 
 # check: safety-critical -- the names land in psql's connection string and in SQL; the password
 # only on psql's standard input, so any character RDS generates is safe there.
 - name: 'VALIDATE | Require The Database Bootstrap Inputs'
   when:
     - (state | default('present') | string | lower | trim) == 'present'
-    - gitlab_running.node_role == 'rails'
+    - gitlab_running.node_role in ['rails', 'praefect']
     - gitlab_running.database_bootstrap.enabled | bool
 
   ansible.builtin.assert:
@@ -153,11 +126,58 @@
         gitlab_running.database_bootstrap.extensions | reject('match', '^[a-z_][a-z0-9_]*$')
         | list | length == 0
 
+#endregion --- [ Validate: The Database Inputs ] ---------------------------------------------- #
+
+#region ------ [ Validate: The Rails Inputs ] ------------------------------------------------- #
+
+# check: safety-critical -- every value below is written into gitlab.rb. The passwords and tokens
+# are run secrets the playbook generates as letters and digits only, so the shape is also what
+# proves the generator ran.
+- name: 'VALIDATE | Require The Rails Node Inputs'
+  vars:
+    __ipv4__: '([0-9]{1,3}[.]){3}[0-9]{1,3}'
+    __secret__: '^[A-Za-z0-9]{48,}$'
+    __cidr__: '^(([0-9]{1,3}[.]){3}[0-9]{1,3}/[0-9]{1,2}|[0-9a-f:]+/[0-9]{1,3})$'
+  when:
+    - (state | default('present') | string | lower | trim) == 'present'
+    - gitlab_running.node_role == 'rails'
+
+  ansible.builtin.assert:
+    fail_msg: >-
+      Refusing to deploy a Rails node: redis.port and sshd.port must be numbers; redis.password
+      and gitaly.token at least 48 letters and digits; redis.host an IPv4 address and
+      gitaly.address tcp://<DNS name>:<port>; object_store.bucket an S3 bucket name,
+      object_store.prefix runs/<run id> and object_store.region an AWS region;
+      object_store.types GitLab object types other than pages; each monitoring_whitelist entry a
+      CIDR; sshd.host_key_source_dir a directory directly under /root. Got redis host
+      '{{ gitlab_running.redis.host }}', gitaly address '{{ gitlab_running.gitaly.address }}',
+      object store prefix '{{ gitlab_running.object_store.prefix }}', types
+      {{ gitlab_running.object_store.types }}, monitoring whitelist
+      {{ gitlab_running.monitoring_whitelist }}, sshd {{ gitlab_running.sshd }}.
+    quiet: true
+    that:
+      - gitlab_running.redis.host is match('^' ~ __ipv4__ ~ '$')
+      - gitlab_running.redis.port | string is match('^[0-9]{1,5}$')
+      - gitlab_running.redis.password is match(__secret__)
+      - gitlab_running.gitaly.address is match('^tcp://[A-Za-z0-9.-]+:[0-9]{1,5}$')
+      - gitlab_running.gitaly.token is match(__secret__)
+      - gitlab_running.object_store.bucket is match('^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')
+      - gitlab_running.object_store.prefix is match('^runs/[0-9]+$')
+      - gitlab_running.object_store.region is match('^[a-z]{2}(-[a-z]+)+-[0-9]$')
+      - gitlab_running.object_store.types | length > 0
+      - >-
+        gitlab_running.object_store.types | difference(['artifacts', 'external_diffs', 'lfs',
+        'uploads', 'packages', 'dependency_proxy', 'terraform_state', 'ci_secure_files',
+        'agent_plan_content', 'ci_catalog_bundles']) | length == 0
+      - gitlab_running.monitoring_whitelist | reject('match', __cidr__) | list | length == 0
+      - gitlab_running.sshd.port | string is match('^[0-9]{1,5}$')
+      - gitlab_running.sshd.host_key_source_dir is match('^/root/[a-z0-9-]+$')
+
 #endregion --- [ Validate: The Rails Inputs ] ------------------------------------------------- #
 
-#region ------ [ Validate: The Gitaly And Redis Inputs ] -------------------------------------- #
+#region ------ [ Validate: The Gitaly, Praefect And Redis Inputs ] ---------------------------- #
 
-# check: safety-critical -- the token and the URL are written into gitlab.rb.
+# check: safety-critical -- the token, the storage name and the URL are written into gitlab.rb.
 - name: 'VALIDATE | Require The Gitaly Node Inputs'
   when:
     - (state | default('present') | string | lower | trim) == 'present'
@@ -165,13 +185,48 @@
 
   ansible.builtin.assert:
     fail_msg: >-
-      Refusing to deploy a Gitaly node: gitaly.token must be at least 48 letters and digits, and
-      gitaly.internal_api_url http://<DNS name>. Got internal_api_url
+      Refusing to deploy a Gitaly node: gitaly.token must be at least 48 letters and digits,
+      gitaly.storage lower-case letters, digits and hyphens, and gitaly.internal_api_url
+      http://<DNS name>. Got storage '{{ gitlab_running.gitaly.storage }}', internal_api_url
       '{{ gitlab_running.gitaly.internal_api_url }}'.
     quiet: true
     that:
       - gitlab_running.gitaly.token is match('^[A-Za-z0-9]{48,}$')
+      - gitlab_running.gitaly.storage is match('^[a-z0-9-]+$')
       - gitlab_running.gitaly.internal_api_url is match('^http://[A-Za-z0-9.-]+$')
+
+# check: safety-critical -- the tokens, the names and the addresses are written into gitlab.rb.
+# The two tokens must differ: a client holding the internal one could reach the Gitaly nodes past
+# Praefect. Praefect itself refuses an empty node list, a repeated storage name and a replication
+# factor beyond the node count, so those are not repeated here.
+- name: 'VALIDATE | Require The Praefect Node Inputs'
+  vars:
+    __secret__: '^[A-Za-z0-9]{48,}$'
+  when:
+    - (state | default('present') | string | lower | trim) == 'present'
+    - gitlab_running.node_role == 'praefect'
+
+  ansible.builtin.assert:
+    fail_msg: >-
+      Refusing to deploy a Praefect node: praefect.port must be a number; praefect.token and
+      gitaly.token at least 48 letters and digits, and different; each of praefect.nodes a
+      storage of lower-case letters, digits and hyphens at tcp://<IPv4>:<port>; and
+      praefect.replication_factor an integer. Got port '{{ gitlab_running.praefect.port }}',
+      nodes {{ gitlab_running.praefect.nodes }}, replication factor
+      '{{ gitlab_running.praefect.replication_factor }}'.
+    quiet: true
+    that:
+      - gitlab_running.praefect.port | string is match('^[0-9]{1,5}$')
+      - gitlab_running.praefect.token is match(__secret__)
+      - gitlab_running.gitaly.token is match(__secret__)
+      - gitlab_running.praefect.token != gitlab_running.gitaly.token
+      - >-
+        gitlab_running.praefect.nodes | map(attribute='storage')
+        | reject('match', '^[a-z0-9-]+$') | list | length == 0
+      - >-
+        gitlab_running.praefect.nodes | map(attribute='address')
+        | reject('match', '^tcp://([0-9]{1,3}[.]){3}[0-9]{1,3}:[0-9]{1,5}$') | list | length == 0
+      - gitlab_running.praefect.replication_factor is integer
 
 # check: safety-critical -- the password is written into gitlab.rb.
 - name: 'VALIDATE | Require The Redis Node Inputs'
@@ -185,7 +240,7 @@
     quiet: true
     that: gitlab_running.redis.password is match('^[A-Za-z0-9]{48,}$')
 
-#endregion --- [ Validate: The Gitaly And Redis Inputs ] -------------------------------------- #
+#endregion --- [ Validate: The Gitaly, Praefect And Redis Inputs ] ---------------------------- #
 
 #region ------ [ Validate: The Shared Secrets ] ----------------------------------------------- #
 

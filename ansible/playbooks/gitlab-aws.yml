@@ -4,7 +4,8 @@
 #
 # Brings the ephemeral EC2 instances from "the API says they exist" to one distributed GitLab on
 # CIS-hardened RHEL 8: two Rails nodes in two zones behind an internal network load balancer, a
-# Gitaly node and a Redis node, on an RDS PostgreSQL database and S3 object storage.
+# Gitaly Cluster of three Gitaly nodes behind three Praefect nodes on the same load balancer, and
+# a Redis node, on an RDS PostgreSQL database and S3 object storage. Nine nodes in all.
 #
 # The inventory decides how each host is reached; this play's ordered credential sets decide who
 # logs on. A new image answers only as its image account, with the launch key.
@@ -14,8 +15,11 @@
 # extra-vars, as it does the account and the region, so the play and the stack cannot disagree.
 #
 # The nodes are configured one role at a time, in the only order that works: Redis first, whose
-# first reconfigure generates the secrets every node shares; then Gitaly, which needs the shared
-# shell secret; then the Rails node that migrates the database; then the other Rails node.
+# first reconfigure generates the secrets every node shares; then the three Gitaly nodes, which
+# need the shared shell secret; then the Praefect node that migrates Praefect's database, then
+# the other two, after which every Praefect node must pass its own checks; then the Rails node
+# that migrates GitLab's database, which reaches its repositories through Praefect; then the
+# other Rails node.
 #
 # Runs from the composed tree: the workflow overlays this repository onto the pinned framework
 # and uses its configuration, role search path, connection defaults, and explicit fact gathering.
@@ -34,26 +38,30 @@
   # rather than reporting a green run that touched nothing.
   tags: ['always']
   tasks:
-    # Two Rails nodes in two zones, because one proves nothing about losing a node or a zone.
+    # Two Rails nodes in two zones, because one proves nothing about losing a node or a zone;
+    # three Gitaly and three Praefect nodes, GitLab's minimal Gitaly Cluster.
     - name: 'INVENTORY | Require The Distributed Topology'
       vars:
         __rails__: "{{ groups['gitlab_rails'] | default([]) }}"
         __roles__: >-
           {{ (groups['gitlab_rails'] | default([])) + (groups['gitlab_gitaly'] | default([]))
-             + (groups['gitlab_redis'] | default([])) }}
+             + (groups['gitlab_praefect'] | default([])) + (groups['gitlab_redis'] | default([]))
+          }}
 
       ansible.builtin.assert:
         fail_msg: >-
           Refusing to configure: the dynamic EC2 inventory found a different topology tagged for
-          this run than terraform/aws.tfvars declares -- two gitlab_rails hosts in two zones, one
-          gitlab_gitaly and one gitlab_redis, nothing else. Found rails {{ __rails__ }}, gitaly
-          {{ groups['gitlab_gitaly'] | default([]) }}, redis
+          this run than terraform/aws.tfvars declares -- two gitlab_rails hosts in two zones,
+          three gitlab_gitaly, three gitlab_praefect and one gitlab_redis, nothing else. Found
+          rails {{ __rails__ }}, gitaly {{ groups['gitlab_gitaly'] | default([]) }}, praefect
+          {{ groups['gitlab_praefect'] | default([]) }}, redis
           {{ groups['gitlab_redis'] | default([]) }}, servers
           {{ groups['gitlab_servers'] | default([]) }}.
         quiet: true
         that:
           - __rails__ | length == 2
-          - groups['gitlab_gitaly'] | default([]) | length == 1
+          - groups['gitlab_gitaly'] | default([]) | length == 3
+          - groups['gitlab_praefect'] | default([]) | length == 3
           - groups['gitlab_redis'] | default([]) | length == 1
           - groups['gitlab_servers'] | default([]) | sort == __roles__ | sort
           - >-
@@ -79,9 +87,10 @@
       ansible.builtin.assert:
         fail_msg: >-
           gitlab_database (address, port, master_user_secret_arn), gitlab_load_balancer_dns,
-          gitlab_target_group_arn and gitlab_ssh_target_group_arn must be provided as
-          extra-vars. The aws-deploy workflow reads them from Terraform's outputs after apply; a
-          local run reads the same outputs and passes them explicitly.
+          gitlab_target_group_arn, gitlab_ssh_target_group_arn and
+          gitlab_praefect_target_group_arn must be provided as extra-vars. The aws-deploy
+          workflow reads them from Terraform's outputs after apply; a local run reads the same
+          outputs and passes them explicitly.
         quiet: true
         that:
           - gitlab_database.address | default('') is match('^[a-z0-9.-]+$')
@@ -92,6 +101,9 @@
           - gitlab_load_balancer_dns | default('') is match('^[A-Za-z0-9.-]+$')
           - gitlab_target_group_arn | default('') is match('^arn:aws:elasticloadbalancing:')
           - gitlab_ssh_target_group_arn | default('') is match('^arn:aws:elasticloadbalancing:')
+          - >-
+            gitlab_praefect_target_group_arn | default('')
+            is match('^arn:aws:elasticloadbalancing:')
 
 #endregion --- [ Play: Inventory Contract ] --------------------------------------------------- #
 
@@ -157,15 +169,23 @@
       gitlab_master_database: 'gitlab'
       # GitLab's required extensions, and pgaudit, which the parameter group loads.
       gitlab_database_extensions: [ 'amcheck', 'btree_gist', 'pg_trgm', 'pgaudit', 'plpgsql' ]
+      # Praefect's own database and role (GitLab's Gitaly Cluster documentation names both so).
+      gitlab_praefect_database_name: 'praefect_production'
+      gitlab_praefect_database_role: 'praefect'
+      # pgaudit, so its DDL audit lines carry object names, as in GitLab's database. plpgsql,
+      # which Praefect's triggers use, is in every new database already.
+      gitlab_praefect_database_extensions: [ 'pgaudit' ]
       gitlab_host_key_dir: '/root/nwarila-gitlab-sshd-host-keys'
       gitlab_ports:
         http: 80
         sshd: 2222
         gitaly: 8075
+        praefect: 2305
         redis: 6379
     __gitlab_ports__: >-
       {{ ([gitlab_ports.http, gitlab_ports.sshd] if 'gitlab_rails' in group_names else [])
          + ([gitlab_ports.gitaly] if 'gitlab_gitaly' in group_names else [])
+         + ([gitlab_ports.praefect] if 'gitlab_praefect' in group_names else [])
          + ([gitlab_ports.redis] if 'gitlab_redis' in group_names else []) }}
 
   tasks:
@@ -198,7 +218,7 @@
 
     # credential_resolver publishes a port the winning set leaves out as null, so SSH's own 22.
     # Unlike keycloak's ruleset, the service ports carry no rate limit: the security groups admit
-    # only the GitLab nodes and the load balancer, and the Rails nodes open their Gitaly and
+    # only the GitLab nodes and the load balancer, and the Rails nodes open their Praefect and
     # Redis pools at boot in bursts a limit could drop. SSH keeps its limit.
     - name: 'PROCESS | Write The Host nftables Ruleset'
       register: '__gitlab_nftables_ruleset__'
@@ -328,10 +348,13 @@
 #endregion --- [ Play: Controller Package Cache And Network Facts ] --------------------------- #
 
 #region ------ [ Play: Run Secrets ] ---------------------------------------------------------- #
-# The Redis password, the Gitaly token and the password of GitLab's database role are generated
-# once per deployment, on the Redis node, and read back on every converge: gitlab.rb holds them
-# and is hashed into the reconfigure record, so a value drawn afresh on each run could never
-# settle. They live under /root, outside /etc/gitlab, whose mode reconfigure resets.
+# The Redis password, Praefect's two tokens and the passwords of GitLab's and Praefect's database
+# roles are generated once per deployment, on the Redis node, and read back on every converge:
+# gitlab.rb holds them and is hashed into the reconfigure record, so a value drawn afresh on each
+# run could never settle. They live under /root, outside /etc/gitlab, whose mode reconfigure
+# resets. The external token is the one Gitaly clients present to Praefect, the internal one the
+# one Praefect presents to Gitaly; they differ, so no client can reach a Gitaly node past
+# Praefect.
 
 - name: 'PLAY | Generate And Read The Run Secrets'
   hosts: 'gitlab_redis'
@@ -348,10 +371,16 @@
         content: >-
           {{ {'redis_password': lookup('ansible.builtin.password', '/dev/null', length=64,
                                        chars=['ascii_letters', 'digits']),
-              'gitaly_token': lookup('ansible.builtin.password', '/dev/null', length=64,
-                                     chars=['ascii_letters', 'digits']),
+              'praefect_external_token': lookup('ansible.builtin.password', '/dev/null',
+                                                length=64, chars=['ascii_letters', 'digits']),
+              'praefect_internal_token': lookup('ansible.builtin.password', '/dev/null',
+                                                length=64, chars=['ascii_letters', 'digits']),
               'database_password': lookup('ansible.builtin.password', '/dev/null', length=64,
-                                          chars=['ascii_letters', 'digits'])} | to_json }}
+                                          chars=['ascii_letters', 'digits']),
+              'praefect_database_password': lookup('ansible.builtin.password', '/dev/null',
+                                                   length=64,
+                                                   chars=['ascii_letters', 'digits'])}
+             | to_json }}
         decrypt: true
         dest: '/root/nwarila-gitlab-run-secrets.json'
         follow: false
@@ -606,7 +635,11 @@
           node_role: 'gitaly'
           secrets_json: "{{ hostvars[__origin__].gitlab_shared_secrets_json }}"
           gitaly:
-            token: "{{ hostvars[__origin__].gitlab_run_secrets.gitaly_token }}"
+            # Named for the host, so Praefect's view of a repository names the nodes that hold
+            # it.
+            storage: "{{ inventory_hostname }}"
+            # The internal token: only Praefect presents it.
+            token: "{{ hostvars[__origin__].gitlab_run_secrets.praefect_internal_token }}"
             # Gitaly calls GitLab's internal API through the load balancer: it is a client of
             # the listener, never a target of it.
             internal_api_url: "http://{{ gitlab_load_balancer_dns }}"
@@ -614,6 +647,145 @@
   #endregion --- [ Roles ] -------------------------------------------------------------------- #
 
 #endregion --- [ Play: GitLab Gitaly ] -------------------------------------------------------- #
+
+#region ------ [ Play: GitLab Praefect, The Deploy Node ] ------------------------------------- #
+# One Praefect node migrates Praefect's database, and the others start once it has. It is the
+# first by name, never by inventory order. Both patterns resolve, to no host, without this run's
+# inventory, as the Rails plays' do.
+
+- name: 'PLAY | GitLab Praefect, The Deploy Node (ephemeral AWS)'
+  hosts: "{{ groups['gitlab_praefect'] | default(['gitlab_praefect']) | sort | first }}"
+  any_errors_fatal: true
+  become: true
+  tags: ['products']
+  vars:
+    <<: *gitlab_site
+    __origin__: "{{ groups['gitlab_redis'] | first }}"
+    # RDS keeps the master credentials in Secrets Manager and rotates them. They are read here,
+    # on the controller, only for this node, which creates Praefect's role, database and
+    # extensions with them, and never written to the log.
+    gitlab_database_credentials: >-
+      {{ lookup('amazon.aws.secretsmanager_secret', gitlab_database.master_user_secret_arn,
+                region=aws_region) | from_json }}
+
+  #region ------ [ Roles ] -------------------------------------------------------------------- #
+  roles:
+    - role: 'gitlab'
+      vars:
+        gitlab:
+          <<: &gitlab_praefect
+            installer: *gitlab_installer
+            temp_dir_path: *gitlab_temp_dir_path
+            node_role: 'praefect'
+            secrets_json: "{{ hostvars[__origin__].gitlab_shared_secrets_json }}"
+            # Praefect's own role and database, which the deploy node creates.
+            database:
+              host: "{{ gitlab_database.address }}"
+              port: "{{ gitlab_database.port }}"
+              name: "{{ gitlab_praefect_database_name }}"
+              username: "{{ gitlab_praefect_database_role }}"
+              password: >-
+                {{ hostvars[__origin__].gitlab_run_secrets.praefect_database_password }}
+            # The internal token, which Praefect presents to every Gitaly node.
+            gitaly:
+              token: "{{ hostvars[__origin__].gitlab_run_secrets.praefect_internal_token }}"
+            praefect:
+              port: "{{ gitlab_ports.praefect }}"
+              token: "{{ hostvars[__origin__].gitlab_run_secrets.praefect_external_token }}"
+              replication_factor: 3
+              # Every Gitaly node by its private address, sorted, so every run and every
+              # Praefect node lists the same.
+              nodes: >-
+                {%- set nodes = [] -%}
+                {%- for host in groups['gitlab_gitaly'] | sort -%}
+                {%- set _ = nodes.append({'storage': host,
+                      'address': 'tcp://' ~ hostvars[host].aws_private_ip_address ~ ':'
+                                 ~ gitlab_ports.gitaly}) -%}
+                {%- endfor -%}
+                {{ nodes }}
+          auto_migrate: true
+          database_bootstrap:
+            enabled: true
+            master_database: "{{ gitlab_master_database }}"
+            master_username: "{{ gitlab_database_credentials.username }}"
+            master_password: "{{ gitlab_database_credentials.password }}"
+            extensions: "{{ gitlab_praefect_database_extensions }}"
+
+  #endregion --- [ Roles ] -------------------------------------------------------------------- #
+
+#endregion --- [ Play: GitLab Praefect, The Deploy Node ] ------------------------------------- #
+
+#region ------ [ Play: GitLab Praefect, The Other Nodes ] ------------------------------------- #
+
+- name: 'PLAY | GitLab Praefect, The Other Nodes (ephemeral AWS)'
+  hosts: >-
+    gitlab_praefect:!{{ groups['gitlab_praefect'] | default(['gitlab_praefect'])
+    | sort | first }}
+  any_errors_fatal: true
+  become: true
+  tags: ['products']
+  vars:
+    <<: *gitlab_site
+    __origin__: "{{ groups['gitlab_redis'] | first }}"
+
+  #region ------ [ Roles ] -------------------------------------------------------------------- #
+  roles:
+    - role: 'gitlab'
+      vars:
+        gitlab:
+          <<: *gitlab_praefect
+          auto_migrate: false
+
+  #endregion --- [ Roles ] -------------------------------------------------------------------- #
+
+#endregion --- [ Play: GitLab Praefect, The Other Nodes ] ------------------------------------- #
+
+#region ------ [ Play: Every Praefect Node Passes Its Own Checks ] ---------------------------- #
+# Once all three Praefect nodes run and before any Rails node does: Praefect's checks need no
+# Rails, so a broken Praefect-to-Gitaly path (a security group, the token, SELinux) is named here
+# rather than after two Rails converges.
+
+- name: 'PLAY | Every Praefect Node Passes Its Own Checks'
+  hosts: 'gitlab_praefect'
+  any_errors_fatal: true
+  become: true
+  tags: ['products']
+  tasks:
+    # Praefect's own checks: its migrations, each Gitaly node's reach and disk, a write to and a
+    # read from its database, and unavailable repositories (service/checks.go). The write is
+    # rolled back, so this stays read-only. A failure that is not fatal still exits 0, with "N
+    # check(s) failed, but none are fatal.", so the closing line is required as well.
+    # rc-contract: praefect check exits 0 unless a fatal check failed, and 1 when one did.
+    - name: 'END | Run Praefect''s Self-Check'
+      become: true
+      become_user: 'git'
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      register: '__gitlab_praefect_check__'
+
+      ansible.builtin.command:
+        argv:
+          - '/opt/gitlab/embedded/bin/praefect'
+          - '-config'
+          - '/var/opt/gitlab/praefect/config.toml'
+          - 'check'
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    - name: 'END | Require Praefect''s Checks To Pass'
+      ansible.builtin.assert:
+        fail_msg: >-
+          praefect check exited {{ __gitlab_praefect_check__.rc }}:
+          {{ __gitlab_praefect_check__.stdout_lines }}
+          {{ __gitlab_praefect_check__.stderr_lines }}
+        quiet: true
+        that:
+          - __gitlab_praefect_check__.rc == 0
+          - "'All checks passed.' in __gitlab_praefect_check__.stdout_lines"
+
+#endregion --- [ Play: Every Praefect Node Passes Its Own Checks ] ---------------------------- #
 
 #region ------ [ Play: GitLab Rails, The Deploy Node ] ---------------------------------------- #
 # One Rails node migrates the database, and its first reconfigure loads the schema and seeds the
@@ -662,11 +834,10 @@
               host: "{{ hostvars[groups['gitlab_redis'] | first].aws_private_ip_address }}"
               port: "{{ gitlab_ports.redis }}"
               password: "{{ hostvars[__origin__].gitlab_run_secrets.redis_password }}"
+            # Praefect's virtual storage, through the load balancer, with the external token.
             gitaly:
-              address: >-
-                tcp://{{ hostvars[groups['gitlab_gitaly'] | first].aws_private_ip_address
-                }}:{{ gitlab_ports.gitaly }}
-              token: "{{ hostvars[__origin__].gitlab_run_secrets.gitaly_token }}"
+              address: "tcp://{{ gitlab_load_balancer_dns }}:{{ gitlab_ports.praefect }}"
+              token: "{{ hostvars[__origin__].gitlab_run_secrets.praefect_external_token }}"
             object_store:
               bucket: "{{ aws_account_id }}-gitlab-objects"
               prefix: "runs/{{ lookup('ansible.builtin.env', 'GITHUB_RUN_ID') }}"
@@ -721,7 +892,7 @@
   vars:
     __origin__: "{{ groups['gitlab_redis'] | first }}"
     # The secrets every node must hold alike. A node also writes back the secrets its own
-    # gitlab.rb sets, such as a Rails node's Gitaly token, so the files differ beyond these.
+    # gitlab.rb sets, so the files differ beyond these.
     __shared__:
       gitlab_rails:
         - 'secret_key_base'
@@ -834,9 +1005,10 @@
 #endregion --- [ Play: Remove The Controller Package Cache ] ---------------------------------- #
 
 #region ------ [ Play: Prove The Distributed Shape (opt-in) ] --------------------------------- #
-# What makes this deployment distributed, proved rather than assumed, from the Gitaly node: the
-# only node that is the load balancer's client and never its target.
-#   1. both target groups report both Rails nodes healthy;
+# What makes this deployment distributed, proved rather than assumed, from the first Gitaly node,
+# a client of the HTTP and SSH listeners and a target of none.
+#   1. both Rails target groups report both Rails nodes healthy, and the Praefect target group
+#      all three Praefect nodes;
 #   2. root signs in through the load balancer, and both Rails nodes honour that session, which
 #      lives in Redis;
 #   3. a commit pushed over HTTP creates a project and clones back over HTTP;
@@ -857,7 +1029,7 @@
 # GitLab only on stdin or in module arguments under no_log: never argv, a URL or a file.
 
 - name: 'PLAY | Prove The Distributed Shape Serves Through The Load Balancer (opt-in)'
-  hosts: 'gitlab_gitaly'
+  hosts: "{{ groups['gitlab_gitaly'] | default(['gitlab_gitaly']) | sort | first }}"
   any_errors_fatal: true
   become: true
   tags: ['never', 'gitlab_proof']
@@ -925,7 +1097,7 @@
     - name: 'PROCESS | Prove The Distributed Shape'
       block:
 
-        #region ------ [ Proof: Both Rails Nodes Serve Behind Both Listeners ] ---------------- #
+        #region ------ [ Proof: Every Target Group Reports Its Nodes Healthy ] ---------------- #
 
         # Read on the controller with the runner's credentials: the guests hold none.
         # UNMEASURED: the bound covers two passing health checks ten seconds apart, with margin.
@@ -960,7 +1132,40 @@
             stdin_add_newline: true
             strip_empty_ends: true
 
-        #endregion --- [ Proof: Both Rails Nodes Serve Behind Both Listeners ] ---------------- #
+        # GitLab reaches every repository through this listener, so the proof below goes through
+        # Praefect from its first request.
+        # UNMEASURED: 30 tries 10 seconds apart; the bound covers two passing health checks ten
+        # seconds apart, with margin.
+        - name: 'END | Wait Until The Praefect Target Group Reports All Three Nodes Healthy'
+          become: false
+          changed_when: false
+          delay: 10
+          delegate_to: 'localhost'
+          register: '__proof_praefect_targets__'
+          retries: 30
+          run_once: true
+          until: __proof_praefect_targets__.stdout | trim == '3'
+          vars:
+            ansible_python_interpreter: "{{ ansible_playbook_python }}"
+
+          ansible.builtin.command:
+            argv:
+              - 'aws'
+              - 'elbv2'
+              - 'describe-target-health'
+              - '--region'
+              - "{{ aws_region }}"
+              - '--target-group-arn'
+              - "{{ gitlab_praefect_target_group_arn }}"
+              - '--query'
+              - "length(TargetHealthDescriptions[?TargetHealth.State=='healthy'])"
+              - '--output'
+              - 'text'
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        #endregion --- [ Proof: Every Target Group Reports Its Nodes Healthy ] ---------------- #
 
         #region ------ [ Proof: Root Signs In Through The Load Balancer ] --------------------- #
 

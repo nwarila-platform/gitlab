@@ -8,14 +8,15 @@ role: every bundled service on one node, or one role of a distributed GitLab. In
    controller **and** on the guest, and against GitLab's signature, immediately before `dnf`
    reads it;
 3. writes the first node's `gitlab-secrets.json` when the node has none, the RDS certificate
-   bundle on a Rails node, and `/etc/gitlab/gitlab.rb`;
+   bundle on a Rails or Praefect node, and `/etc/gitlab/gitlab.rb`;
 4. lets Gitaly execute its runtime binaries under fapolicyd, on a node that runs Gitaly;
-5. on the Rails node that migrates, creates GitLab's own database role, its database and the
-   extensions, as the database's master user;
+5. on the node that migrates a database, creates its service's own database role, its database
+   and the extensions, as the database's master user;
 6. runs `gitlab-ctl reconfigure`;
 7. on a Rails node, installs the shared gitlab-sshd host keys;
 8. reads the version, readiness, the services and FIPS mode back from GitLab itself, the gitlab
-   rule back from fapolicyd, and the fingerprints of gitlab-sshd's host key files.
+   rule back from fapolicyd, the fingerprints of gitlab-sshd's host key files, and whether
+   Praefect reaches its database.
 
 > **Scope:** `state=absent` is not implemented: the loader fails it by name, because no
 > `absent_redhat.yml` exists, until a removal is proven on a live host.
@@ -27,8 +28,9 @@ role: every bundled service on one node, or one role of a distributed GitLab. In
 | `node_role` | Runs | Inputs beyond the installer |
 |---|---|---|
 | `all-in-one` (default) | PostgreSQL, Redis, Gitaly, Puma, Sidekiq, Workhorse and NGINX | `external_url` |
-| `rails` | Puma, Sidekiq, Workhorse, NGINX and gitlab-sshd | `external_url`, `auto_migrate`, `secrets_json`, `monitoring_whitelist`, `database`, `redis`, `gitaly.address`, `gitaly.token`, `object_store`, `sshd.host_key_source_dir`; on the node that migrates, `database_bootstrap` |
-| `gitaly` | Gitaly | `secrets_json`, `gitaly.token`, `gitaly.internal_api_url` |
+| `rails` | Puma, Sidekiq, Workhorse, NGINX and gitlab-sshd | `external_url`, `auto_migrate`, `secrets_json`, `monitoring_whitelist`, `database`, `redis`, `gitaly.address` and `gitaly.token` (Praefect's, through the load balancer), `object_store`, `sshd.host_key_source_dir`; on the node that migrates, `database_bootstrap` |
+| `gitaly` | Gitaly, one storage of Praefect's virtual storage | `secrets_json`, `gitaly.token` (Praefect's internal token), `gitaly.storage`, `gitaly.internal_api_url` |
+| `praefect` | Praefect | `auto_migrate`, `secrets_json`, `database`, `gitaly.token` (the internal token), `praefect.token`, `praefect.nodes`; on the node that migrates, `database_bootstrap` |
 | `redis` | Redis | `redis.password` |
 
 `all-in-one` is the degenerate case: a node given no `node_role` renders, byte for byte, the
@@ -37,9 +39,37 @@ deploys it now, so that run is the last that exercised it.
 
 A Rails node names `roles(['application_role'])`. Naming a role stops GitLab's default role from
 loading, so the bundled PostgreSQL and Redis stay off with no setting of their own; the
-application role's Gitaly is switched off because Gitaly has its own node. KAS is switched off:
-it would call `external_url`, the load balancer, and no Rails node is ever the load balancer's
-client, which is what keeps a request from hairpinning back to the node that sent it.
+application role's Gitaly is switched off because Gitaly has its own nodes. KAS is switched off:
+it would call `external_url`, the load balancer's HTTP listener, whose target a Rails node is.
+With client addresses preserved there, a request a node sent to itself through the balancer
+would be dropped.
+
+## Gitaly Cluster
+
+A Rails node reaches its repositories only through Praefect, which serves one virtual storage,
+`default`, on `praefect.port` (2305) behind the load balancer and replicates every repository to
+`praefect.replication_factor` of the Gitaly nodes in `praefect.nodes`. Each Gitaly node holds one
+storage, named by `gitaly.storage`.
+
+Two hops take two tokens, which `tasks/validate.yml` requires to differ:
+
+| Hop | Token | Held by |
+|---|---|---|
+| Gitaly client to Praefect | `praefect.token`; on a Rails node, `gitaly.token` | Rails and Praefect |
+| Praefect to Gitaly | `gitaly.token` | Praefect and Gitaly |
+
+A client holding the internal token could reach the Gitaly nodes past Praefect, which GitLab
+warns can lose data. The Rails storage carries its token itself, and
+`gitlab_rails['gitaly_token']` is deliberately unset, so nothing falls back to a global one.
+
+A Praefect node names no role: none exists for it, so every service GitLab's default role would
+start is switched off by name. It connects to its own database, `database.name`, as its own role,
+`database.username`, directly and with no PgBouncer between: Praefect opens few connections, and
+the connections it holds open for `LISTEN` need a session of their own. The connection is
+`verify-full` against the same RDS bundle. The first Praefect node migrates the database
+(`auto_migrate`) and the others start once it has. GitLab's firewall table lists a route from
+Praefect to GitLab's API on port 80; Praefect 19.4.1 imports no GitLab client, so no such route
+is declared.
 
 ## Composition and prerequisites
 
@@ -84,15 +114,15 @@ converge. The playbook compares the shared keys on every node afterwards.
 
 ## The database
 
-A Rails node connects to an external PostgreSQL with `sslmode=verify-full` against the RDS
-certificate bundle in `files/`, pinned by its SHA-256: the us-east-1 bundle, which holds
+A Rails or Praefect node connects to an external PostgreSQL with `sslmode=verify-full` against
+the RDS certificate bundle in `files/`, pinned by its SHA-256: the us-east-1 bundle, which holds
 `rds-ca-rsa2048-g1`, the authority a new instance is issued from.
 
-It connects as GitLab's own role, `database.username`, which holds no superuser, role or database
-creation right and owns only its database, `database.name`. GitLab's documentation for RDS
-grants its user `rds_superuser` so that it can create extensions; that role could also switch
-pgaudit off. Instead, on the one Rails node given `database_bootstrap`, on every converge and
-ahead of its reconfigure, the database's master user:
+It connects as its service's own role, `database.username`, which holds no superuser, role or
+database creation right and owns only its database, `database.name`. GitLab's documentation for
+RDS grants its user `rds_superuser` so that it can create extensions; that role could also switch
+pgaudit off. Instead, on the one node of each service given `database_bootstrap`, on every
+converge and ahead of its reconfigure, the database's master user:
 
 1. reads whether the role, its own membership in the role with INHERIT and SET, and the database
    exist, and creates only what is absent;
@@ -139,7 +169,7 @@ configured.
 |---|---|---|
 | `/etc/gitlab/gitlab.rb` | `root`, 0600 | The configuration; reconfigure, as root, is its only reader. It holds credentials, so it is written without a diff |
 | `/etc/gitlab/gitlab-secrets.json` | `root`, 0600 | The shared secrets, written only when absent |
-| `/etc/gitlab/rds-ca-bundle.pem` | `root`, 0644 | Rails: the database's certificate authorities |
+| `/etc/gitlab/rds-ca-bundle.pem` | `root`, 0644 | Rails and Praefect: the database's certificate authorities |
 | `/var/opt/gitlab/.nwarila-reconfigured` | `root`, 0600 | `<version> <gitlab.rb SHA-256>` of the last successful reconfigure |
 
 `gitlab-ctl reconfigure` runs when the version or `gitlab.rb` differs from the record, and when
@@ -157,7 +187,7 @@ no reconfigure on a first install: `gitlab.rb` still holds the vendor's placehol
 | FIPS mode | The FIPS package; END requires OpenSSL in GitLab's Ruby to report FIPS mode. gitlab-sshd offers FIPS-approved algorithms only, and its host keys are ECDSA and RSA-3072 |
 | SELinux | Left enforcing; the package labels its own paths |
 | No `async` | Reconfigure is bounded by `timeout(1)` in its argv: `async` stages a file fapolicyd denies |
-| Database least privilege | GitLab's own role, no `rds_superuser`. One node connects as the master user on every converge, ahead of its reconfigure, to read the role, its database and the extensions and to create whatever is absent; the playbook's proof also creates `rds_tools` with it and reads the settings and password types only it may read. GitLab never connects as it |
+| Database least privilege | Each service's own role, no `rds_superuser`. One node of each service connects as the master user on every converge, ahead of its reconfigure, to read the role, its database and the extensions and to create whatever is absent; the playbook's proof also creates `rds_tools` with it and reads the settings and password types only it may read. Neither service connects as it |
 
 The fapolicyd rule widens what may execute, stated both ways. Before: nothing under
 `/var/opt/gitlab/gitaly/` executes unless the RPM database vouches for its digest. After: any
@@ -166,8 +196,8 @@ directory below it. The subtree belongs to the `git` account, mode 0700. On a Gi
 Gitaly runs as `git`; on an all-in-one node Puma, Sidekiq and Workhorse, the services behind
 GitLab's network listener, do too, so code running as `git` there can write an ELF and execute
 it. GitLab documents the rule as required (otherwise a push fails with "pre-receive hook
-declined"), and files written at run time cannot be trusted by digest. Rails and Redis nodes
-never run Gitaly and do not get the rule.
+declined"), and files written at run time cannot be trusted by digest. Rails, Praefect and Redis
+nodes never run Gitaly and do not get the rule.
 
 ## State
 
@@ -182,8 +212,11 @@ END is ungated: every converge requires the version manifest to begin with the p
 version, `gitlab-ctl status` to report every service `run:`, OpenSSL in GitLab's embedded Ruby to
 report FIPS mode, and the record to hold the declared version and the SHA-256 of the `gitlab.rb`
 on disk. On an all-in-one or Rails node `/-/readiness?all=1` must answer `ok`, which on a Rails
-node proves its database, Redis and Gitaly connections; a Rails, Gitaly or Redis node must be
-listening on the port it serves its peers on. With fapolicyd running on a node that runs Gitaly,
-a fresh `fapolicyd-cli --list` must show the gitlab rule compiled into the loaded rules file; the
-proof shows whether it is in force. The readiness wait and the reconfigure are bounded in
-`tasks/present_redhat.yml`, and both bounds are unmeasured until a live run.
+node proves its database, Redis, and that a Praefect answers through the load balancer: Praefect
+answers that health check itself, so the Gitaly nodes are proved by the playbook's
+`praefect check`, and the external token by the proof's push; a Praefect node must reach its
+database, `praefect sql-ping` printing its OK line; and a Rails, Gitaly, Praefect or Redis node
+must be listening on the port it serves its peers on. With fapolicyd running on a node that runs
+Gitaly, a fresh `fapolicyd-cli --list` must show the gitlab rule compiled into the loaded rules
+file; the proof shows whether it is in force. The readiness wait and the reconfigure are bounded
+in `tasks/present_redhat.yml`, and both bounds are unmeasured until a live run.
