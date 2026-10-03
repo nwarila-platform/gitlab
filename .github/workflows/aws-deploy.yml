@@ -159,7 +159,7 @@ jobs:
           echo "CI_STAGED_PUBLIC_KEY=${staged_public}" >> "${GITHUB_ENV}"
 
       - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.DEPLOY_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
@@ -385,7 +385,7 @@ jobs:
       # Each playbook run reads Secrets Manager, S3 and the load balancer from the controller, so each
       # starts on a fresh session: the path through the second converge outlasts one session.
       - name: Refresh AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.DEPLOY_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
@@ -424,7 +424,7 @@ jobs:
 
       # The proof reads the load balancer's target health and the database's logs.
       - name: Refresh AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.DEPLOY_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
@@ -458,7 +458,7 @@ jobs:
 
       # The second converge reads the same services the first did.
       - name: Refresh AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.DEPLOY_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
@@ -625,7 +625,7 @@ jobs:
           echo "RUNNER_IP=${runner_ip}" >> "${GITHUB_ENV}"
 
       - name: Configure AWS credentials for teardown (OIDC)
-        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/${{ env.DEPLOY_ROLE }}
           aws-region: ${{ env.AWS_REGION }}
