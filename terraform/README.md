@@ -55,11 +55,11 @@ through the balancer would be dropped; this keeps that from being possible.
 
 Peers are named by group, never by address. Every node carries `gitlab-node`, and the Rails nodes
 also carry `gitlab-db-client`, the only group the database admits; the load balancer carries
-`gitlab-lb`. These four standing groups belong to `dependencies/aws/estate.yml`, and
-`scripts/apply-dependencies.sh --apply` creates them and prints their ids. Until the ids are in
-this file it names them `sg-REPLACE-gitlab-node`, `sg-REPLACE-gitlab-lb`, `sg-REPLACE-gitlab-db`
-and `sg-REPLACE-gitlab-db-client`: an apply fails on the first one it meets, naming it, and the
-destroy job, which always runs, removes whatever the apply had created.
+`gitlab-lb`. These four standing groups belong to `dependencies/aws/estate.yml`; this file names
+them by the ids `scripts/apply-dependencies.sh --apply` created and printed: `gitlab-node`
+sg-0d1ebea3cf83a5b08, `gitlab-db-client` sg-0e731bddd6958768e, `gitlab-db` sg-097bdbe65e2dd0215
+and `gitlab-lb` sg-078525e6572561825. A group recreated by that script gets a new id, which must
+be copied here.
 
 Each node's interface also gets its own run-scoped rules:
 

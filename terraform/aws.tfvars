@@ -103,7 +103,7 @@ all_systems = [
         interface_type = null
         private_ip     = null
         # Membership the load balancer and the database admit (dependencies/aws/estate.yml).
-        security_groups = ["sg-REPLACE-gitlab-node", "sg-REPLACE-gitlab-db-client"]
+        security_groups = ["sg-0d1ebea3cf83a5b08", "sg-0e731bddd6958768e"]
         # Peers by group, never by address. The load balancer preserves client addresses, so a
         # request it forwards arrives from the client node, which carries gitlab-node; its health
         # checks arrive from the load balancer itself. Whether the gitlab-lb reference alone also
@@ -117,7 +117,7 @@ all_systems = [
             to_port                      = 80
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-lb"
+            referenced_security_group_id = "sg-078525e6572561825"
           },
           {
             description                  = "HTTP from load balancer clients"
@@ -126,7 +126,7 @@ all_systems = [
             to_port                      = 80
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-node"
+            referenced_security_group_id = "sg-0d1ebea3cf83a5b08"
           },
           {
             description                  = "gitlab-sshd from the load balancer"
@@ -135,7 +135,7 @@ all_systems = [
             to_port                      = 2222
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-lb"
+            referenced_security_group_id = "sg-078525e6572561825"
           },
           {
             description                  = "gitlab-sshd from load balancer clients"
@@ -144,7 +144,7 @@ all_systems = [
             to_port                      = 2222
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-node"
+            referenced_security_group_id = "sg-0d1ebea3cf83a5b08"
           }
         ]
         egress = [
@@ -175,7 +175,7 @@ all_systems = [
             to_port                      = 5432
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-db"
+            referenced_security_group_id = "sg-097bdbe65e2dd0215"
           },
           {
             description                  = "Redis on the Redis node"
@@ -184,7 +184,7 @@ all_systems = [
             to_port                      = 6379
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-node"
+            referenced_security_group_id = "sg-0d1ebea3cf83a5b08"
           },
           {
             description                  = "Gitaly on the Gitaly node"
@@ -193,7 +193,7 @@ all_systems = [
             to_port                      = 8075
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-node"
+            referenced_security_group_id = "sg-0d1ebea3cf83a5b08"
           }
         ]
         tags = {}
@@ -275,7 +275,7 @@ all_systems = [
         interface_type = null
         private_ip     = null
         # Membership the load balancer and the database admit (dependencies/aws/estate.yml).
-        security_groups = ["sg-REPLACE-gitlab-node", "sg-REPLACE-gitlab-db-client"]
+        security_groups = ["sg-0d1ebea3cf83a5b08", "sg-0e731bddd6958768e"]
         # Peers by group, never by address. The load balancer preserves client addresses, so a
         # request it forwards arrives from the client node, which carries gitlab-node; its health
         # checks arrive from the load balancer itself. Whether the gitlab-lb reference alone also
@@ -289,7 +289,7 @@ all_systems = [
             to_port                      = 80
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-lb"
+            referenced_security_group_id = "sg-078525e6572561825"
           },
           {
             description                  = "HTTP from load balancer clients"
@@ -298,7 +298,7 @@ all_systems = [
             to_port                      = 80
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-node"
+            referenced_security_group_id = "sg-0d1ebea3cf83a5b08"
           },
           {
             description                  = "gitlab-sshd from the load balancer"
@@ -307,7 +307,7 @@ all_systems = [
             to_port                      = 2222
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-lb"
+            referenced_security_group_id = "sg-078525e6572561825"
           },
           {
             description                  = "gitlab-sshd from load balancer clients"
@@ -316,7 +316,7 @@ all_systems = [
             to_port                      = 2222
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-node"
+            referenced_security_group_id = "sg-0d1ebea3cf83a5b08"
           }
         ]
         egress = [
@@ -347,7 +347,7 @@ all_systems = [
             to_port                      = 5432
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-db"
+            referenced_security_group_id = "sg-097bdbe65e2dd0215"
           },
           {
             description                  = "Redis on the Redis node"
@@ -356,7 +356,7 @@ all_systems = [
             to_port                      = 6379
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-node"
+            referenced_security_group_id = "sg-0d1ebea3cf83a5b08"
           },
           {
             description                  = "Gitaly on the Gitaly node"
@@ -365,7 +365,7 @@ all_systems = [
             to_port                      = 8075
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-node"
+            referenced_security_group_id = "sg-0d1ebea3cf83a5b08"
           }
         ]
         tags = {}
@@ -444,7 +444,7 @@ all_systems = [
         interface_type = null
         private_ip     = null
         # Membership the load balancer admits (dependencies/aws/estate.yml).
-        security_groups = ["sg-REPLACE-gitlab-node"]
+        security_groups = ["sg-0d1ebea3cf83a5b08"]
         # Peers by group, never by address.
         ingress = [
           {
@@ -454,7 +454,7 @@ all_systems = [
             to_port                      = 8075
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-node"
+            referenced_security_group_id = "sg-0d1ebea3cf83a5b08"
           }
         ]
         egress = [
@@ -486,7 +486,7 @@ all_systems = [
             to_port                      = 80
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-lb"
+            referenced_security_group_id = "sg-078525e6572561825"
           },
           {
             description                  = "SSH to the load balancer"
@@ -495,7 +495,7 @@ all_systems = [
             to_port                      = 22
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-lb"
+            referenced_security_group_id = "sg-078525e6572561825"
           }
         ]
         tags = {}
@@ -574,7 +574,7 @@ all_systems = [
         interface_type = null
         private_ip     = null
         # Membership the GitLab peers share (dependencies/aws/estate.yml).
-        security_groups = ["sg-REPLACE-gitlab-node"]
+        security_groups = ["sg-0d1ebea3cf83a5b08"]
         # Peers by group, never by address.
         ingress = [
           {
@@ -584,7 +584,7 @@ all_systems = [
             to_port                      = 6379
             cidr_ipv4                    = null
             prefix_list_id               = null
-            referenced_security_group_id = "sg-REPLACE-gitlab-node"
+            referenced_security_group_id = "sg-0d1ebea3cf83a5b08"
           }
         ]
         egress = [
@@ -636,7 +636,7 @@ all_databases = [
     multi_az               = false
     db_name                = "gitlab"
     db_subnet_group_name   = "gitlab"
-    vpc_security_group_ids = ["sg-REPLACE-gitlab-db"]
+    vpc_security_group_ids = ["sg-097bdbe65e2dd0215"]
     engine                 = "postgres"
     # The major release is the pin: RDS creates the current minor of PostgreSQL 17, the only
     # major GitLab 19 supports.
@@ -683,7 +683,7 @@ all_load_balancers = [
     resource_key    = "gitlab"
     name            = "gitlab"
     name_prefix     = null
-    security_groups = ["sg-REPLACE-gitlab-lb"]
+    security_groups = ["sg-078525e6572561825"]
     subnets         = ["subnet-03a855e712be7b399", "subnet-0dbb7770d19f253ad"]
     subnet_mapping  = []
 
