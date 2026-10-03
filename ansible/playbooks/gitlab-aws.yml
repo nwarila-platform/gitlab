@@ -1033,8 +1033,10 @@
             validate_certs: true
 
         # The form's CSRF token is bound to the session cookie the form set; a sign-in that
-        # succeeds answers with a redirect away from the form and a new session. no_log hides why
-        # a request failed, so each that carries a credential is judged by the assert after it.
+        # succeeds redirects away from the form with a new session. uri returns cookies only for
+        # a final success, so the redirects are followed, and the form's cookie is kept off them.
+        # no_log hides why a request failed, so each that carries a credential is judged by the
+        # assert after it.
         - name: 'PROCESS | Sign In As Root Through The Load Balancer'
           changed_when: false
           ignore_errors: true
@@ -1052,7 +1054,7 @@
                    | regex_search('^Password: (\S+)$', '\1', multiline=True) | first }}
             body_format: 'form-urlencoded'
             decompress: true
-            follow_redirects: 'none'
+            follow_redirects: 'all'
             force: false
             force_basic_auth: false
             headers:
@@ -1061,9 +1063,9 @@
             method: 'POST'
             remote_src: false
             return_content: false
-            status_code: [ 302 ]
+            status_code: [ 200 ]
             timeout: 30
-            unredirected_headers: []
+            unredirected_headers: [ 'Cookie' ]
             unsafe_writes: false
             url: "{{ __nlb__ }}/users/sign_in"
             use_gssapi: false
@@ -1074,14 +1076,14 @@
         - name: 'VERIFY | Require The Sign-In To Leave The Form'
           ansible.builtin.assert:
             fail_msg: >-
-              Root's sign-in through the load balancer answered
-              {{ __proof_sign_in__.status | default('nothing') }}, redirecting to
-              '{{ __proof_sign_in__.location | default('') }}'; a 302 away from the form, with a
-              new session, was expected.
+              Root's sign-in through the load balancer ended at
+              '{{ __proof_sign_in__.url | default('') | urlsplit('path') }}' with
+              {{ __proof_sign_in__.status | default('nothing') }}; a page away from the form,
+              with a new session, was expected.
             quiet: true
             that:
-              - __proof_sign_in__.status | default(0) == 302
-              - __proof_sign_in__.location | default('') is not search('/users/sign_in')
+              - __proof_sign_in__.status | default(0) == 200
+              - __proof_sign_in__.url | default('') is not search('/users/sign_in')
               - __proof_sign_in__.cookies['_gitlab_session'] | default('') | length > 0
 
         # Each node asked on its own loopback, so the load balancer cannot route both questions
@@ -1786,44 +1788,49 @@
             stdin_add_newline: true
             strip_empty_ends: true
 
+        # boto3 directly, not s3_object: that module also reads the bucket's ownership controls
+        # and the object's tags and sets an ACL, none of which the instance role is granted.
+        # This uses only the object writes, reads and deletes the role holds under runs/.
+        # rc-contract: python exits 0 when every call succeeded and 1 on the first exception.
         - name: 'PROCESS | Put, Get And Delete The Probe Under This Run'
+          changed_when: __proof_s3_round_trip__.rc == 0
           delegate_to: "{{ __deploy__ }}"
-          loop:
-            - mode: 'put'
-              object: "runs/{{ __run__ }}/proof/probe"
-            - mode: 'get'
-              object: "runs/{{ __run__ }}/proof/probe"
-            - mode: 'delobj'
-              object: "runs/{{ __run__ }}/proof/probe"
-          loop_control: { label: "{{ item.mode }} {{ item.object }}" }
-          vars:
-            ansible_python_interpreter: '/opt/ansible/venv/bin/python'
+          failed_when: false
+          register: '__proof_s3_round_trip__'
 
-          amazon.aws.s3_object:
-            bucket: "{{ aws_account_id }}-gitlab-objects"
-            ceph: false
-            debug_botocore_endpoint_logs: false
-            dest: >-
-              {{ ('/root/gitlab-s3-probe-' ~ __run__ ~ '.read')
-                 if item.mode == 'get' else omit }}
-            dualstack: false
-            encrypt: true
-            encryption_mode: 'AES256'
-            expiry: 600
-            ignore_nonexistent_bucket: true
-            mode: "{{ item.mode }}"
-            object: "{{ item.object }}"
-            overwrite: 'always'
-            permission: [ 'private' ]
-            prefix: ''
-            purge_tags: true
-            region: "{{ aws_region }}"
-            retries: 0
-            sig_v4: true
-            src: >-
-              {{ ('/root/gitlab-s3-probe-' ~ __run__ ~ '.bin') if item.mode == 'put' else omit }}
-            validate_bucket_name: true
-            validate_certs: true
+          ansible.builtin.command:
+            argv:
+              - '/opt/ansible/venv/bin/python'
+              - '-'
+              - "{{ aws_account_id }}-gitlab-objects"
+              - "runs/{{ __run__ }}/proof/probe"
+              - "/root/gitlab-s3-probe-{{ __run__ }}.bin"
+              - "/root/gitlab-s3-probe-{{ __run__ }}.read"
+              - "{{ aws_region }}"
+            expand_argument_vars: false
+            stdin: |-
+              import hashlib, sys
+              import boto3
+              bucket, key, source, copy, region = sys.argv[1:]
+              s3 = boto3.client('s3', region_name=region)
+              s3.upload_file(source, bucket, key, ExtraArgs={'ServerSideEncryption': 'AES256'})
+              s3.download_file(bucket, key, copy)
+              s3.delete_object(Bucket=bucket, Key=key)
+              digest = [hashlib.sha256(open(p, 'rb').read()).hexdigest() for p in (source, copy)]
+              print('same' if digest[0] == digest[1] else 'differ')
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'VERIFY | Require The Probe To Round-Trip Under This Run'
+          ansible.builtin.assert:
+            fail_msg: >-
+              The deploy node's put, get and delete under runs/ exited
+              {{ __proof_s3_round_trip__.rc }} with '{{ __proof_s3_round_trip__.stdout }}':
+              {{ __proof_s3_round_trip__.stderr_lines[-3:] }}
+            quiet: true
+            that:
+              - __proof_s3_round_trip__.rc == 0
+              - __proof_s3_round_trip__.stdout == 'same'
 
         # A refusal is the expected answer, and the assert after it requires exactly that.
         - name: 'PROCESS | Attempt A Put Outside runs/ From The Deploy Node'
