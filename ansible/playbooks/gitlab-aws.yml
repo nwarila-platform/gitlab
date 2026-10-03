@@ -806,7 +806,7 @@
         quiet: true
         that:
           - __gitlab_gitaly_check__.rc == 0
-          - __gitlab_gitaly_check__.stdout is search('Check: OK')
+          - "__gitlab_gitaly_check__.stdout is search('Check: OK')"
 
 #endregion --- [ Play: Verify The Cluster ] --------------------------------------------------- #
 
