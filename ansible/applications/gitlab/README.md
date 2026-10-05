@@ -28,10 +28,10 @@ role: every bundled service on one node, or one role of a distributed GitLab. In
 | `node_role` | Runs | Inputs beyond the installer |
 |---|---|---|
 | `all-in-one` (default) | PostgreSQL, Redis, Gitaly, Puma, Sidekiq, Workhorse and NGINX | `external_url` |
-| `rails` | Puma, Sidekiq, Workhorse, NGINX and gitlab-sshd | `external_url`, `auto_migrate`, `secrets_json`, `monitoring_whitelist`, `database`, `redis`, `gitaly.address` and `gitaly.token` (Praefect's, through the load balancer), `object_store`, `sshd.host_key_source_dir`; on the node that migrates, `database_bootstrap` |
+| `rails` | Puma, Sidekiq, Workhorse, NGINX and gitlab-sshd | `external_url`, `auto_migrate`, `secrets_json`, `monitoring_whitelist`, `database`, `redis.password`, `redis.sentinels`, `redis.sentinel_port`, `redis.sentinel_password`, `gitaly.address` and `gitaly.token` (Praefect's, through the load balancer), `object_store`, `sshd.host_key_source_dir`; on the node that migrates, `database_bootstrap` |
 | `gitaly` | Gitaly, one storage of Praefect's virtual storage | `secrets_json`, `gitaly.token` (Praefect's internal token), `gitaly.storage`, `gitaly.internal_api_url` |
 | `praefect` | Praefect | `auto_migrate`, `secrets_json`, `database`, `gitaly.token` (the internal token), `praefect.token`, `praefect.nodes`; on the node that migrates, `database_bootstrap` |
-| `redis` | Redis | `redis.password` |
+| `redis` | Redis and its Sentinel | `secrets_json` (every node but the first), `redis.password`, `redis.sentinel_password`, `redis.primary`, `redis.primary_host` |
 
 `all-in-one` is the degenerate case: a node given no `node_role` renders, byte for byte, the
 `gitlab.rb` the single-node deployment's AWS Deploy run proved. No playbook in this repository
@@ -199,6 +199,28 @@ it. GitLab documents the rule as required (otherwise a push fails with "pre-rece
 declined"), and files written at run time cannot be trusted by digest. Rails, Praefect and Redis
 nodes never run Gitaly and do not get the rule.
 
+## Redis replication
+
+Each Redis node runs Redis and a Sentinel. The Rails nodes never name a Redis address: Puma,
+Sidekiq and Workhorse ask the Sentinels in `redis.sentinels` which node is primary, and ask again
+when a connection to it fails other than by timing out, or it answers as a replica. Two
+passwords, each a run secret held by the Redis and Rails nodes:
+
+| Password | Presented by | To |
+|---|---|---|
+| `redis.password` | every Redis client and every replica | Redis |
+| `redis.sentinel_password` | every Sentinel client and every peer Sentinel | Sentinel |
+
+`redis.primary` names the node that starts as the primary, and `redis.primary_host` is its
+address on every node; the others start as its replicas. That holds for the first start only:
+from then on Sentinel decides which node is primary, two of the three Sentinels agreeing. A
+reconfigure after a failover keeps the primary Sentinel recorded in `sentinel.conf`, but renders
+`redis.conf`'s `replicaof` from `gitlab.rb` again and restarts Redis. The node `redis.primary`
+names comes back a primary, and Sentinel demotes it within seconds; a replica Sentinel had
+promoted comes back a replica, which leaves no primary until the Sentinels fail over, about 40
+seconds. The role reconfigures only when its inputs change, and nothing it is given depends on
+which node is primary, so a failover alone triggers no reconfigure.
+
 ## State
 
 | State | Does |
@@ -215,11 +237,12 @@ on disk. On an all-in-one or Rails node `/-/readiness?all=1` must answer `ok`, w
 node proves its database, Redis, and that a Praefect answers through the load balancer: Praefect
 answers that health check itself, so the Gitaly nodes are proved by the playbook's
 `praefect check`, and the external token by the proof's push; a Praefect node must reach its
-database, `praefect sql-ping` printing its OK line; and a Rails, Gitaly, Praefect or Redis node
-must be listening on the port it serves its peers on. With fapolicyd running on a node that runs
-Gitaly, a fresh `fapolicyd-cli --list` must show the gitlab rule compiled into the loaded rules
-file; the proof shows whether it is in force. The readiness wait and the reconfigure are bounded
-in `tasks/present_redhat.yml`, and both bounds are unmeasured until a live run.
+database, `praefect sql-ping` printing its OK line; a Rails, Gitaly or Praefect node must be
+listening on the port it serves its peers on, and a Redis node on its Redis and Sentinel ports.
+With fapolicyd running on a node that runs Gitaly, a fresh `fapolicyd-cli --list` must show the
+gitlab rule compiled into the loaded rules file; the proof shows whether it is in force. The
+readiness wait and the reconfigure are bounded in `tasks/present_redhat.yml`, and both bounds are
+unmeasured until a live run.
 
 The playbook's proof shows the Gitaly Cluster at work: Praefect connects over TLS 1.3 as its own
 role and holds its LISTEN connections from every Praefect node; a repository has three current

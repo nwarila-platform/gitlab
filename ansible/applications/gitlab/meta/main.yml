@@ -35,7 +35,9 @@
 # rails:
 #
 #   gitlab.monitoring_whitelist  CIDRs allowed to read the health endpoints.
-#   gitlab.redis.{host,password}
+#   gitlab.redis.{password,sentinels,sentinel_password}
+#                              Every Redis node's private IPv4, each serving a Sentinel on
+#                              sentinel_port, and the Redis and Sentinel passwords.
 #   gitlab.gitaly.{address,token}
 #                              tcp://<host>:<port> of the virtual storage 'default', and the
 #                              token it takes: Praefect's, through the load balancer.
@@ -53,7 +55,16 @@
 #
 # gitaly: gitlab.secrets_json, gitlab.gitaly.token (the token Praefect presents),
 # gitlab.gitaly.storage (this node's storage name) and gitlab.gitaly.internal_api_url, the
-# http:// URL of GitLab's internal API. redis: gitlab.redis.password.
+# http:// URL of GitLab's internal API.
+#
+# redis:
+#
+#   gitlab.redis.{password,sentinel_password}
+#                              The Redis and Sentinel passwords, the same on every Redis node.
+#   gitlab.redis.primary       True on the one node that starts as Redis's primary.
+#   gitlab.redis.primary_host  That node's private IPv4, the same on every Redis node.
+#   gitlab.secrets_json        On every node but the first, the first configured node's
+#                              gitlab-secrets.json.
 #
 # The controller fetches the package with its own credentials; the guest is never given any for
 # it. Passwords and tokens are 48 or more letters and digits; the master password reaches psql

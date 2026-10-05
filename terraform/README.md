@@ -5,7 +5,7 @@ pinned `nwarila-platform/aws-terraform-framework`; this repository contributes o
 input that shapes them.
 
 - `aws.tfvars` — the system declaration consumed verbatim by the framework. It pins, for each of
-  nine systems, the availability zone, subnet, instance type, AMI, key pair, instance profile,
+  eleven systems, the availability zone, subnet, instance type, AMI, key pair, instance profile,
   disk layout, the network interface and its rules, and declares the database and the load
   balancer. The OS instances are not swap-eligible (`refresh = false`) until the application
   declares persistent data volumes.
@@ -30,6 +30,8 @@ cannot be overridden from here.
 | `tcnaw-praefect02` | us-east-1a | t3.small | `nwarila-ec2-profile` | `gitlab-praefect` |
 | `tcnaw-praefect03` | us-east-1c | t3.small | `nwarila-ec2-profile` | `gitlab-praefect` |
 | `tcnaw-redis01` | us-east-1c | t3.small | `nwarila-ec2-profile` | `gitlab-redis` |
+| `tcnaw-redis02` | us-east-1a | t3.small | `nwarila-ec2-profile` | `gitlab-redis` |
+| `tcnaw-redis03` | us-east-1c | t3.small | `nwarila-ec2-profile` | `gitlab-redis` |
 
 The `Function` tag places each system in its inventory group, attaches the two Rails nodes to
 the HTTP and SSH target groups and the three Praefect nodes to the Praefect one. Only the Rails
@@ -38,7 +40,9 @@ carry the SSM-only organization profile.
 
 Three Gitaly nodes behind three Praefect nodes are GitLab's minimal Gitaly Cluster: Praefect
 replicates every repository to all three, and the Rails nodes reach the cluster only through
-Praefect. The Gitaly and Praefect nodes are spread over the two Rails zones.
+Praefect. Three Redis nodes, each running Redis and a Sentinel, are GitLab's minimal Redis
+replication: the Rails nodes ask the Sentinels which node is primary. The Gitaly, Praefect and
+Redis nodes are spread over the two Rails zones.
 
 - **The database**: one RDS PostgreSQL 17 instance, `gitlab`, single-AZ, `db.t4g.large`, 20 GiB
   encrypted, not public, with an RDS-managed master password. It boots with the standing `gitlab`
@@ -80,10 +84,10 @@ Each node's interface also gets its own run-scoped rules:
 
 | Node | Ingress | Egress beyond 443/tcp and 1194/udp to anywhere |
 |---|---|---|
-| Rails | 80 and 2222 from `gitlab-lb` and from `gitlab-node` | 5432 to `gitlab-db`; 6379 to `gitlab-node`; 2305 to `gitlab-lb` |
+| Rails | 80 and 2222 from `gitlab-lb` and from `gitlab-node` | 5432 to `gitlab-db`; 6379 and 26379 to `gitlab-node`; 2305 to `gitlab-lb` |
 | Gitaly | 8075 from `gitlab-node` | 80 and 2305 to `gitlab-lb`; 8075 to `gitlab-node`; on `tcnaw-gitaly01`, which runs the proofs, 22 to `gitlab-lb` |
 | Praefect | 2305 from `gitlab-lb` | 5432 to `gitlab-db`; 8075 to `gitlab-node` |
-| Redis | 6379 from `gitlab-node` | none |
+| Redis | 6379 and 26379 from `gitlab-node` | 6379 and 26379 to `gitlab-node` |
 
 A Rails node admits 80 and 2222 from `gitlab-node` as well as from `gitlab-lb` because, with
 client addresses preserved, a forwarded request arrives from the client node. Whether the
@@ -93,6 +97,12 @@ and every health check arrives from the load balancer. The Rails nodes do not re
 Gitaly node's 8075 serves only Praefect and its peers, which replicate from one another. A Gitaly
 node's 2305 egress is the route GitLab's Gitaly Cluster firewall table requires of it; nothing in
 this deployment exercises it yet.
+
+Redis (6379) and Sentinel (26379) are admitted from both sides. Only the Rails and Redis nodes
+have egress to them, and only the Redis nodes admit them, so no Gitaly or Praefect node reaches
+Redis or a Sentinel although every node carries `gitlab-node`. The Redis nodes reach one another
+on both ports: a replica replicates from the primary, and each Sentinel checks every Redis node
+and talks to its peer Sentinels.
 
 On the host, nftables admits SSH, ICMP and each node's ingress ports from this table, and drops
 every other new connection. Unlike keycloak's ruleset, the service ports carry no rate limit:

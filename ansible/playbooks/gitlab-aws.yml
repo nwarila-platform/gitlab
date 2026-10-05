@@ -5,7 +5,8 @@
 # Brings the ephemeral EC2 instances from "the API says they exist" to one distributed GitLab on
 # CIS-hardened RHEL 8: two Rails nodes in two zones behind an internal network load balancer, a
 # Gitaly Cluster of three Gitaly nodes behind three Praefect nodes on the same load balancer, and
-# a Redis node, on an RDS PostgreSQL database and S3 object storage. Nine nodes in all.
+# three Redis nodes, each with a Sentinel, on an RDS PostgreSQL database and S3 object storage.
+# Eleven nodes in all.
 #
 # The inventory decides how each host is reached; this play's ordered credential sets decide who
 # logs on. A new image answers only as its image account, with the launch key.
@@ -14,12 +15,14 @@
 # RDS keeps its master credentials in, the load balancer's name and its target groups -- as
 # extra-vars, as it does the account and the region, so the play and the stack cannot disagree.
 #
-# The nodes are configured one role at a time, in the only order that works: Redis first, whose
-# first reconfigure generates the secrets every node shares; then the three Gitaly nodes, which
-# need the shared shell secret; then the Praefect node that migrates Praefect's database, then
-# the other two, after which every Praefect node must pass its own checks; then the Rails node
-# that migrates GitLab's database, which reaches its repositories through Praefect; then the
-# other Rails node.
+# The nodes are configured one role at a time, in the only order that works: the first Redis
+# node, whose first reconfigure generates the secrets every node shares and which starts as
+# Redis's primary; then the other two Redis nodes, its replicas, after which every Redis node
+# must agree on one primary; then the three Gitaly nodes, which need the shared shell secret;
+# then the Praefect node that migrates Praefect's database, then the other two, after which every
+# Praefect node must pass its own checks; then the Rails node that migrates GitLab's database,
+# which reaches its repositories through Praefect and Redis through the Sentinels; then the other
+# Rails node.
 #
 # Runs from the composed tree: the workflow overlays this repository onto the pinned framework
 # and uses its configuration, role search path, connection defaults, and explicit fact gathering.
@@ -39,7 +42,8 @@
   tags: ['always']
   tasks:
     # Two Rails nodes in two zones, because one proves nothing about losing a node or a zone;
-    # three Gitaly and three Praefect nodes, GitLab's minimal Gitaly Cluster.
+    # three Gitaly and three Praefect nodes, GitLab's minimal Gitaly Cluster; three Redis nodes,
+    # each with a Sentinel, its minimal Redis replication.
     - name: 'INVENTORY | Require The Distributed Topology'
       vars:
         __rails__: "{{ groups['gitlab_rails'] | default([]) }}"
@@ -52,7 +56,7 @@
         fail_msg: >-
           Refusing to configure: the dynamic EC2 inventory found a different topology tagged for
           this run than terraform/aws.tfvars declares -- two gitlab_rails hosts in two zones,
-          three gitlab_gitaly, three gitlab_praefect and one gitlab_redis, nothing else. Found
+          three gitlab_gitaly, three gitlab_praefect and three gitlab_redis, nothing else. Found
           rails {{ __rails__ }}, gitaly {{ groups['gitlab_gitaly'] | default([]) }}, praefect
           {{ groups['gitlab_praefect'] | default([]) }}, redis
           {{ groups['gitlab_redis'] | default([]) }}, servers
@@ -62,7 +66,7 @@
           - __rails__ | length == 2
           - groups['gitlab_gitaly'] | default([]) | length == 3
           - groups['gitlab_praefect'] | default([]) | length == 3
-          - groups['gitlab_redis'] | default([]) | length == 1
+          - groups['gitlab_redis'] | default([]) | length == 3
           - groups['gitlab_servers'] | default([]) | sort == __roles__ | sort
           - >-
             __rails__ | map('extract', hostvars, ['aws_placement', 'availability_zone'])
@@ -182,11 +186,29 @@
         gitaly: 8075
         praefect: 2305
         redis: 6379
+        sentinel: 26379
+      # A Sentinel command run as the local Sentinel's client: the Sentinel password arrives on
+      # stdin and is exported to redis-cli, never argv. -e makes an error reply exit 1.
+      gitlab_sentinel_cli:
+        - '/bin/sh'
+        - '-c'
+        - 'IFS= read -r REDISCLI_AUTH && export REDISCLI_AUTH && exec "$@"'
+        - 'sentinel'
+        - '/opt/gitlab/embedded/bin/redis-cli'
+        - '-h'
+        - '127.0.0.1'
+        - '-p'
+        - "{{ gitlab_ports.sentinel }}"
+        - '-e'
+      # SENTINEL CKQUORUM's reply when all three Sentinels are usable (sentinel.c).
+      gitlab_sentinel_ckquorum_ok: >-
+        OK 3 usable Sentinels. Quorum and failover authorization can be reached
     __gitlab_ports__: >-
       {{ ([gitlab_ports.http, gitlab_ports.sshd] if 'gitlab_rails' in group_names else [])
          + ([gitlab_ports.gitaly] if 'gitlab_gitaly' in group_names else [])
          + ([gitlab_ports.praefect] if 'gitlab_praefect' in group_names else [])
-         + ([gitlab_ports.redis] if 'gitlab_redis' in group_names else []) }}
+         + ([gitlab_ports.redis, gitlab_ports.sentinel] if 'gitlab_redis' in group_names
+            else []) }}
 
   tasks:
     - name: 'PROCESS | Install nftables'
@@ -348,16 +370,16 @@
 #endregion --- [ Play: Controller Package Cache And Network Facts ] --------------------------- #
 
 #region ------ [ Play: Run Secrets ] ---------------------------------------------------------- #
-# The Redis password, Praefect's two tokens and the passwords of GitLab's and Praefect's database
-# roles are generated once per deployment, on the Redis node, and read back on every converge:
-# gitlab.rb holds them and is hashed into the reconfigure record, so a value drawn afresh on each
-# run could never settle. They live under /root, outside /etc/gitlab, whose mode reconfigure
-# resets. The external token is the one Gitaly clients present to Praefect, the internal one the
-# one Praefect presents to Gitaly; they differ, so no client can reach a Gitaly node past
-# Praefect.
+# The Redis and Sentinel passwords, Praefect's two tokens and the passwords of GitLab's and
+# Praefect's database roles are generated once per deployment, on the first Redis node by name
+# alone, and read back on every converge: gitlab.rb holds them and is hashed into the reconfigure
+# record, so a value drawn afresh on each run could never settle. They live under /root, outside
+# /etc/gitlab, whose mode reconfigure resets. The external token is the one Gitaly clients
+# present to Praefect, the internal one the one Praefect presents to Gitaly; they differ, so no
+# client can reach a Gitaly node past Praefect.
 
 - name: 'PLAY | Generate And Read The Run Secrets'
-  hosts: 'gitlab_redis'
+  hosts: "{{ groups['gitlab_redis'] | default(['gitlab_redis']) | sort | first }}"
   any_errors_fatal: true
   become: true
   tags: ['products']
@@ -371,6 +393,8 @@
         content: >-
           {{ {'redis_password': lookup('ansible.builtin.password', '/dev/null', length=64,
                                        chars=['ascii_letters', 'digits']),
+              'sentinel_password': lookup('ansible.builtin.password', '/dev/null', length=64,
+                                          chars=['ascii_letters', 'digits']),
               'praefect_external_token': lookup('ansible.builtin.password', '/dev/null',
                                                 length=64, chars=['ascii_letters', 'digits']),
               'praefect_internal_token': lookup('ansible.builtin.password', '/dev/null',
@@ -546,46 +570,57 @@
 
 #endregion --- [ Play: Share The gitlab-sshd Host Keys ] -------------------------------------- #
 
-#region ------ [ Play: GitLab Redis ] --------------------------------------------------------- #
-# The first node configured: its first reconfigure generates the secrets every node shares.
+#region ------ [ Play: GitLab Redis, The First Node ] ----------------------------------------- #
+# The first node configured: its first reconfigure generates the secrets every node shares, and
+# it starts as Redis's primary. It is the first by name, never by inventory order.
 
-- name: 'PLAY | GitLab Redis (ephemeral AWS)'
-  hosts: 'gitlab_redis'
+- name: 'PLAY | GitLab Redis, The First Node (ephemeral AWS)'
+  hosts: "{{ groups['gitlab_redis'] | default(['gitlab_redis']) | sort | first }}"
   any_errors_fatal: true
   become: true
   tags: ['products']
   vars:
     <<: *gitlab_site
+    __origin__: "{{ groups['gitlab_redis'] | sort | first }}"
 
   #region ------ [ Roles ] -------------------------------------------------------------------- #
   roles:
     - role: 'gitlab'
       vars:
         gitlab:
+          <<: &gitlab_redis
 
-          # What is installed, stated where a reader can see it, and once for every play: the
-          # digest is the SHA-256 that GitLab's signed yum metadata records for
-          # gitlab-fips-19.4.1-fips.0.el8.x86_64.rpm, and the application repository carries
-          # those bytes at the key the role composes from the version. A version bump is these
-          # two values. The package is fetched into the controller cache once.
-          installer: &gitlab_installer
-            bucket: "{{ aws_account_id }}-apprepo"
-            version: '19.4.1'
-            sha256: '339d4a04b89e67d6108642642a68ed31c3eaae46b8c50a09a4667c4610e3520b'
-            cache_dir: "{{ hostvars['localhost'].__gitlab_package_cache__.path }}"
+            # What is installed, stated where a reader can see it, and once for every play: the
+            # digest is the SHA-256 that GitLab's signed yum metadata records for
+            # gitlab-fips-19.4.1-fips.0.el8.x86_64.rpm, and the application repository carries
+            # those bytes at the key the role composes from the version. A version bump is these
+            # two values. The package is fetched into the controller cache once.
+            installer: &gitlab_installer
+              bucket: "{{ aws_account_id }}-apprepo"
+              version: '19.4.1'
+              sha256: '339d4a04b89e67d6108642642a68ed31c3eaae46b8c50a09a4667c4610e3520b'
+              cache_dir: "{{ hostvars['localhost'].__gitlab_package_cache__.path }}"
 
-          # The 1.26 GB package is staged here, on the root volume, not in /tmp: the CIS image's
-          # /tmp did not hold it on the 2 GiB t3.small, and the copy failed with ENOSPC.
-          temp_dir_path: &gitlab_temp_dir_path '/root/gitlab-staging'
+            # The 1.26 GB package is staged here, on the root volume, not in /tmp: the CIS
+            # image's /tmp did not hold it on the 2 GiB t3.small, and the copy failed with
+            # ENOSPC.
+            temp_dir_path: &gitlab_temp_dir_path '/root/gitlab-staging'
 
-          node_role: 'redis'
+            node_role: 'redis'
           redis:
-            port: "{{ gitlab_ports.redis }}"
-            password: "{{ gitlab_run_secrets.redis_password }}"
+            <<: &gitlab_redis_inputs
+              port: "{{ gitlab_ports.redis }}"
+              password: "{{ hostvars[__origin__].gitlab_run_secrets.redis_password }}"
+              sentinel_port: "{{ gitlab_ports.sentinel }}"
+              sentinel_password: >-
+                {{ hostvars[__origin__].gitlab_run_secrets.sentinel_password }}
+              # Every node names the first node as the primary it starts with.
+              primary_host: "{{ hostvars[__origin__].aws_private_ip_address }}"
+            primary: true
 
   #endregion --- [ Roles ] -------------------------------------------------------------------- #
 
-#endregion --- [ Play: GitLab Redis ] --------------------------------------------------------- #
+#endregion --- [ Play: GitLab Redis, The First Node ] ----------------------------------------- #
 
 #region ------ [ Play: Read The Shared Secrets ] ---------------------------------------------- #
 # Read from the first configured node and written to every other node before its first
@@ -593,7 +628,7 @@
 # owner-only temporary file on the runner and on the node.
 
 - name: 'PLAY | Read The Secrets Every Node Shares'
-  hosts: 'gitlab_redis'
+  hosts: "{{ groups['gitlab_redis'] | default(['gitlab_redis']) | sort | first }}"
   any_errors_fatal: true
   become: true
   tags: ['products']
@@ -615,6 +650,159 @@
 
 #endregion --- [ Play: Read The Shared Secrets ] ---------------------------------------------- #
 
+#region ------ [ Play: GitLab Redis, The Other Nodes ] ---------------------------------------- #
+# Replicas of the first node at their first start, holding the secrets it generated.
+
+- name: 'PLAY | GitLab Redis, The Other Nodes (ephemeral AWS)'
+  hosts: >-
+    gitlab_redis:!{{ groups['gitlab_redis'] | default(['gitlab_redis'])
+    | sort | first }}
+  any_errors_fatal: true
+  become: true
+  tags: ['products']
+  vars:
+    <<: *gitlab_site
+    __origin__: "{{ groups['gitlab_redis'] | sort | first }}"
+
+  #region ------ [ Roles ] -------------------------------------------------------------------- #
+  roles:
+    - role: 'gitlab'
+      vars:
+        gitlab:
+          <<: *gitlab_redis
+          secrets_json: "{{ hostvars[__origin__].gitlab_shared_secrets_json }}"
+          redis:
+            <<: *gitlab_redis_inputs
+            primary: false
+
+  #endregion --- [ Roles ] -------------------------------------------------------------------- #
+
+#endregion --- [ Play: GitLab Redis, The Other Nodes ] ---------------------------------------- #
+
+#region ------ [ Play: Every Redis Node Agrees On One Primary ] ------------------------------- #
+# Once all three Redis nodes run and before any node that uses Redis: every Sentinel must reach
+# its quorum and name the same Redis node as primary, and every node must replicate as that
+# Sentinel says. It reads roles, never names, so the second converge passes it after the proof's
+# failover. Every Sentinel read carries the Sentinel password on stdin, so each is no_log and
+# judged by the assert after it.
+
+- name: 'PLAY | Every Redis Node Agrees On One Primary'
+  hosts: 'gitlab_redis'
+  any_errors_fatal: true
+  become: true
+  tags: ['products']
+  vars:
+    <<: *gitlab_site
+    __origin__: "{{ groups['gitlab_redis'] | sort | first }}"
+    __redis_addresses__: >-
+      {{ groups['gitlab_redis'] | sort | map('extract', hostvars, 'aws_private_ip_address')
+         | list }}
+
+  tasks:
+    # SENTINEL CKQUORUM counts this Sentinel and every peer it does not hold down; the peers are
+    # found by their hello messages. UNMEASURED: 24 tries 5 seconds apart.
+    - name: 'END | Wait Until This Node''s Sentinel Reaches Its Quorum'
+      changed_when: false
+      check_mode: false
+      delay: 5
+      ignore_errors: true
+      no_log: true
+      register: '__gitlab_sentinel_quorum__'
+      retries: 24
+      until: >-
+        __gitlab_sentinel_quorum__.rc == 0
+        and __gitlab_sentinel_quorum__.stdout == gitlab_sentinel_ckquorum_ok
+
+      ansible.builtin.command:
+        argv: "{{ gitlab_sentinel_cli + ['SENTINEL', 'ckquorum', 'gitlab-redis'] }}"
+        expand_argument_vars: false
+        stdin: "{{ hostvars[__origin__].gitlab_run_secrets.sentinel_password }}"
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    - name: 'END | Require This Node''s Sentinel To Reach Its Quorum'
+      ansible.builtin.assert:
+        fail_msg: >-
+          The Sentinel on {{ inventory_hostname }} answered SENTINEL CKQUORUM with exit
+          {{ __gitlab_sentinel_quorum__.rc | default('nothing') }}:
+          '{{ __gitlab_sentinel_quorum__.stdout | default('') }}'
+          {{ __gitlab_sentinel_quorum__.stderr_lines | default([]) }}. Three usable Sentinels
+          were expected.
+        quiet: true
+        that:
+          - __gitlab_sentinel_quorum__.rc | default(1) == 0
+          - __gitlab_sentinel_quorum__.stdout | default('') == gitlab_sentinel_ckquorum_ok
+
+    # rc-contract: redis-cli -e exits 0 after the reply, and 1 on an error reply or when it
+    # cannot connect.
+    - name: 'BEGIN | Read The Primary This Node''s Sentinel Names'
+      changed_when: false
+      check_mode: false
+      failed_when: false
+      no_log: true
+      register: '__gitlab_sentinel_primary__'
+
+      ansible.builtin.command:
+        argv: >-
+          {{ gitlab_sentinel_cli + ['SENTINEL', 'get-master-addr-by-name', 'gitlab-redis'] }}
+        expand_argument_vars: false
+        stdin: "{{ hostvars[__origin__].gitlab_run_secrets.sentinel_password }}"
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+    # SENTINEL GET-MASTER-ADDR-BY-NAME replies the address, then the port, one to a line.
+    - name: 'END | Require Every Sentinel To Name One Redis Node As Primary'
+      vars:
+        __named__: >-
+          {{ ansible_play_hosts_all | map('extract', hostvars, '__gitlab_sentinel_primary__')
+             | map(attribute='stdout', default='') | list }}
+
+      ansible.builtin.assert:
+        fail_msg: >-
+          The Sentinel on {{ inventory_hostname }} answered
+          {{ __gitlab_sentinel_primary__.stdout_lines }}
+          {{ __gitlab_sentinel_primary__.stderr_lines }} (exit
+          {{ __gitlab_sentinel_primary__.rc }}), and the Sentinels on
+          {{ ansible_play_hosts_all }} named {{ __named__ }}. One of {{ __redis_addresses__ }}
+          on port {{ gitlab_ports.redis }}, named by every Sentinel, was expected.
+        quiet: true
+        that:
+          - __gitlab_sentinel_primary__.rc == 0
+          - __gitlab_sentinel_primary__.stdout_lines | length == 2
+          - __gitlab_sentinel_primary__.stdout_lines[0] in __redis_addresses__
+          - __gitlab_sentinel_primary__.stdout_lines[1] == gitlab_ports.redis | string
+          - __named__ | unique | length == 1
+
+    # INFO replication (server.c): role:master with connected_slaves and a slave<n> line for each
+    # replica on the primary; role:slave, master_host and master_link_status on a replica.
+    # UNMEASURED: 24 tries 5 seconds apart, for a replica's first full sync.
+    - name: 'END | Wait Until This Node Replicates As Its Sentinel Says'
+      changed_when: false
+      check_mode: false
+      delay: 5
+      register: '__gitlab_redis_replication__'
+      retries: 24
+      until: >-
+        __gitlab_redis_replication__.rc == 0
+        and (('role:master' in __gitlab_redis_replication__.stdout_lines
+              and 'connected_slaves:2' in __gitlab_redis_replication__.stdout_lines
+              and __gitlab_redis_replication__.stdout_lines | select('match', 'slave[0-9]+:')
+              | select('search', 'state=online,') | list | length == 2)
+             if aws_private_ip_address == __primary__ else
+             ('role:slave' in __gitlab_redis_replication__.stdout_lines
+              and ('master_host:' ~ __primary__) in __gitlab_redis_replication__.stdout_lines
+              and 'master_link_status:up' in __gitlab_redis_replication__.stdout_lines))
+      vars:
+        __primary__: "{{ __gitlab_sentinel_primary__.stdout_lines[0] }}"
+
+      ansible.builtin.command:
+        argv: [ 'gitlab-redis-cli', '-e', 'INFO', 'replication' ]
+        expand_argument_vars: false
+        stdin_add_newline: true
+        strip_empty_ends: true
+
+#endregion --- [ Play: Every Redis Node Agrees On One Primary ] ------------------------------- #
+
 #region ------ [ Play: GitLab Gitaly ] -------------------------------------------------------- #
 
 - name: 'PLAY | GitLab Gitaly (ephemeral AWS)'
@@ -623,7 +811,7 @@
   become: true
   tags: ['products']
   vars:
-    __origin__: "{{ groups['gitlab_redis'] | first }}"
+    __origin__: "{{ groups['gitlab_redis'] | sort | first }}"
 
   #region ------ [ Roles ] -------------------------------------------------------------------- #
   roles:
@@ -660,7 +848,7 @@
   tags: ['products']
   vars:
     <<: *gitlab_site
-    __origin__: "{{ groups['gitlab_redis'] | first }}"
+    __origin__: "{{ groups['gitlab_redis'] | sort | first }}"
     # RDS keeps the master credentials in Secrets Manager and rotates them. They are read here,
     # on the controller, only for this node, which creates Praefect's role, database and
     # extensions with them, and never written to the log.
@@ -726,7 +914,7 @@
   tags: ['products']
   vars:
     <<: *gitlab_site
-    __origin__: "{{ groups['gitlab_redis'] | first }}"
+    __origin__: "{{ groups['gitlab_redis'] | sort | first }}"
 
   #region ------ [ Roles ] -------------------------------------------------------------------- #
   roles:
@@ -800,7 +988,7 @@
   tags: ['products']
   vars:
     <<: *gitlab_site
-    __origin__: "{{ groups['gitlab_redis'] | first }}"
+    __origin__: "{{ groups['gitlab_redis'] | sort | first }}"
     # RDS keeps the master credentials in Secrets Manager and rotates them. They are read here,
     # on the controller, only for this node, which creates GitLab's role, database and
     # extensions with them, and never written to the log.
@@ -831,9 +1019,15 @@
               username: "{{ gitlab_database_role }}"
               password: "{{ hostvars[__origin__].gitlab_run_secrets.database_password }}"
             redis:
-              host: "{{ hostvars[groups['gitlab_redis'] | first].aws_private_ip_address }}"
-              port: "{{ gitlab_ports.redis }}"
               password: "{{ hostvars[__origin__].gitlab_run_secrets.redis_password }}"
+              sentinel_port: "{{ gitlab_ports.sentinel }}"
+              sentinel_password: >-
+                {{ hostvars[__origin__].gitlab_run_secrets.sentinel_password }}
+              # Every Redis node's Sentinel by its private address, sorted, so every run and
+              # every Rails node lists the same.
+              sentinels: >-
+                {{ groups['gitlab_redis'] | sort
+                   | map('extract', hostvars, 'aws_private_ip_address') | list }}
             # Praefect's virtual storage, through the load balancer, with the external token.
             gitaly:
               address: "tcp://{{ gitlab_load_balancer_dns }}:{{ gitlab_ports.praefect }}"
@@ -866,7 +1060,7 @@
   tags: ['products']
   vars:
     <<: *gitlab_site
-    __origin__: "{{ groups['gitlab_redis'] | first }}"
+    __origin__: "{{ groups['gitlab_redis'] | sort | first }}"
 
   #region ------ [ Roles ] -------------------------------------------------------------------- #
   roles:
@@ -890,7 +1084,7 @@
   become: true
   tags: ['products']
   vars:
-    __origin__: "{{ groups['gitlab_redis'] | first }}"
+    __origin__: "{{ groups['gitlab_redis'] | sort | first }}"
     # The secrets every node must hold alike. A node also writes back the secrets its own
     # gitlab.rb sets, so the files differ beyond these.
     __shared__:
@@ -1026,13 +1220,16 @@
 #      connections, and Praefect's role is a SCRAM one as GitLab's and the master user's are;
 #   9. the project's repository has three current replicas; with its primary's Gitaly stopped,
 #      a push over HTTP succeeds on a new primary and every repository stays available; the
-#      node is reconciled once it is back, and the three copies hold the same checksum.
+#      node is reconciled once it is back, and the three copies hold the same checksum;
+#  10. with the Redis primary's node stopped, a replica is promoted, the session survives, a new
+#      sign-in and a push are served and Sidekiq records the push; the node rejoins as a
+#      replica.
 #
-# It adds a project, keys and objects and stops a Rails node and a Gitaly node, so it is tagged
-# 'never': an ordinary converge, and the second converge that must report no change, never run
-# it. The workflow asks for it by tag. Root's password, the access token and the session cookie
-# reach git, curl and GitLab only on stdin or in module arguments under no_log: never argv, a
-# URL or a file.
+# It adds a project, keys and objects and stops a Rails node, a Gitaly node and a Redis node, so
+# it is tagged 'never': an ordinary converge, and the second converge that must report no change,
+# never run it. The workflow asks for it by tag. Root's password, the access token, the session
+# cookie and the Sentinel password reach git, curl, GitLab and redis-cli only on stdin or in
+# module arguments under no_log: never argv, a URL or a file.
 
 - name: 'PLAY | Prove The Distributed Shape Serves Through The Load Balancer (opt-in)'
   hosts: "{{ groups['gitlab_gitaly'] | default(['gitlab_gitaly']) | sort | first }}"
@@ -1045,6 +1242,12 @@
     __deploy__: "{{ groups['gitlab_rails'] | sort | first }}"
     __rails__: "{{ groups['gitlab_rails'] | sort }}"
     __praefect__: "{{ groups['gitlab_praefect'] | sort | first }}"
+    __redis__: "{{ groups['gitlab_redis'] | sort }}"
+    __redis_addresses__: >-
+      {{ __redis__ | map('extract', hostvars, 'aws_private_ip_address') | list }}
+    # From the run secrets the proof reads on the first Redis node, and only ever sent on stdin.
+    __sentinel_password__: >-
+      {{ (__proof_run_secrets__.content | b64decode | from_json).sentinel_password }}
     # Every Praefect node's private address, each holding LISTEN connections to its database.
     __addresses__: >-
       {{ groups['gitlab_praefect'] | map('extract', hostvars, 'aws_private_ip_address') | list }}
@@ -2738,8 +2941,8 @@
         #region ------ [ Proof: Praefect's Database Is Its Own, Over TLS ] -------------------- #
 
         # The proof runs only the tagged plays, so the run secrets play has not read them here.
-        - name: 'BEGIN | Read The Run Secrets On The Redis Node'
-          delegate_to: "{{ groups['gitlab_redis'] | first }}"
+        - name: 'BEGIN | Read The Run Secrets On The First Redis Node'
+          delegate_to: "{{ groups['gitlab_redis'] | sort | first }}"
           no_log: true
           register: '__proof_run_secrets__'
 
@@ -3321,6 +3524,528 @@
                 == groups['gitlab_gitaly'] | sort
 
         #endregion --- [ Proof: Three Replicas Survive Losing The Primary ] ------------------- #
+
+        #region ------ [ Proof: Losing The Redis Primary Loses Nothing ] ---------------------- #
+
+        # The Sentinel password reaches redis-cli on stdin, so every Sentinel read is no_log and
+        # judged by the assert after it.
+        # rc-contract: redis-cli -e exits 0 after the reply, and 1 on an error reply or when it
+        # cannot connect.
+        - name: 'BEGIN | Read The Primary The Sentinels Name'
+          changed_when: false
+          check_mode: false
+          delegate_to: "{{ __redis__ | first }}"
+          failed_when: false
+          no_log: true
+          register: '__proof_redis_primary__'
+
+          ansible.builtin.command:
+            argv: >-
+              {{ gitlab_sentinel_cli + ['SENTINEL', 'get-master-addr-by-name', 'gitlab-redis'] }}
+            expand_argument_vars: false
+            stdin: "{{ __sentinel_password__ }}"
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'VERIFY | Require A Redis Node As The Primary'
+          ansible.builtin.assert:
+            fail_msg: >-
+              The Sentinel on {{ __redis__ | first }} answered
+              {{ __proof_redis_primary__.stdout_lines }}
+              {{ __proof_redis_primary__.stderr_lines }} (exit {{ __proof_redis_primary__.rc }});
+              one of {{ __redis_addresses__ }} on port {{ gitlab_ports.redis }} was expected.
+            quiet: true
+            that:
+              - __proof_redis_primary__.rc == 0
+              - __proof_redis_primary__.stdout_lines | length == 2
+              - __proof_redis_primary__.stdout_lines[0] in __redis_addresses__
+              - __proof_redis_primary__.stdout_lines[1] == gitlab_ports.redis | string
+
+        # The whole node stops, Redis and its Sentinel together: running them side by side means
+        # losing a node loses both (replication_and_failover.md). Two of the three Sentinels
+        # remain, which is both the quorum and the majority that elects the one to fail over.
+        - name: 'PROCESS | Prove Redis Survives Losing Its Primary'
+          block:
+
+            # The Sentinels name an address, so the node to stop is the one that holds it.
+            - name: 'BEGIN | Record The Redis Primary To Stop'
+              ansible.builtin.set_fact:
+                __redis_stopped__: >-
+                  {{ __redis__ | map('extract', hostvars)
+                     | selectattr('aws_private_ip_address', 'equalto',
+                                  __proof_redis_primary__.stdout_lines[0])
+                     | map(attribute='inventory_hostname') | first }}
+                __redis_stopped_address__: "{{ __proof_redis_primary__.stdout_lines[0] }}"
+                cacheable: false
+
+            - name: 'PROCESS | Stop GitLab On The Redis Primary'
+              changed_when: true
+              delegate_to: "{{ __redis_stopped__ }}"
+
+              ansible.builtin.command:
+                argv: [ 'gitlab-ctl', 'stop' ]
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            # The Sentinels hold the primary down after down-after-milliseconds, 10 s, and elect
+            # one of themselves to promote a replica. A split vote makes each candidate wait
+            # twice the failover timeout, 120 s, before it tries again (sentinel.c:4769,
+            # 4980-4981), so the bound holds one retry. A failure is named by the assert after
+            # it. UNMEASURED: 36 tries 5 seconds apart.
+            - name: 'END | Wait Until The Surviving Sentinels Promote Another Node'
+              changed_when: false
+              check_mode: false
+              delay: 5
+              delegate_to: "{{ __redis__ | reject('equalto', __redis_stopped__) | first }}"
+              ignore_errors: true
+              no_log: true
+              register: '__proof_redis_promoted__'
+              retries: 36
+              until: >-
+                __proof_redis_promoted__.rc == 0
+                and __proof_redis_promoted__.stdout_lines | length == 2
+                and __proof_redis_promoted__.stdout_lines[0] != __redis_stopped_address__
+                and __proof_redis_promoted__.stdout_lines[0] in __redis_addresses__
+
+              ansible.builtin.command:
+                argv: >-
+                  {{ gitlab_sentinel_cli
+                     + ['SENTINEL', 'get-master-addr-by-name', 'gitlab-redis'] }}
+                expand_argument_vars: false
+                stdin: "{{ __sentinel_password__ }}"
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            - name: 'VERIFY | Require A Promoted Replica'
+              ansible.builtin.assert:
+                fail_msg: >-
+                  With {{ __redis_stopped__ }} stopped, the Sentinel on
+                  {{ __redis__ | reject('equalto', __redis_stopped__) | first }} answered
+                  {{ __proof_redis_promoted__.stdout_lines | default([]) }}
+                  {{ __proof_redis_promoted__.stderr_lines | default([]) }} (exit
+                  {{ __proof_redis_promoted__.rc | default('nothing') }}); another of
+                  {{ __redis_addresses__ }} than {{ __redis_stopped_address__ }} was expected.
+                quiet: true
+                that:
+                  - __proof_redis_promoted__.rc | default(1) == 0
+                  - __proof_redis_promoted__.stdout_lines | default([]) | length == 2
+                  - __proof_redis_promoted__.stdout_lines[0] != __redis_stopped_address__
+                  - __proof_redis_promoted__.stdout_lines[0] in __redis_addresses__
+
+            - name: 'BEGIN | Record The Promoted Primary'
+              ansible.builtin.set_fact:
+                __redis_promoted__: >-
+                  {{ __redis__ | map('extract', hostvars)
+                     | selectattr('aws_private_ip_address', 'equalto',
+                                  __proof_redis_promoted__.stdout_lines[0])
+                     | map(attribute='inventory_hostname') | first }}
+                cacheable: false
+
+            # The promoted node answers role:master once it has left replication, and counts the
+            # third node once that node follows it. UNMEASURED: 12 tries 5 seconds apart.
+            - name: 'END | Wait Until The Promoted Node Serves As Primary'
+              changed_when: false
+              check_mode: false
+              delay: 5
+              delegate_to: "{{ __redis_promoted__ }}"
+              register: '__proof_redis_serving__'
+              retries: 12
+              until: >-
+                __proof_redis_serving__.rc == 0
+                and 'role:master' in __proof_redis_serving__.stdout_lines
+                and 'connected_slaves:1' in __proof_redis_serving__.stdout_lines
+
+              ansible.builtin.command:
+                argv: [ 'gitlab-redis-cli', '-e', 'INFO', 'replication' ]
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            # The session was written before the stop and has reached the replicas since. A
+            # client's first request after the stop may meet the refused connection, on which it
+            # asks the Sentinels for the primary again, so the read is retried.
+            # UNMEASURED: 12 tries 5 seconds apart.
+            # rc-contract: uri reports the HTTP status GitLab answered; the assert reads it.
+            - name: 'END | Read The Session Through The Load Balancer After The Promotion'
+              changed_when: false
+              delay: 5
+              failed_when: false
+              no_log: true
+              register: '__proof_redis_session__'
+              retries: 12
+              until: >-
+                (__proof_redis_session__.json | default({})).username | default('') == 'root'
+
+              ansible.builtin.uri:
+                body_format: 'raw'
+                decompress: true
+                follow_redirects: 'none'
+                force: false
+                force_basic_auth: false
+                headers:
+                  Cookie: "_gitlab_session={{ __proof_sign_in__.cookies['_gitlab_session'] }}"
+                http_agent: 'ansible-httpget'
+                method: 'GET'
+                remote_src: false
+                return_content: true
+                status_code: [ 200 ]
+                timeout: 30
+                unredirected_headers: []
+                unsafe_writes: false
+                url: "{{ __nlb__ }}/api/v4/user"
+                use_gssapi: false
+                use_netrc: false
+                use_proxy: false
+                validate_certs: true
+
+            - name: 'VERIFY | Require The Session To Survive The Promotion'
+              ansible.builtin.assert:
+                fail_msg: >-
+                  After the promotion of {{ __redis_promoted__ }}, the session answered
+                  {{ __proof_redis_session__.status | default('nothing') }} as
+                  '{{ (__proof_redis_session__.json | default({})).username | default('') }}',
+                  not root.
+                quiet: true
+                that: >-
+                  (__proof_redis_session__.json | default({})).username | default('') == 'root'
+
+            - name: 'BEGIN | Open The Sign-In Form After The Promotion'
+              changed_when: false
+              register: '__proof_redis_form__'
+
+              ansible.builtin.uri:
+                body_format: 'raw'
+                decompress: true
+                follow_redirects: 'none'
+                force: false
+                force_basic_auth: false
+                headers: {}
+                http_agent: 'ansible-httpget'
+                method: 'GET'
+                remote_src: false
+                return_content: true
+                status_code: [ 200 ]
+                timeout: 30
+                unredirected_headers: []
+                unsafe_writes: false
+                url: "{{ __nlb__ }}/users/sign_in"
+                use_gssapi: false
+                use_netrc: false
+                use_proxy: false
+                validate_certs: true
+
+            # A new session is written to the new primary. A failure is named by the assert
+            # after it, which no_log would otherwise hide.
+            - name: 'PROCESS | Sign In As Root After The Promotion'
+              changed_when: false
+              ignore_errors: true
+              no_log: true
+              register: '__proof_redis_sign_in__'
+
+              ansible.builtin.uri:
+                body:
+                  authenticity_token: >-
+                    {{ __proof_redis_form__.content
+                       | regex_search('name="authenticity_token" value="([^"]+)"', '\1')
+                       | first }}
+                  user[login]: 'root'
+                  user[password]: >-
+                    {{ __proof_password__.content | b64decode
+                       | regex_search('^Password: (\S+)$', '\1', multiline=True) | first }}
+                body_format: 'form-urlencoded'
+                decompress: true
+                follow_redirects: 'all'
+                force: false
+                force_basic_auth: false
+                headers:
+                  Cookie: "{{ __proof_redis_form__.cookies_string }}"
+                http_agent: 'ansible-httpget'
+                method: 'POST'
+                remote_src: false
+                return_content: false
+                status_code: [ 200 ]
+                timeout: 30
+                unredirected_headers: [ 'Cookie' ]
+                unsafe_writes: false
+                url: "{{ __nlb__ }}/users/sign_in"
+                use_gssapi: false
+                use_netrc: false
+                use_proxy: false
+                validate_certs: true
+
+            - name: 'VERIFY | Require A New Session After The Promotion'
+              ansible.builtin.assert:
+                fail_msg: >-
+                  Root's sign-in after the promotion ended at
+                  '{{ __proof_redis_sign_in__.url | default('') | urlsplit('path') }}' with
+                  {{ __proof_redis_sign_in__.status | default('nothing') }}; a page away from the
+                  form, with a new session, was expected.
+                quiet: true
+                that:
+                  - __proof_redis_sign_in__.status | default(0) == 200
+                  - __proof_redis_sign_in__.url | default('') is not search('/users/sign_in')
+                  - __proof_redis_sign_in__.cookies['_gitlab_session'] | default('') | length > 0
+
+            - name: 'PROCESS | Make One Commit To Push After The Promotion'
+              changed_when: true
+
+              ansible.builtin.command:
+                argv:
+                  - "{{ __git__ }}"
+                  - '-C'
+                  - "{{ __proof_workspace__.path }}/ssh-clone"
+                  - '-c'
+                  - 'user.name=GitLab proof'
+                  - '-c'
+                  - 'user.email=proof@localhost'
+                  - 'commit'
+                  - '--allow-empty'
+                  - '--message'
+                  - 'Prove a push after the Redis primary is promoted'
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            # A failure is named by the assert after it, which no_log would otherwise hide.
+            - name: 'PROCESS | Push Over HTTP After The Promotion'
+              changed_when: __proof_redis_push__.rc == 0
+              ignore_errors: true
+              no_log: true
+              register: '__proof_redis_push__'
+
+              ansible.builtin.command:
+                argv:
+                  - '/bin/sh'
+                  - '-c'
+                  - "{{ __with_header__ }}"
+                  - 'sh'
+                  - "{{ __git__ }}"
+                  - '-C'
+                  - "{{ __proof_workspace__.path }}/ssh-clone"
+                  - 'push'
+                  - "{{ __http_url__ }}"
+                  - 'HEAD:refs/heads/main'
+                expand_argument_vars: false
+                stdin: "{{ __header__ }}"
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            - name: 'VERIFY | Require The Push After The Promotion To Succeed'
+              ansible.builtin.assert:
+                fail_msg: >-
+                  The push over HTTP after the promotion of {{ __redis_promoted__ }} exited
+                  {{ __proof_redis_push__.rc | default('nothing') }}:
+                  {{ __proof_redis_push__.stderr_lines | default([]) }}
+                quiet: true
+                that: __proof_redis_push__.rc | default(1) == 0
+
+            - name: 'BEGIN | Read The Commit Pushed After The Promotion'
+              changed_when: false
+              register: '__proof_redis_pushed__'
+
+              ansible.builtin.command:
+                argv:
+                  - "{{ __git__ }}"
+                  - '-C'
+                  - "{{ __proof_workspace__.path }}/ssh-clone"
+                  - 'rev-parse'
+                  - 'HEAD'
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            # Sidekiq takes the push's PostReceive job from Redis and records a push event in the
+            # database (post_receive.rb, base_hooks_service.rb), which the project's events list
+            # with the commit it pushed. UNMEASURED: 24 tries 5 seconds apart.
+            # rc-contract: uri reports the HTTP status GitLab answered; the assert reads it.
+            - name: 'END | Wait Until Sidekiq Records The Push After The Promotion'
+              changed_when: false
+              delay: 5
+              failed_when: false
+              no_log: true
+              register: '__proof_redis_events__'
+              retries: 24
+              until: >-
+                __proof_redis_pushed__.stdout
+                in (__proof_redis_events__.json | default([])
+                    | map(attribute='push_data.commit_to', default='') | list)
+
+              ansible.builtin.uri:
+                body_format: 'raw'
+                decompress: true
+                follow_redirects: 'none'
+                force: false
+                force_basic_auth: false
+                headers:
+                  PRIVATE-TOKEN: "{{ __proof_token__ }}"
+                http_agent: 'ansible-httpget'
+                method: 'GET'
+                remote_src: false
+                return_content: true
+                status_code: [ 200 ]
+                timeout: 30
+                unredirected_headers: []
+                unsafe_writes: false
+                url: "{{ __project_api__ }}/events?action=pushed"
+                use_gssapi: false
+                use_netrc: false
+                use_proxy: false
+                validate_certs: true
+
+            - name: 'VERIFY | Require Sidekiq To Record The Push After The Promotion'
+              vars:
+                __commits__: >-
+                  {{ __proof_redis_events__.json | default([])
+                     | map(attribute='push_data.commit_to', default='') | list }}
+
+              ansible.builtin.assert:
+                fail_msg: >-
+                  The project's push events answered
+                  {{ __proof_redis_events__.status | default('nothing') }} with commits
+                  {{ __commits__ }}; {{ __proof_redis_pushed__.stdout }} was expected among them.
+                quiet: true
+                that: __proof_redis_pushed__.stdout in __commits__
+
+          # Each cleanup is judged by the assert below, so one failing does not skip the next.
+          always:
+
+            - name: 'CLEANUP | Start GitLab On The Stopped Redis Primary Again'
+              changed_when: true
+              delegate_to: "{{ __redis_stopped__ }}"
+              ignore_errors: true
+              register: '__proof_redis_started__'
+              when: __redis_stopped__ is defined
+
+              ansible.builtin.command:
+                argv: [ 'gitlab-ctl', 'start' ]
+                expand_argument_vars: false
+                stdin_add_newline: true
+                strip_empty_ends: true
+
+            # UNMEASURED: a bound until a live run measures Redis's and Sentinel's start.
+            - name: 'CLEANUP | Wait For Redis And Sentinel To Listen There Again'
+              delegate_to: "{{ __redis_stopped__ }}"
+              ignore_errors: true
+              loop: [ "{{ gitlab_ports.redis }}", "{{ gitlab_ports.sentinel }}" ]
+              loop_control: { label: "{{ item }}" }
+              register: '__proof_redis_listening__'
+              when: __redis_stopped__ is defined
+
+              ansible.builtin.wait_for:
+                active_connection_states:
+                  - 'ESTABLISHED'
+                  - 'FIN_WAIT1'
+                  - 'FIN_WAIT2'
+                  - 'SYN_RECV'
+                  - 'SYN_SENT'
+                  - 'TIME_WAIT'
+                connect_timeout: 5
+                delay: 0
+                host: '127.0.0.1'
+                msg: "Nothing listens on {{ __redis_stopped__ }}:{{ item }} after 120 seconds."
+                port: "{{ item | int }}"
+                sleep: 1
+                state: 'started'
+                timeout: 120
+
+            - name: 'CLEANUP | Require Redis And Sentinel To Run Again There'
+              when: __redis_stopped__ is defined
+
+              ansible.builtin.assert:
+                fail_msg: >-
+                  Redis and its Sentinel on {{ __redis_stopped__ }} did not come back: gitlab-ctl
+                  start {{ 'failed' if __proof_redis_started__ is failed else 'ran' }}, and
+                  {{ (__proof_redis_listening__.results | selectattr('failed')
+                      | map(attribute='msg') | list) or 'both ports answered' }}.
+                quiet: true
+                that:
+                  - __proof_redis_started__ is not failed
+                  - __proof_redis_listening__ is not failed
+
+        # Sentinel tells the returning node to follow the new primary once it has reported for
+        # four publish periods, 8 s (sentinel.c), and the node then syncs in full. Every node
+        # must replicate before the proof ends, or the second converge's check play would find
+        # one missing. UNMEASURED: 30 tries 5 seconds apart.
+        - name: 'END | Wait Until The Old Primary Rejoins As A Replica'
+          changed_when: false
+          check_mode: false
+          delay: 5
+          delegate_to: "{{ __redis_promoted__ }}"
+          register: '__proof_redis_rejoined__'
+          retries: 30
+          until: >-
+            __proof_redis_rejoined__.rc == 0
+            and 'connected_slaves:2' in __proof_redis_rejoined__.stdout_lines
+            and __proof_redis_rejoined__.stdout_lines | select('match', 'slave[0-9]+:')
+            | select('search', 'ip=' ~ (__redis_stopped_address__ | regex_escape) ~ ',')
+            | select('search', 'state=online,') | list | length == 1
+
+          ansible.builtin.command:
+            argv: [ 'gitlab-redis-cli', '-e', 'INFO', 'replication' ]
+            expand_argument_vars: false
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        # The restarted Sentinel rejoins its peers by their hello messages. The second converge's
+        # check play requires three usable Sentinels, so the proof ends with them.
+        # UNMEASURED: 24 tries 5 seconds apart. A failure is named by the assert after it.
+        - name: 'END | Wait Until Every Sentinel Reaches Its Quorum Again'
+          changed_when: false
+          check_mode: false
+          delay: 5
+          delegate_to: "{{ item }}"
+          ignore_errors: true
+          loop: "{{ __redis__ }}"
+          loop_control: { label: "{{ item }}" }
+          no_log: true
+          register: '__proof_redis_quorum__'
+          retries: 24
+          until: >-
+            __proof_redis_quorum__.rc == 0
+            and __proof_redis_quorum__.stdout == gitlab_sentinel_ckquorum_ok
+
+          ansible.builtin.command:
+            argv: "{{ gitlab_sentinel_cli + ['SENTINEL', 'ckquorum', 'gitlab-redis'] }}"
+            expand_argument_vars: false
+            stdin: "{{ __sentinel_password__ }}"
+            stdin_add_newline: true
+            strip_empty_ends: true
+
+        - name: 'VERIFY | Require Every Sentinel To Reach Its Quorum Again'
+          vars:
+            __answers__: >-
+              {{ __proof_redis_quorum__.results | map(attribute='stdout', default='') | list }}
+            __errors__: >-
+              {{ __proof_redis_quorum__.results | map(attribute='stderr', default='') | list }}
+            __exits__: >-
+              {{ __proof_redis_quorum__.results | map(attribute='rc', default='nothing')
+                 | list }}
+
+          ansible.builtin.assert:
+            fail_msg: >-
+              After the rejoin, the Sentinels on {{ __redis__ }} exited {{ __exits__ }} with
+              {{ __answers__ }} {{ __errors__ }}; three usable Sentinels on each were expected.
+            quiet: true
+            that:
+              - >-
+                __proof_redis_quorum__.results | map(attribute='rc', default=1)
+                | reject('equalto', 0) | list | length == 0
+              - __answers__ | reject('equalto', gitlab_sentinel_ckquorum_ok) | list | length == 0
+
+        - name: 'INFO | Report The Redis Failover'
+          ansible.builtin.debug:
+            msg: >-
+              The Sentinels named {{ __redis_stopped__ }} ({{ __redis_stopped_address__ }}) the
+              primary before the stop and {{ __redis_promoted__ }}
+              ({{ __proof_redis_promoted__.stdout_lines[0] }}) after it, within
+              {{ __proof_redis_promoted__.attempts }} reads 5 seconds apart; the old primary
+              rejoined as a replica within {{ __proof_redis_rejoined__.attempts }} reads, and
+              every Sentinel reached its quorum again within
+              {{ __proof_redis_quorum__.results | map(attribute='attempts', default=1) | list }}.
+            verbosity: 0
+
+        #endregion --- [ Proof: Losing The Redis Primary Loses Nothing ] ---------------------- #
 
       # Every cleanup runs whatever the others did, and the last task names each that failed. A
       # cleanup that reads a registered result is still guarded on it, because a failed template

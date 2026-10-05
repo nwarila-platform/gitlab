@@ -6,11 +6,11 @@
 # DATA-ONLY here (a plain tfvars, no .tf files); resources live in the pinned
 # aws-terraform-framework, configuration in the pinned ansible-framework + this repo's role.
 #
-#   * The stack is nine nodes: two GitLab Rails nodes in two zones behind an internal network
+#   * The stack is eleven nodes: two GitLab Rails nodes in two zones behind an internal network
 #     load balancer, a Gitaly Cluster of three Gitaly nodes behind three Praefect nodes on the
-#     same load balancer, and a Redis node, with an RDS PostgreSQL database and S3 object
-#     storage. The proof runs between the two converges, so the second, which must change
-#     nothing, also judges the node the proof stopped and started.
+#     same load balancer, and three Redis nodes, each with a Sentinel, with an RDS PostgreSQL
+#     database and S3 object storage. The proof runs between the two converges, so the second,
+#     which must change nothing, also judges the nodes the proof stopped and started.
 #   * AWS credentials are issued only to this workflow at refs/heads/main. Pull requests use
 #     the credential-free quality workflow; feature-branch workflow code never reaches AWS.
 #   * Reachability: direct SSH to a subnet-assigned public IPv4. At runtime the framework adds
@@ -23,7 +23,7 @@
 #     provisioning and refreshes it before each of the three playbook runs, so no step outlives
 #     its session. The hold holds none: it only waits. destroy exchanges a 3,600-second session
 #     on a fresh runner and destroys from the same state key.
-#   * Budgets: aws-deploy 300 minutes (its step bounds sum to about 262), hold 245 for the
+#   * Budgets: aws-deploy 300 minutes (its step bounds sum to about 277), hold 245 for the
 #     largest 240-minute choice, destroy 45; every job stays below the runner's 360-minute
 #     execution limit. destroy runs whatever happened before it, and cancelling a held run to end
 #     the hold early still destroys -- and, as for any cancel, marks the run failed and opens the
@@ -397,8 +397,11 @@ jobs:
 
       # Readiness, configuration and the cluster checks all live in the playbook. The EC2
       # inventory plugin filters live AWS instances to this repository and run before exposing
-      # them. The four nodes converge one role at a time; the budget guards against a hung
-      # converge without cutting a working one short, and profile_tasks times every task.
+      # them. The eleven nodes converge one role at a time; the budget guards against a hung
+      # converge without cutting a working one short, and profile_tasks times every task. Nine
+      # nodes took 81 minutes (run 37140051409). Eleven add the other two Redis nodes' play,
+      # about the 10 the first took, the Redis check play, about 1, and a third round of five
+      # forks on each task every node runs, about 3, for an estimate near 95 inside the 120.
       - name: Run the application playbook
         timeout-minutes: 120
         working-directory: .frameworks/ansible-framework
@@ -437,14 +440,17 @@ jobs:
       # The opt-in proof play (nessus precedent): sign-in, git over HTTP and SSH, an upload in
       # object storage and the database's settings, all through the load balancer, then losing
       # a Rails node and its rejoin, then Praefect's database and losing a repository's primary
-      # Gitaly node, a push without it and its reconciliation. It adds a project and stops a
-      # Rails node and a Gitaly node, so it runs once, here, and the second converge after it
-      # still judges only what the role manages; the proof ends with every replica current, so
-      # that converge's praefect check finds nothing outdated. The 30 minutes hold the 11 the
-      # proof took on the first Praefect stack (run 37119822220), and the 3 to 5 the cluster
-      # checks are estimated to add.
+      # Gitaly node, a push without it and its reconciliation, then losing the Redis primary's
+      # node, a session, a sign-in and a push Sidekiq records after the promotion, and the
+      # node's rejoin as a replica. It adds a project and stops a Rails node, a Gitaly node and
+      # a Redis node, so it runs once, here, and the second converge after it still judges only
+      # what the role manages; the proof ends with every replica current and every Sentinel at
+      # its quorum, so that converge's praefect check and Redis check play find nothing amiss.
+      # The 45 minutes hold the 17 the proof took with the Gitaly Cluster checks (run
+      # 37140051409), and the 4 or so the Redis failover is estimated to add, with room for a
+      # Sentinel vote that splits and waits two minutes to retry.
       - name: Prove the distributed shape serves through the load balancer
-        timeout-minutes: 30
+        timeout-minutes: 45
         working-directory: .frameworks/ansible-framework
         env:
           ANSIBLE_CONFIG: ${{ github.workspace }}/.frameworks/ansible-framework/ansible.cfg
