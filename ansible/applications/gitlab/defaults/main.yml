@@ -52,7 +52,8 @@ gitlab_defaults:
 
   # What this node runs. 'all-in-one' is every bundled service on one node, and renders exactly
   # the configuration a single node was proven with. The distributed layout's roles are 'rails'
-  # (Puma, Sidekiq, Workhorse, NGINX and gitlab-sshd), 'gitaly', 'praefect' and 'redis'.
+  # (Puma, Sidekiq, Workhorse, NGINX and gitlab-sshd), 'gitaly', 'praefect' and 'redis' (Redis
+  # and its Sentinel).
   node_role: 'all-in-one'
 
   #endregion --- [ Node Role ] ---------------------------------------------------------------- #
@@ -112,11 +113,20 @@ gitlab_defaults:
 
   #region ------ [ Redis And Gitaly ] --------------------------------------------------------- #
 
-  # The Redis node the Rails nodes share. The password is a run secret.
+  # Redis replicated across the Redis nodes, each with a Sentinel that fails it over. password is
+  # the one every Redis node and client presents, sentinel_password the one every Sentinel and
+  # its clients present; both are run secrets. redis: primary marks the node that starts as
+  # Redis's primary and primary_host is that node's private IPv4; after the first start Sentinel,
+  # not gitlab.rb, decides which node is primary. rails: sentinels is every Redis node's private
+  # IPv4, each serving a Sentinel on sentinel_port.
   redis:
-    host: ''
     port: 6379
     password: ''
+    sentinel_port: 26379
+    sentinel_password: ''
+    primary: false
+    primary_host: ''
+    sentinels: []
 
   # rails: address is where the virtual storage 'default' is served, tcp://<host>:<port>, and
   # token the one that storage takes. gitaly: storage is this node's own storage name,

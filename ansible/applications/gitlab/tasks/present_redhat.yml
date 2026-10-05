@@ -4,7 +4,7 @@
 #
 # Installs GitLab at the pinned version on a CIS-hardened RHEL 8 host and reconfigures it as the
 # node role it is given: every bundled service on one node (all-in-one), or one role of the
-# distributed layout (rails, gitaly, redis).
+# distributed layout (rails, gitaly, praefect, redis).
 #
 # BEGIN reads the host. PROCESS trusts the vendor key, installs the verified package, writes the
 # shared secrets, the database's certificate bundle and gitlab.rb, lets Gitaly execute under
@@ -1108,15 +1108,17 @@
           - __gitlab_praefect_ping__.rc == 0
           - "'praefect sql-ping: OK' in __gitlab_praefect_ping__.stdout_lines"
 
-    # The port each other role serves its peers on: gitlab-sshd on a Rails node, Gitaly,
-    # Praefect and Redis on theirs. UNMEASURED: a bound until a live run measures the start.
+    # The ports each other role serves its peers on: gitlab-sshd on a Rails node, Gitaly and
+    # Praefect on theirs, and Redis and its Sentinel on a Redis node. UNMEASURED: a bound until
+    # a live run measures the start.
     - name: 'END | Wait For The Node Role To Listen'
+      loop: >-
+        {{ {'rails': [gitlab_running.sshd.port], 'gitaly': [8075],
+            'praefect': [gitlab_running.praefect.port],
+            'redis': [gitlab_running.redis.port, gitlab_running.redis.sentinel_port]}
+           [gitlab_running.node_role] }}
+      loop_control: { label: "{{ item }}" }
       when: gitlab_running.node_role in ['rails', 'gitaly', 'praefect', 'redis']
-      vars:
-        __port__: >-
-          {{ {'rails': gitlab_running.sshd.port, 'gitaly': 8075,
-              'praefect': gitlab_running.praefect.port,
-              'redis': gitlab_running.redis.port}[gitlab_running.node_role] }}
 
       ansible.builtin.wait_for:
         active_connection_states:
@@ -1130,9 +1132,9 @@
         delay: 0
         host: '127.0.0.1'
         msg: >-
-          Nothing listens on 127.0.0.1:{{ __port__ }} after 120 seconds, where the
+          Nothing listens on 127.0.0.1:{{ item }} after 120 seconds, where the
           {{ gitlab_running.node_role }} node serves its peers.
-        port: "{{ __port__ | int }}"
+        port: "{{ item | int }}"
         sleep: 1
         state: 'started'
         timeout: 120

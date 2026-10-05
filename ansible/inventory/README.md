@@ -21,11 +21,11 @@ Terraform stamps each system with a `Function` tag, and each group is built from
 | `gitlab_rails` | `Function` `gitlab-rails`: the two Rails nodes |
 | `gitlab_gitaly` | `Function` `gitlab-gitaly`: the three Gitaly nodes |
 | `gitlab_praefect` | `Function` `gitlab-praefect`: the three Praefect nodes |
-| `gitlab_redis` | `Function` `gitlab-redis`: the Redis node |
+| `gitlab_redis` | `Function` `gitlab-redis`: the three Redis nodes, each with its Sentinel |
 | `gitlab_servers` | all four functions: every node the playbook configures |
 
 The playbook's first play requires exactly that topology: two Rails nodes in two zones, three
-Gitaly nodes, three Praefect nodes and one Redis node. That they share one VPC is the Terraform
+Gitaly nodes, three Praefect nodes and three Redis nodes. That they share one VPC is the Terraform
 framework's runner-ingress precondition. The nodes that migrate a database, GitLab's and
 Praefect's, are the first Rails node and the first Praefect node by name, never by inventory
 order.

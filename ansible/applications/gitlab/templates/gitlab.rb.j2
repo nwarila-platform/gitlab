@@ -37,9 +37,17 @@ gitlab_rails['db_password'] = '{{ __config__.database.password }}'
 gitlab_rails['db_sslmode'] = 'verify-full'
 gitlab_rails['db_sslrootcert'] = '/etc/gitlab/rds-ca-bundle.pem'
 
-gitlab_rails['redis_host'] = '{{ __config__.redis.host }}'
-gitlab_rails['redis_port'] = {{ __config__.redis.port | int }}
-gitlab_rails['redis_password'] = '{{ __config__.redis.password }}'
+# Redis through its Sentinels: Puma, Sidekiq and Workhorse ask a Sentinel for the current
+# primary, and ask again when a connection to it fails other than by timing out, or it answers
+# as a replica.
+redis['master_name'] = 'gitlab-redis'
+redis['master_password'] = '{{ __config__.redis.password }}'
+gitlab_rails['redis_sentinels'] = [
+{% for host in __config__.redis.sentinels %}
+  { 'host' => '{{ host }}', 'port' => {{ __config__.redis.sentinel_port | int }} },
+{% endfor %}
+]
+gitlab_rails['redis_sentinels_password'] = '{{ __config__.redis.sentinel_password }}'
 
 # The one storage is Praefect's virtual storage, through the load balancer, and carries the token
 # Praefect takes. The global gitlab_rails['gitaly_token'] is deliberately unset: no storage falls
@@ -157,11 +165,35 @@ praefect['configuration'] = {
 }
 {% elif __config__.node_role == 'redis' %}
 
-# Redis alone, for the Rails nodes, which authenticate with its password.
-roles(['redis_master_role'])
+# Redis and its Sentinel, one of three nodes (replication_and_failover.md, "Example of a minimal
+# configuration"). The node named primary starts as Redis's primary and the others replicate it;
+# from then on Sentinel decides which node is primary. A reconfigure after a failover keeps the
+# primary Sentinel recorded in sentinel.conf, but renders redis.conf's replicaof from this file
+# again and restarts Redis: the node named primary here comes back a primary, which Sentinel
+# demotes, and a replica Sentinel had promoted comes back a replica, so the Sentinels fail over.
+{% if __config__.redis.primary %}
+roles(['redis_sentinel_role', 'redis_master_role'])
+{% else %}
+roles(['redis_sentinel_role', 'redis_replica_role'])
+{% endif %}
 prometheus_monitoring['enable'] = false
 gitlab_rails['auto_migrate'] = false
 redis['bind'] = '0.0.0.0'
 redis['port'] = {{ __config__.redis.port | int }}
 redis['password'] = '{{ __config__.redis.password }}'
+# Every node names the same primary at first start, and the name the Rails nodes ask the
+# Sentinels for.
+redis['master_name'] = 'gitlab-redis'
+redis['master_ip'] = '{{ __config__.redis.primary_host }}'
+redis['master_port'] = {{ __config__.redis.port | int }}
+redis['master_password'] = '{{ __config__.redis.password }}'
+# Not set, each deliberately: down_after_milliseconds (10000) and failover_timeout (60000) keep
+# the package defaults, the documented values; no announce_ip, since every node and client shares
+# one VPC with no address translation; no TLS.
+sentinel['bind'] = '0.0.0.0'
+sentinel['port'] = {{ __config__.redis.sentinel_port | int }}
+sentinel['password'] = '{{ __config__.redis.sentinel_password }}'
+# Two of the three Sentinels must agree the primary is down, and two must elect the one that
+# fails it over.
+sentinel['quorum'] = 2
 {% endif %}
